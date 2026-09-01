@@ -1,0 +1,31 @@
+key,value,notes
+image_relpath,,"Path to the plate image, relative to the Data\Spotting Assays root"
+image_sha256,,"python -c ""import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())"" <image>"
+image_width,,pixels
+image_height,,pixels
+imagej_version,,Help > About ImageJ
+rgb_weighted,,"TRUE/FALSE -- Edit > Options > Conversions > 'Weighted RGB conversions'. Worth ~1.6 gray here; must match --rgb-mode"
+scale_when_converting,,TRUE/FALSE -- same dialog
+roi_shape,oval,
+measure_diameter_px,,"Oval width = height, in px. The SAME value for every spot and background ROI"
+rollingball_radius_px,,"The literal number typed into Process > Subtract Background. ImageJ calls it a radius; the protocol text says diameter -- record what you actually typed"
+rb_light_background,,TRUE/FALSE
+rb_sliding_paraboloid,,TRUE/FALSE
+rb_disable_smoothing,,TRUE/FALSE
+rb_preview,,TRUE/FALSE
+rollingball_iterations,1,"How many times you clicked OK. Should be 1 -- see README on why iterating is wrong"
+bg_spread_after,,"max - min of the 5 background Mean values after subtraction, in gray units"
+quantified_row_rep1,,"1-based OVERALL row (1-6) you would normally quantify for the top replicate"
+quantified_row_rep2,,1-based OVERALL row (1-6) for the bottom replicate
+control_col,1,1-based column holding the control strain
+strain_col_1,,left-most column
+strain_col_2,,
+strain_col_3,,
+strain_col_4,,
+strain_col_5,,
+strain_col_6,,
+strain_col_7,,
+strain_col_8,,right-most column
+operator,,
+date,,YYYY-MM-DD
+notes,,"Anything unusual: glare, condensation, papillae, ROIs you nudged and why"

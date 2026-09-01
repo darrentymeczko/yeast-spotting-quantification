@@ -1,0 +1,21 @@
+# Python packages. Install with:  pip install -r requirements.txt
+#
+# Tested on Python 3.13 / Windows 11. Nothing here is version-pinned tightly
+# because the code uses stable APIs, with one exception noted below.
+
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# Image handling. scikit-image 0.26 renamed several morphology parameters;
+# the code handles both spellings, so older versions also work.
+scikit-image>=0.22
+Pillow>=10.0
+tifffile>=2023.7.10
+
+matplotlib>=3.7          # previews, montages, diagnostics
+statsmodels>=0.14        # multiple-comparison correction
+
+# Export formats
+python-pptx>=0.6.21      # slide deck of montages + graphs
+openpyxl>=3.1            # .xlsx alongside the .csv summaries

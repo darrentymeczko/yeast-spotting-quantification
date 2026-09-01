@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Data. None of this belongs in the repository: the photos are large (a single
+# corpus here is 160 MB+), they are unpublished experimental data, and the
+# derived files are all reproducible from them.
+# ---------------------------------------------------------------------------
+Spotting Assays/
+Old/
+*.JPG
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# Measurement cache and per-folder answers
+.spotting_cache/
+spotting_config.json
+timecourse_config.json
+
+# Everything a run produces
+Results/
+timecourse_candidates.csv
+*.pptx
+*.xlsx
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# R
+# ---------------------------------------------------------------------------
+.Rhistory
+.RData
+.Rproj.user/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
