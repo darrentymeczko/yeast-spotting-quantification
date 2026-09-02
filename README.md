@@ -21,12 +21,12 @@ than applied silently.
 |---|---|
 | `run_spotting.bat` | **Main pipeline.** A folder of chosen photos → measurements, statistics, figures. |
 | `run_timecourse.bat` | **Selection pipeline.** A raw capture tree → which photos are worth quantifying. |
-| `spotting_quant.py` | Measurement engine: plate finding, grid detection, ROI placement and sizing, background subtraction, normalisation, statistics. |
-| `spotting_batch.py` | Driver for the main pipeline: discovery, prompts, caching, exports. |
-| `spotting_montage.py` | Figure of the spots themselves, one block per biological replicate. |
-| `spotting_pptx.py` | Slide deck pairing each montage with its graph. |
-| `spotting_timecourse.py` | Scores every timepoint × photo pairing × dilution and ranks them. |
-| `R/plot_spotting.R` | Prism-style dot plots and the significance tests. |
+| `src/spotting_quant.py` | Measurement engine: plate finding, grid detection, ROI placement and sizing, background subtraction, normalisation, statistics. |
+| `src/spotting_batch.py` | Driver for the main pipeline: discovery, prompts, caching, exports. |
+| `src/spotting_montage.py` | Figure of the spots themselves, one block per biological replicate. |
+| `src/spotting_pptx.py` | Slide deck pairing each montage with its graph. |
+| `src/spotting_timecourse.py` | Scores every timepoint × photo pairing × dilution and ranks them. |
+| `src/plot_spotting.R` | Prism-style dot plots and the significance tests. |
 | `tests/` | Calibration harness and the hand-measured ground truth. |
 
 ---
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 **FIJI / ImageJ** — used for background subtraction, called headlessly. The code
 looks for it in the usual install locations (e.g.
 `C:\Program Files\Fiji.app\ImageJ-win64.exe`). If it is not found the run falls
-back to an equivalent implementation in `spotting_quant.py`, which is
+back to an equivalent implementation in `src/spotting_quant.py`, which is
 analytically correct but flattens the background slightly less well
 (measured: background spread 0.32 vs FIJI's 0.08 on the same plate).
 
@@ -261,7 +261,7 @@ Known limits, stated plainly:
   brighter than K-OAc or glycerol. Thresholds throughout are expressed relative
   to each plate's own measured noise for this reason; several bugs in this
   project's history were absolute constants that worked on glucose.
-- **Cache invalidation is manual.** `_cache_key` in `spotting_batch.py` ends in a
+- **Cache invalidation is manual.** `_cache_key` in `src/spotting_batch.py` ends in a
   version tag. Change any measurement logic and it must be bumped, or stale
   results are served from code that no longer exists.
 
@@ -273,12 +273,13 @@ Known limits, stated plainly:
 .
 ├── run_spotting.bat            main pipeline launcher
 ├── run_timecourse.bat          selection pipeline launcher
-├── spotting_quant.py           measurement engine
-├── spotting_batch.py           main pipeline driver
-├── spotting_montage.py         spot montages
-├── spotting_pptx.py            slide deck export
-├── spotting_timecourse.py      time-course scoring
-├── R/plot_spotting.R           figures and statistics
+├── src/
+│   ├── spotting_quant.py       measurement engine
+│   ├── spotting_batch.py       main pipeline driver
+│   ├── spotting_montage.py     spot montages
+│   ├── spotting_pptx.py        slide deck export
+│   ├── spotting_timecourse.py  time-course scoring
+│   └── plot_spotting.R         figures and statistics
 ├── tests/                      calibration harness and ground truth
 ├── requirements.txt
 └── .gitignore                  keeps photographs and results out of the repo

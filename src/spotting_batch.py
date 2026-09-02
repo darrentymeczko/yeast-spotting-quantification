@@ -46,6 +46,9 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# The repository root: source lives in src/, but the photo folder and
+# everything a run writes live beside it, not inside it.
+PROJECT_ROOT = HERE.parent
 import spotting_quant as sq   # noqa: E402
 
 # <set>.<plate><treatment>; the treatment may contain hyphens ("K-OAc").
@@ -786,7 +789,7 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", type=Path, nargs="?", default=HERE / "Spotting Assays",
+    ap.add_argument("folder", type=Path, nargs="?", default=PROJECT_ROOT / "Spotting Assays",
                     help="Folder of <set>.<plate><TREATMENT> images.")
     ap.add_argument("--out", type=Path, default=None,
                     help="Where results go (default: <folder>/Results).")
@@ -1052,7 +1055,7 @@ CONDITION_ORDER = ["GLU", "GLY", "K-OAc"]
 
 
 def _stars(p) -> str:
-    """Significance marks, matching R/plot_spotting.R exactly."""
+    """Significance marks, matching src/plot_spotting.R exactly."""
     if p is None or not np.isfinite(p):
         return ""
     if p < 1e-4:
@@ -1214,7 +1217,7 @@ def make_montages(data: dict, cfg: dict, opts: "sq.MeasureOptions",
 
 
 def run_r(csv_path: Path, outdir: Path) -> None:
-    """Draw the figures with R/plot_spotting.R if R is available."""
+    """Draw the figures with src/plot_spotting.R if R is available."""
     import shutil
     import subprocess
 
@@ -1232,9 +1235,9 @@ def run_r(csv_path: Path, outdir: Path) -> None:
         cands = sorted(Path("C:/Program Files/R").glob("R-*/bin/Rscript.exe"),
                        reverse=True) if Path("C:/Program Files/R").exists() else []
         rscript = str(cands[0]) if cands else None
-    script = HERE / "R" / "plot_spotting.R"
+    script = HERE / "plot_spotting.R"
     if not rscript or not script.exists():
-        print("\n  (R not found — CSVs written; run R/plot_spotting.R yourself "
+        print("\n  (R not found — CSVs written; run src/plot_spotting.R yourself "
               "to draw the figures.)")
         return
 

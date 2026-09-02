@@ -3081,7 +3081,7 @@ def _paired_ttests(sub: pd.DataFrame, control_col: int,
     into every comparison -- on Set 2 K-OAc it made a strain with no growth at
     all and near-zero scatter come out "not significant".
 
-    Mirrors R/plot_spotting.R so the table and the figure cannot disagree.
+    Mirrors src/plot_spotting.R so the table and the figure cannot disagree.
     """
     from scipy import stats as st
 

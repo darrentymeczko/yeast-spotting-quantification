@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent / "src"))
 import spotting_quant as sq   # noqa: E402
 
 BALL_RADIUS = 107.0     # protocol reading: (spot diameter + 20) / 2

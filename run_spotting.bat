@@ -25,7 +25,7 @@ if not defined PYEXE (
     echo.
     echo   ERROR: Python was not found on your PATH.
     echo   Install Python, or open an Anaconda Prompt and run:
-    echo       python spotting_batch.py "Spotting Assays"
+    echo       python src\spotting_batch.py "Spotting Assays"
     echo.
     pause
     exit /b 1
@@ -40,7 +40,7 @@ echo  ============================================================
 echo   Spotting assay quantification
 echo  ============================================================
 
-%PYEXE% "%~dp0spotting_batch.py" "%~dp0Spotting Assays" %*
+%PYEXE% "%~dp0src\spotting_batch.py" "%~dp0Spotting Assays" %*
 set "RC=%ERRORLEVEL%"
 
 echo.

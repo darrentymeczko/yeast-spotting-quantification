@@ -25,6 +25,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The repository root: source lives in src/, but the photo folder and
+# everything a run writes live beside it, not inside it.
+PROJECT_ROOT = HERE.parent
 
 # The supplied deck: 13.33 x 7.50 in, montage at x=0.00 w=6.47, graph at
 # x=6.43 w=6.90, both spanning the full height with no gutter and no title.
@@ -137,7 +140,7 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", type=Path, nargs="?", default=HERE / "Spotting Assays")
+    ap.add_argument("folder", type=Path, nargs="?", default=PROJECT_ROOT / "Spotting Assays")
     ap.add_argument("--combo", nargs=2, metavar=("SET", "TREATMENT"),
                     help="Only this combination, e.g. --combo 4 K-OAc")
     ap.add_argument("--out", type=Path, default=None,

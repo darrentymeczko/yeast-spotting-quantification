@@ -63,7 +63,7 @@ shift
 goto collect
 
 :run
-%PYEXE% "%~dp0spotting_timecourse.py" "%ROOT%" %EXTRA%
+%PYEXE% "%~dp0src\spotting_timecourse.py" "%ROOT%" %EXTRA%
 set "RC=%ERRORLEVEL%"
 
 echo.

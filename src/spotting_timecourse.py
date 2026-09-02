@@ -50,6 +50,9 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# The repository root: source lives in src/, but the photo folder and
+# everything a run writes live beside it, not inside it.
+PROJECT_ROOT = HERE.parent
 import spotting_quant as sq        # noqa: E402
 import spotting_batch as sb        # noqa: E402
 
@@ -322,7 +325,7 @@ def load_or_ask_config(root: Path, set_id=None, main_cfg: Path = None):
 
     sid = set_id or set_id_from_name(root.name)
     if sid:
-        main_cfg = main_cfg or (HERE / "Spotting Assays" / "spotting_config.json")
+        main_cfg = main_cfg or (PROJECT_ROOT / "Spotting Assays" / "spotting_config.json")
         got = strains_from_main_config(sid, main_cfg)
         if got:
             named = [x for x in got["strains"] if x]
