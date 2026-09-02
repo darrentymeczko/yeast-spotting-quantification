@@ -533,7 +533,8 @@ ALL_ROW_SETS = [(lo + 1, hi + 1) for lo, hi in DILUTIONS.values()]
 
 
 def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
-            debug: bool = False, precompute: bool = True) -> PlateData:
+            debug: bool = False, precompute: bool = True,
+            read_path: "Path | None" = None) -> PlateData:
     """Measure one plate, returning the result for `opts.quant_rows`.
 
     Every dilution choice is measured and cached in the same pass. Detection --
@@ -542,6 +543,11 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
     that is under a second. Measured on 9.1GLU: all three choices in one pass
     took 53.0 s against 53.8 s for a single one. So the dilution can be changed
     at review time with no re-measure, which is the whole point.
+
+    read_path: if given, the image is read from this path instead of ref.path.
+    The cache entry is still keyed on ref.path, so the caller can copy a
+    cloud-only stub to a local temp file and pass that here; re-runs will hit
+    the cache without touching the photo at all.
     """
     cf = cache_dir / f"{_cache_key(ref.path, opts)}.npz"
     want = tuple(opts.quant_rows or ())
@@ -566,7 +572,7 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
     if not precompute:
         row_sets = [want] if want else [ALL_ROW_SETS[1]]
 
-    res = sq.analyze_image_multi(ref.path, opts, row_sets,
+    res = sq.analyze_image_multi(read_path or ref.path, opts, row_sets,
                                  label=ref.label, debug=debug)
     _, _, spread, _ = res["_shared"]
 

@@ -40,8 +40,11 @@ import argparse
 import itertools
 import json
 import multiprocessing
+import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -172,20 +175,56 @@ def _init_worker():
         os.environ[var] = "1"
 
 
+_CLOUD_MASK = 0x1000 | 0x40000 | 0x400000  # OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
+
+
+def _is_cloud_stub(path: Path) -> bool:
+    """True when path is a OneDrive Files-On-Demand stub not yet on this disk."""
+    try:
+        return bool(getattr(path.stat(), "st_file_attributes", 0) & _CLOUD_MASK)
+    except OSError:
+        return False
+
+
 def _measure_one(job):
     """Worker: measure one photo at one dilution choice.
 
     Module level so a process pool can pickle it -- Windows has no fork, so a
     closure or a lambda would not survive the trip to the child process.
+
+    If the photo is a OneDrive cloud stub, it is copied to a local temp file
+    before measurement so that a concurrent OneDrive re-sync cannot change the
+    file underneath a read. The temp file is deleted immediately after; re-runs
+    hit the cache and never touch the photo at all.
     """
     path, rows, cache_dir = job
+    tmp: "Path | None" = None
     try:
         ref = sb.PhotoRef(Path(path), 0, 1, "TC")
         opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
-        sb.measure(ref, opts, Path(cache_dir))
+        cache_dir_path = Path(cache_dir)
+
+        # If the result is already cached, the photo never needs to be read —
+        # skip the download entirely.
+        cf = cache_dir_path / f"{sb._cache_key(ref.path, opts)}.npz"
+        read_path = None
+        if not cf.exists() and _is_cloud_stub(ref.path):
+            fd, tmp_str = tempfile.mkstemp(suffix=ref.path.suffix)
+            os.close(fd)
+            tmp = Path(tmp_str)
+            shutil.copy2(str(ref.path), str(tmp))
+            read_path = tmp
+
+        sb.measure(ref, opts, cache_dir_path, read_path=read_path)
         return (str(path), tuple(rows), None)
     except Exception as e:
         return (str(path), tuple(rows), f"{type(e).__name__}: {e}")
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def measure_all(jobs, cache_dir: Path, workers: int):
@@ -480,26 +519,22 @@ def main(argv=None) -> int:
           f"on {workers} worker(s)")
     stubs = cloud_placeholders(shots)
     if stubs:
-        print(f"\n  !! {len(stubs)} of {len(shots)} photos are still cloud-only "
-              f"(OneDrive Files On-Demand).")
-        for s in stubs[:5]:
-            # Relative to the root, not tp/medium/name: within a set every
-            # photo can share one camera-assigned filename, so the plate
-            # folder is the only thing telling two of them apart.
-            try:
-                rel = s.path.relative_to(root)
-            except ValueError:
-                rel = s.path
-            print(f"       {rel}")
-        if len(stubs) > 5:
-            print(f"       ... and {len(stubs) - 5} more")
-        print("     Reading them downloads them one at a time, and a file read "
-              "while it is\n     still materialising can come back partial -- "
-              "that has produced a\n     nonsense measurement in this project "
-              "before. Right-click the folder\n     -> 'Always keep on this "
-              "device', wait for it to finish, then re-run.")
-        if not sb._ask("     Continue anyway? [y/N]: ", "n").lower().startswith("y"):
-            return 1
+        # Count how many will actually need downloading (cached ones are free).
+        opts_probe = replace(sq.MeasureOptions())
+        n_download = sum(
+            1 for s in stubs
+            if not (cache / f"{sb._cache_key(s.path, opts_probe)}.npz").exists()
+        )
+        if n_download:
+            print(f"\n  Note: {n_download} of {len(stubs)} cloud-only photo(s) "
+                  f"will be downloaded as needed.")
+            print("     Each is copied to a local temp file before measurement "
+                  "so a concurrent\n     OneDrive re-sync cannot corrupt the "
+                  "read. The copy is deleted immediately\n     after; re-runs "
+                  "will use the cache and skip the download entirely.")
+        else:
+            print(f"\n  Note: {len(stubs)} photo(s) are cloud-only but all "
+                  "measurements are cached -- no download needed.")
 
     if args.cache_dir is None and "onedrive" in str(root).lower():
         print("\n  Note: the photos are on OneDrive, so the measurement cache "
