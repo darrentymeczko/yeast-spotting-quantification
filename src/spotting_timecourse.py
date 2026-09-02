@@ -483,7 +483,14 @@ def main(argv=None) -> int:
         print(f"\n  !! {len(stubs)} of {len(shots)} photos are still cloud-only "
               f"(OneDrive Files On-Demand).")
         for s in stubs[:5]:
-            print(f"       {s.tp_label}/{s.medium_label}/{s.path.name}")
+            # Relative to the root, not tp/medium/name: within a set every
+            # photo can share one camera-assigned filename, so the plate
+            # folder is the only thing telling two of them apart.
+            try:
+                rel = s.path.relative_to(root)
+            except ValueError:
+                rel = s.path
+            print(f"       {rel}")
         if len(stubs) > 5:
             print(f"       ... and {len(stubs) - 5} more")
         print("     Reading them downloads them one at a time, and a file read "
