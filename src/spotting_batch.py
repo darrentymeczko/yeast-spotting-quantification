@@ -544,7 +544,8 @@ ALL_ROW_SETS = [(lo + 1, hi + 1) for lo, hi in DILUTIONS.values()]
 
 def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
             debug: bool = False, precompute: bool = True,
-            read_path: "Path | None" = None) -> PlateData:
+            read_path: "Path | None" = None,
+            proc=None, detection=None) -> PlateData:
     """Measure one plate, returning the result for `opts.quant_rows`.
 
     Every dilution choice is measured and cached in the same pass. Detection --
@@ -582,8 +583,11 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
     if not precompute:
         row_sets = [want] if want else [ALL_ROW_SETS[1]]
 
+    # proc/detection let a caller supply the background subtraction and the
+    # detection it already has, so a batch of photos can share one FIJI run.
     res = sq.analyze_image_multi(read_path or ref.path, opts, row_sets,
-                                 label=ref.label, debug=debug)
+                                 label=ref.label, debug=debug,
+                                 proc=proc, detection=detection)
     _, _, spread, _ = res["_shared"]
 
     # Only geometry and per-choice measurements are cached, at full resolution.

@@ -3035,8 +3035,45 @@ def _pick_image(imgs: list[Path], treatment: str, plate: str) -> Path:
 # Driver
 # ---------------------------------------------------------------------------
 
+def detect_for_measure(path: Path, opts: MeasureOptions,
+                       debug: bool = False) -> dict:
+    """Everything about a plate that does NOT depend on the background subtraction.
+
+    Split out so a caller can learn a plate's ball radius WITHOUT having run
+    FIJI on it. That is what makes batching possible on the measurement pass:
+    the radius comes from `grid.largest_diameter`, so detection has to happen
+    first, and until this split the only way to get it was to run the whole
+    per-photo pipeline including its own FIJI launch.
+
+    `img8` is returned too, because the non-batched path still needs it to
+    subtract. Callers that only want the geometry can drop it -- it is 24 MB.
+    """
+    from skimage.transform import resize
+
+    img8 = load_gray8(path, rgb_mode=opts.rgb_mode)
+    if opts.rois is not None:
+        grid, bg_centers = load_roi_csv(opts.rois)
+    else:
+        grid = detect_grid(img8, debug=debug, nudge=opts.nudge, quant_rows=None)
+        bg_centers = background_gap_centers(grid)
+
+    small, ds = None, 1
+    if opts.rois is None:
+        ds = max(1, round(max(img8.shape) / DETECT_LONG_SIDE))
+        small = (resize(img8.astype(float),
+                        (img8.shape[0] // ds, img8.shape[1] // ds),
+                        order=1, preserve_range=True) if ds > 1
+                 else img8.astype(float))
+
+    return {"img8": img8, "grid": grid, "bg_centers": bg_centers,
+            "small": small, "ds": ds,
+            "ball_radius": opts.resolve_ball_radius(grid.largest_diameter)}
+
+
 def analyze_image_multi(path: Path, opts: MeasureOptions, row_sets: list,
-                        label: str = "", debug: bool = False) -> dict:
+                        label: str = "", debug: bool = False,
+                        proc: "np.ndarray | None" = None,
+                        detection: "dict | None" = None) -> dict:
     """Measure ONE plate for SEVERAL dilution-row choices in one pass.
 
     Detection (41s, dominated by the iterated full-resolution centring) and the
@@ -3051,31 +3088,33 @@ def analyze_image_multi(path: Path, opts: MeasureOptions, row_sets: list,
     """
     import copy
 
-    img8 = load_gray8(path, rgb_mode=opts.rgb_mode)
-    if opts.rois is not None:
-        grid, bg_centers = load_roi_csv(opts.rois)
-    else:
-        grid = detect_grid(img8, debug=debug, nudge=opts.nudge, quant_rows=None)
-        bg_centers = background_gap_centers(grid)
+    if detection is None:
+        detection = detect_for_measure(path, opts, debug=debug)
+    grid = detection["grid"]
+    bg_centers = detection["bg_centers"]
+    ball_radius = detection["ball_radius"]
+    small, ds = detection["small"], detection["ds"]
 
-    ball_radius = opts.resolve_ball_radius(grid.largest_diameter)
-    if opts.bg_mode == "none":
-        proc, n_iter, spread = img8.astype(np.float64), 0, 0.0
+    if proc is not None:
+        # Subtraction supplied by the caller: the same array this function
+        # would have produced, obtained from a BATCHED FIJI run. `spread` is a
+        # property of that image, so it is recomputed here rather than passed
+        # in -- max minus min of the agar disc means, exactly as
+        # subtract_background does.
+        n_iter = opts.bg_iters
+        samples = [_disk_mean(proc, cy, cx,
+                              grid.base_radius or grid.measure_radius)
+                   for cy, cx in bg_centers]
+        spread = (max(samples) - min(samples)) if samples else 0.0
+    elif opts.bg_mode == "none":
+        proc, n_iter, spread = detection["img8"].astype(np.float64), 0, 0.0
     else:
         proc, n_iter, spread = subtract_background(
-            img8, ball_radius=ball_radius, bg_centers=bg_centers,
+            detection["img8"], ball_radius=ball_radius,
+            bg_centers=bg_centers,
             bg_radius=grid.base_radius or grid.measure_radius,
             iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
             fiji_path=path, debug=debug)
-
-    small, ds = None, 1
-    if opts.rois is None:
-        from skimage.transform import resize
-        ds = max(1, round(max(img8.shape) / DETECT_LONG_SIDE))
-        small = (resize(img8.astype(float),
-                        (img8.shape[0] // ds, img8.shape[1] // ds),
-                        order=1, preserve_range=True) if ds > 1
-                 else img8.astype(float))
 
     out = {"_shared": (bg_centers, n_iter, spread, ball_radius)}
     for rows in row_sets:

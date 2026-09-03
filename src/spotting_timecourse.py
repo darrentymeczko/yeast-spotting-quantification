@@ -625,6 +625,100 @@ def _measure_one(job):
                 pass
 
 
+# Photos whose FIJI subtractions share one JVM inside a measurement worker.
+# Each subtracted plate is a 96 MB TIFF on disk until consumed, so this trades
+# temp space for JVM starts exactly as MONTAGES_PER_FIJI_BATCH does.
+PHOTOS_PER_FIJI_BATCH = 4
+
+
+def _measure_chunk(chunk):
+    """Worker: measure several photos, sharing FIJI runs between them.
+
+    The measurement pass could not batch FIJI the way the montage pass does,
+    because the ball radius comes from `grid.largest_diameter` -- it is not
+    known until detection has run on that photo. `sq.detect_for_measure` splits
+    detection out, so a worker can detect its whole chunk first, learn every
+    radius, put them through ONE FIJI run, and then measure.
+
+    Detection results stay inside the worker, so nothing is pickled or cached
+    to disk; the only extra state is `small` (~12 MB a photo) held until the
+    chunk finishes.
+
+    Any photo that the batch could not cover falls back to the ordinary
+    per-photo path, so this can only ever save time, never lose a measurement.
+    """
+    import shutil
+    import tifffile
+
+    results = []
+    for i in range(0, len(chunk), PHOTOS_PER_FIJI_BATCH):
+        group = chunk[i:i + PHOTOS_PER_FIJI_BATCH]
+        tmp = Path(tempfile.mkdtemp(prefix="tcmeas_"))
+        dets = {}
+        try:
+            # --- phase 1: detect (no FIJI), which yields the radii ---
+            for path, rows, cache_dir in group:
+                t0 = time.perf_counter()
+                ref = sb.PhotoRef(Path(path), 0, 1, "TC")
+                opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
+                cf = Path(cache_dir) / f"{sb._cache_key(ref.path, opts)}.npz"
+                if cf.exists():
+                    results.append((path, tuple(rows), None,
+                                    time.perf_counter() - t0, True))
+                    continue
+                local = None
+                try:
+                    if _is_cloud_stub(ref.path):
+                        fd, tmp_str = tempfile.mkstemp(suffix=ref.path.suffix)
+                        os.close(fd)
+                        local = Path(tmp_str)
+                        shutil.copy2(str(ref.path), str(local))
+                    dets[path] = (ref, opts, Path(cache_dir), local, t0,
+                                  sq.detect_for_measure(local or ref.path, opts))
+                except Exception as e:
+                    if local is not None:
+                        local.unlink(missing_ok=True)
+                    results.append((path, tuple(rows),
+                                    f"{type(e).__name__}: {e}",
+                                    time.perf_counter() - t0, False))
+
+            # --- phase 2: one FIJI run for the whole group ---
+            done = {}
+            fiji_jobs = [((d[3] or d[0].path), d[5]["ball_radius"])
+                         for d in dets.values()
+                         if d[1].bg_mode == "fiji"]
+            if fiji_jobs:
+                try:
+                    done = sq.fiji_subtract_background_batch(fiji_jobs, tmp)
+                except Exception:
+                    done = {}
+
+            # --- phase 3: measure and cache ---
+            for path, (ref, opts, cdir, local, t0, det) in dets.items():
+                try:
+                    src = local or ref.path
+                    tif = done.get(sq.fiji_batch_key(src, det["ball_radius"]))
+                    proc = (tifffile.imread(str(tif)).astype(np.float64)
+                            if tif else None)
+                    sb.measure(ref, opts, cdir, read_path=local,
+                               proc=proc, detection=det)
+                    results.append((path, tuple(opts.quant_rows), None,
+                                    time.perf_counter() - t0, False))
+                except Exception as e:
+                    results.append((path, tuple(opts.quant_rows),
+                                    f"{type(e).__name__}: {e}",
+                                    time.perf_counter() - t0, False))
+                finally:
+                    if local is not None:
+                        try:
+                            local.unlink()
+                        except OSError:
+                            pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
 def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
     """Measure every photo, in parallel.
 
@@ -645,24 +739,32 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
     errors, elapsed = [], []
     total = len(jobs)
     t_start = time.perf_counter()
+    done_n = 0
+    # One chunk per worker so each worker's FIJI runs are shared across the
+    # photos it owns, rather than a JVM started for every photo.
+    n_chunks = max(1, min(workers, total))
+    chunks = [c for c in (jobs[i::n_chunks] for i in range(n_chunks)) if c]
+
     if workers <= 1:
-        for i, j in enumerate(jobs, 1):
-            _, _, err, dt, cached = _measure_one(j)
-            if err:
-                errors.append((j[0], err))
-            elapsed.append((dt, cached))
-            print(f"\r    {i}/{total}", end="", flush=True)
+        for c in chunks:
+            for path, rows, err, dt, cached in _measure_chunk(c):
+                done_n += 1
+                if err:
+                    errors.append((path, err))
+                elapsed.append((dt, cached))
+                print(f"\r    {done_n}/{total}", end="", flush=True)
         print()
     else:
         with ProcessPoolExecutor(max_workers=workers,
                                  initializer=_init_worker) as pool:
-            futs = [pool.submit(_measure_one, j) for j in jobs]
-            for i, fut in enumerate(as_completed(futs), 1):
-                path, rows, err, dt, cached = fut.result()
-                if err:
-                    errors.append((path, err))
-                elapsed.append((dt, cached))
-                print(f"\r    {i}/{total}  ({workers} workers)",
+            futs = [pool.submit(_measure_chunk, c) for c in chunks]
+            for fut in as_completed(futs):
+                for path, rows, err, dt, cached in fut.result():
+                    done_n += 1
+                    if err:
+                        errors.append((path, err))
+                    elapsed.append((dt, cached))
+                print(f"\r    {done_n}/{total}  ({len(chunks)} batch worker(s))",
                       end="", flush=True)
         print()
 
