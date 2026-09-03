@@ -48,3 +48,8 @@ env/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---------------------------------------------------------------------------
+# Local tooling config: machine-specific paths, of no use to anyone else.
+# ---------------------------------------------------------------------------
+.claude/

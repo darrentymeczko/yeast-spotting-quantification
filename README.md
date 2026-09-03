@@ -26,6 +26,7 @@ than applied silently.
 | `src/spotting_montage.py` | Figure of the spots themselves, one block per biological replicate. |
 | `src/spotting_pptx.py` | Slide deck pairing each montage with its graph. |
 | `src/spotting_timecourse.py` | Scores every timepoint × photo pairing × dilution and ranks them. |
+| `src/spotting_timecourse_figures.py` | Turns each of those candidates into a comparison sheet: marked spots beside their graph. |
 | `src/plot_spotting.R` | Prism-style dot plots and the significance tests. |
 | `tests/` | Calibration harness and the hand-measured ground truth. |
 
@@ -96,7 +97,12 @@ One dilution is scored per replicate. A column can be left empty.
 
 ### What a run writes
 
-Into `Results/` beside the photos:
+Into `Results/Spotting/` **beside the code**, not beside the photos. The
+photographs live on OneDrive, and anything written next to them is synced back
+up and easily mistaken for part of the raw capture. The two pipelines keep
+separate folders — `Results/Spotting/` here, `Results/Timecourse/<set>/` for
+pipeline 2 — because they answer different questions and one must never
+overwrite the other:
 
 | file | contents |
 |---|---|
@@ -128,9 +134,29 @@ Set09/
 ```
 
 ```
+run_timecourse.bat                            # folder picker opens
 run_timecourse.bat "D:\Set09" --estimate      # how much work it is
 run_timecourse.bat "D:\Set09"                 # score everything
 ```
+
+**Several sets at once.** Run it with no argument and a multi-select folder
+picker opens — Ctrl- or Shift-click to choose as many as you like, and it
+reopens so you can add folders from elsewhere. Pointing at the folder that
+*contains* your sets runs every capture tree inside it, so ten sets take one
+click. Folders can also be dragged onto the `.bat`, or passed as arguments.
+
+Every question — which extra sessions to include, and each set's strain panel —
+is asked up front, before any measuring, so a long batch can be left alone once
+it starts.
+
+**Extra sessions.** A set folder often holds a second capture beside its
+timepoint folders (`Take02`, or somebody's name), which the plain walk would
+skip silently — on this project six of ten sets hid 249 such photos. These are
+detected, reported with their photo counts, and offered for inclusion. An
+included session runs as its **own** capture tree with its own results folder
+(`Set01 - Take02`), so a photo from one session is never paired with a photo
+from another. `--include-takes` / `--no-takes` answer for everything without
+prompting.
 
 For each medium it tries every timepoint, every pairing of a plate-1 photo with
 a plate-2 photo (technical replicates are handled by trying all combinations),
@@ -140,6 +166,29 @@ and all three dilution choices. Every candidate is scored into
 The root folder being named for a set (`Set09`) is how the strain panel is
 found — it is read from the main pipeline's `spotting_config.json` so the names
 cannot drift between the two tools.
+
+### The comparison sheets
+
+A table of coefficients of variation cannot tell you whether the spots are
+actually quantifiable, so every candidate is also drawn as one sheet in
+`Results/Timecourse/<set>/figures/<medium>/`: the four replicate blocks on the
+left with the quantified dilution row outlined in amber, and on the right the
+relative-growth graph for exactly that candidate.
+
+The graph is not a mock-up. It goes through the same tidy-frame builder and the
+same `plot_spotting.R` the main pipeline uses, so it is what quantifying that
+candidate would actually give you.
+
+Filenames are prefixed `<hours>h_d<0|1|2>_`, so sorting by name walks the time
+course in order with the three dilution choices grouped under each timepoint.
+Any three consecutive sheets share an identical spot image — only the amber row
+and the graph change — which is what makes the dilution choice comparable at a
+glance. `--figures all|none|N` controls how many are drawn (default `all`).
+
+Each photo's display background subtraction is done once, at that photo's
+largest ROI radius across the three dilutions, so the plate looks the same on
+all of its sheets; the radius used is stated in every sheet's footer. No
+brightness or contrast adjustment is applied to any spot image.
 
 ### On ranking
 
@@ -155,11 +204,16 @@ this property. Whichever is used is stamped into the CSV.
 
 ### If the photos are on OneDrive
 
-Use `--cache-dir` to keep the measurement cache on a local disk, and make sure
-the photos are actually downloaded (**right-click → Always keep on this
-device**) before running. The pipeline checks for cloud-only placeholder files
-and warns, because reading one while it is still materialising can return
-partial data — that has produced a nonsense measurement in this project before.
+Cloud-only photos are handled without any preparation on your part. A
+placeholder file is copied to a local temporary file before it is measured, so a
+OneDrive re-sync cannot change it underneath the read — reading one while it is
+still materialising can return partial data, which has produced a nonsense
+measurement in this project before. The copy is deleted immediately afterwards,
+and re-runs hit the cache without touching the photo at all. The run reports how
+many files it will need to fetch.
+
+Use `--cache-dir <local path>` to keep the measurement cache off OneDrive. It is
+only a few KB per measurement, but it is one less thing for sync to touch.
 
 ---
 
@@ -279,11 +333,23 @@ Known limits, stated plainly:
 │   ├── spotting_montage.py     spot montages
 │   ├── spotting_pptx.py        slide deck export
 │   ├── spotting_timecourse.py  time-course scoring
+│   ├── spotting_timecourse_figures.py   comparison sheets
 │   └── plot_spotting.R         figures and statistics
 ├── tests/                      calibration harness and ground truth
 ├── requirements.txt
+├── LICENSE
 └── .gitignore                  keeps photographs and results out of the repo
 ```
 
-Photographs, the measurement cache, per-folder configuration and everything in
-`Results/` are deliberately not tracked.
+Photographs, the measurement cache, per-folder configuration and everything a
+run writes are deliberately not tracked. `Results/` is created beside the code
+when a pipeline runs.
+
+---
+
+## Licence
+
+MIT — see `LICENSE`.
+
+The measurement method is that of Petropavlovskiy et al., *STAR Protocols*
+**1**:100182 (2020); please cite the paper if you use this for published work.
