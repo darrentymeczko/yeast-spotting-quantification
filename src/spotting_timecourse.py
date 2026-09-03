@@ -1180,30 +1180,173 @@ def _draw_montage_job(job):
         return (experiment, f"{type(e).__name__}: {e}")
 
 
+# How many montages share one FIJI batch inside a worker. Each plate's
+# subtracted image is a 96 MB 32-bit TIFF on disk until it is consumed, so this
+# trades temp space against JVM starts: 2 montages = 4 plates = ~380 MB per
+# worker in flight, ~3 GB across 8. Raising it amortises the 4.3 s JVM start
+# further and costs proportionally more temp space.
+MONTAGES_PER_FIJI_BATCH = 2
+
+
+def _run_r_job(job):
+    """Worker: draw one tree's figures with plot_spotting.R.
+
+    R is quick per call -- ~1.5 s of startup and library loading plus ~0.6 s a
+    figure -- but it was run once per tree, in line, so twelve trees put 36 s of
+    purely serial wall-clock in the middle of the run. Batching every tree into
+    ONE R call only reaches 1.31x, because the fixed cost being amortised is
+    small; running the calls side by side reaches about 5x instead.
+
+    Output is captured rather than printed, so twelve concurrent R processes do
+    not interleave their messages; the caller prints each block intact.
+    """
+    import contextlib
+    import io
+
+    csv_path, outdir, label = job
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            sb.run_r(Path(csv_path), Path(outdir))
+        return (label, buf.getvalue(), None)
+    except Exception as e:
+        return (label, buf.getvalue(), f"{type(e).__name__}: {e}")
+
+
+def run_r_all(jobs, workers: int):
+    """Draw every tree's figures, in parallel. Returns the list of failures."""
+    if not jobs:
+        return []
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    errors = []
+    t0 = time.perf_counter()
+    if workers <= 1 or len(jobs) == 1:
+        out = [_run_r_job(j) for j in jobs]
+    else:
+        out = []
+        with ProcessPoolExecutor(max_workers=min(workers, len(jobs)),
+                                 initializer=_init_worker) as pool:
+            futs = [pool.submit(_run_r_job, j) for j in jobs]
+            for fut in as_completed(futs):
+                out.append(fut.result())
+    for label, text, err in sorted(out, key=lambda t: t[0]):
+        tail = [ln for ln in text.splitlines() if ln.strip()]
+        if tail:
+            print(f"  --- {label} ---")
+            for ln in tail[-12:]:
+                print("  " + ln)
+        if err:
+            errors.append((label, err))
+            print(f"  ! R failed for {label}: {err}")
+    print(f"    {len(jobs)} R call(s) in {time.perf_counter() - t0:.1f}s")
+    return errors
+
+
+def _draw_montage_chunk(chunk):
+    """Worker: draw several montages, sharing FIJI runs between them.
+
+    Every montage needs two plates background-subtracted, and each subtraction
+    used to be its own headless FIJI. Starting Java is 4.3 s against 6.3 s of
+    real work, so roughly half the montage pass was booting VMs. Here the
+    plates of several montages go through ONE FIJI run and the results are
+    handed to `build_montage` ready-made.
+
+    Falls back to the per-plate path if FIJI is unavailable or a batch comes
+    back short, so a montage is never lost to this optimisation.
+    """
+    import shutil
+    import tifffile
+    import spotting_montage as sm
+
+    results = []
+    for i in range(0, len(chunk), MONTAGES_PER_FIJI_BATCH):
+        group = chunk[i:i + MONTAGES_PER_FIJI_BATCH]
+        tmp = Path(tempfile.mkdtemp(prefix="tcbg_"))
+        try:
+            # Resolve every plate and its display radius from the CACHE, so the
+            # FIJI radii are known before any image is touched.
+            prepared, fiji_jobs = [], []
+            for job in group:
+                (p1, pl1, p2, pl2, rows, strains, out_path,
+                 cache_dir, experiment) = job
+                try:
+                    opts_m = replace(sq.MeasureOptions(),
+                                     quant_rows=tuple(r + 1 for r in rows))
+                    plates = [_cached_measure(Path(p), pl,
+                                              tuple(r + 1 for r in rows),
+                                              Path(cache_dir))
+                              for p, pl in ((p1, pl1), (p2, pl2))]
+                    balls = [opts_m.resolve_ball_radius(
+                        2 * float(pd_.radius) / sq.MEASURE_RADIUS_FRAC)
+                        for pd_ in plates]
+                    prepared.append((job, opts_m, plates, balls, strains))
+                    if opts_m.bg_mode == "fiji":
+                        for pd_, ball in zip(plates, balls):
+                            fiji_jobs.append((pd_.ref.path, ball))
+                except Exception as e:
+                    results.append((job[8], f"{type(e).__name__}: {e}"))
+
+            done = {}
+            if fiji_jobs:
+                try:
+                    done = sq.fiji_subtract_background_batch(fiji_jobs, tmp)
+                except Exception:
+                    done = {}
+
+            for job, opts_m, plates, balls, strains in prepared:
+                out_path, experiment = Path(job[6]), job[8]
+                try:
+                    procs = []
+                    for pd_, ball in zip(plates, balls):
+                        tif = done.get(sq.fiji_batch_key(pd_.ref.path, ball))
+                        procs.append(
+                            tifffile.imread(str(tif)).astype(np.float64)
+                            if tif else None)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    sm.build_montage(f"TC|{experiment}", plates, strains,
+                                     opts_m, out_path, rep_label="Replicant",
+                                     proc=procs)
+                    results.append((experiment, None))
+                except Exception as e:
+                    results.append((experiment, f"{type(e).__name__}: {e}"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return results
+
+
 def draw_montages(jobs, workers: int):
     """Draw every pending montage, in parallel. Returns the list of failures."""
     if not jobs:
         return []
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    errors = []
+    errors, done_n = [], 0
     total = len(jobs)
     t0 = time.perf_counter()
+    # One chunk per worker, so each worker's FIJI runs are shared across the
+    # montages it owns rather than restarted for every plate.
+    n_chunks = max(1, min(workers, total))
+    chunks = [jobs[i::n_chunks] for i in range(n_chunks)]
+    chunks = [c for c in chunks if c]
+
     if workers <= 1:
-        for i, j in enumerate(jobs, 1):
-            exp, err = _draw_montage_job(j)
-            if err:
-                errors.append((exp, err))
-            print(f"\r    {i}/{total}", end="", flush=True)
+        for c in chunks:
+            for exp, err in _draw_montage_chunk(c):
+                done_n += 1
+                if err:
+                    errors.append((exp, err))
+                print(f"\r    {done_n}/{total}", end="", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=workers,
                                  initializer=_init_worker) as pool:
-            futs = [pool.submit(_draw_montage_job, j) for j in jobs]
-            for i, fut in enumerate(as_completed(futs), 1):
-                exp, err = fut.result()
-                if err:
-                    errors.append((exp, err))
-                print(f"\r    {i}/{total}  ({workers} workers)",
+            futs = [pool.submit(_draw_montage_chunk, c) for c in chunks]
+            for fut in as_completed(futs):
+                for exp, err in fut.result():
+                    done_n += 1
+                    if err:
+                        errors.append((exp, err))
+                print(f"\r    {done_n}/{total}  ({len(chunks)} batch worker(s))",
                       end="", flush=True)
     print(f"\n    {total} montage(s) in {(time.perf_counter() - t0) / 60:.1f} min")
     for exp, err in errors[:10]:
@@ -1225,9 +1368,9 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
     medium, and the paired t-test table it writes covers them together instead
     of each run overwriting the last.
 
-    Returns (slides, montage_jobs). The montages are drawn later, in one
-    parallel pass over the whole run, and the deck is assembled once by
-    `build_best_deck` after they land.
+    Returns (slides, montage_jobs, r_job). The R figures and the montages
+    are both drawn later, each in one parallel pass over the whole run, and
+    the deck is assembled once by `build_best_deck` after they land.
     """
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -1242,18 +1385,17 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
             print(f"  ! {_tc_experiment(cand, label)}: {type(e).__name__}: {e}")
     if not frames:
         print("  ! no medium could be built -- skipping output")
-        return []
+        return [], [], None
     tidy = pd.concat(frames, ignore_index=True)
     tidy = sq.flag_outliers(tidy, group_keys=["experiment", "strain"])
     csv_path = outdir / "spotting_results_normalized.csv"
     tidy.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"  wrote {csv_path.name}  ({len(frames)} medium/media)")
 
-    # --- R figures, once for all media ---
-    try:
-        sb.run_r(csv_path, outdir)
-    except Exception as e:
-        print(f"  ! R figures skipped: {e}")
+    # --- R figures: queued, not drawn here ---
+    # Deferred for the same reason as the montages. R is fast per call but was
+    # run in line once per tree, so a twelve-tree run serialised 36 s of it.
+    r_job = (str(csv_path), str(outdir), label)
 
     # --- queue one montage per medium, and the slide it belongs to ---
     # The montages are NOT drawn here. Each costs two headless FIJI
@@ -1267,16 +1409,15 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
         mont = outdir / "montages" / f"montage_{safe}.png"
         # R names its figure from the same treatment string, so the graph path
         # is derivable rather than searched for.
+        # R has not run yet, so the graph cannot be checked here. `main` drops
+        # any slide whose two pictures did not both land.
         graph = outdir / "figures" / f"spotting_{safe}.png"
-        if not graph.exists():
-            print(f"  (no deck slide for {experiment}: graph missing)")
-            continue
         jobs.append((str(cand["plate1"].path), cand["plate1"].plate,
                      str(cand["plate2"].path), cand["plate2"].plate,
                      tuple(rows), cfg["strains"], str(mont), str(cache),
                      experiment))
         slides.append(((label, experiment), mont, graph))
-    return slides, jobs
+    return slides, jobs, r_job
 
 
 def main(argv=None) -> int:
@@ -1398,7 +1539,7 @@ def main(argv=None) -> int:
                       file=sys.stderr)
 
     rc = 0
-    slides, mont_jobs = [], []
+    slides, mont_jobs, r_jobs = [], [], []
     for i, r in enumerate(roots, 1):
         if len(roots) > 1:
             print(f"\n{'=' * 62}\n  [{i}/{len(roots)}]  {r.label}\n{'=' * 62}")
@@ -1409,7 +1550,7 @@ def main(argv=None) -> int:
             continue
         try:
             one = run_one(r, args, cfg, multi=len(roots) > 1, slides=slides,
-                          mont_jobs=mont_jobs)
+                          mont_jobs=mont_jobs, r_jobs=r_jobs)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -1419,15 +1560,20 @@ def main(argv=None) -> int:
             one = 1
         rc = rc or one
 
+    workers_out = args.workers or max(
+        1, min(8, (multiprocessing.cpu_count() or 2) // 2))
+    if r_jobs:
+        print(f"\n{'=' * 62}\n  Drawing figures for {len(r_jobs)} tree(s) "
+              f"with R on {min(workers_out, len(r_jobs))} worker(s) ...")
+        run_r_all(r_jobs, workers_out)
+
     # Every montage in the run, drawn in one parallel pass. Each is two
     # headless FIJI subtractions and they share nothing, so this is where the
     # run's remaining wall-clock actually goes.
     if mont_jobs:
-        workers = args.workers or max(
-            1, min(8, (multiprocessing.cpu_count() or 2) // 2))
         print(f"\n{'=' * 62}\n  Drawing {len(mont_jobs)} montage(s) on "
-              f"{workers} worker(s) ...")
-        draw_montages(mont_jobs, workers)
+              f"{workers_out} worker(s) ...")
+        draw_montages(mont_jobs, workers_out)
 
     # A montage that failed leaves its slide half-built; drop those rather than
     # letting sp.build fail on a missing file.
@@ -1500,7 +1646,7 @@ def build_best_deck(slides, args) -> "Path | None":
 
 
 def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
-            mont_jobs=None) -> int:
+            mont_jobs=None, r_jobs=None) -> int:
     """Score one capture tree. `cfg` is its already-resolved strain panel.
 
     `slides` collects this tree's best-candidate (montage, graph) pairs for the
@@ -1830,12 +1976,14 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     # into the run-wide passes driven by `main`, not a deck here.
     print(f"\n  Building full output for {len(bests)} best candidate(s) ...")
     try:
-        got, jobs = output_best_candidates(bests, cfg, cache, outdir / "best",
-                                           tree.label)
+        got, jobs, rj = output_best_candidates(
+            bests, cfg, cache, outdir / "best", tree.label)
         if slides is not None:
             slides.extend(got)
         if mont_jobs is not None:
             mont_jobs.extend(jobs)
+        if r_jobs is not None and rj is not None:
+            r_jobs.append(rj)
     except Exception as e:
         print(f"  ! best-candidate output failed: {type(e).__name__}: {e}")
 

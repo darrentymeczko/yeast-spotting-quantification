@@ -150,7 +150,8 @@ def _load_gray8_cached(path: Path, rgb_mode) -> np.ndarray:
 
 
 def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
-                 radius: "float | None" = None):
+                 radius: "float | None" = None,
+                 proc: "np.ndarray | None" = None):
     """The two replicate blocks of one plate, with their rim masks.
 
     Split out of `build_montage` so repeated draws of the same plate can share
@@ -193,11 +194,17 @@ def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
     img8 = _load_gray8_cached(pd_.ref.path, opts.rgb_mode)
     # Same background treatment the numbers come from, so the picture and
     # the quantification are showing the same thing.
-    ball = opts.resolve_ball_radius(2 * r_disp / sq.MEASURE_RADIUS_FRAC)
-    proc, _, _ = sq.subtract_background(
-        img8, ball_radius=ball, bg_centers=[], bg_radius=r_disp,
-        iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
-        fiji_path=pd_.ref.path)
+    #
+    # `proc` lets the caller supply that subtraction ready-made. It is the same
+    # array this branch would compute -- the caller obtained it from a BATCHED
+    # FIJI run, which is bit-identical and amortises the 4.3 s JVM start over
+    # many images instead of paying it per plate.
+    if proc is None:
+        ball = opts.resolve_ball_radius(2 * r_disp / sq.MEASURE_RADIUS_FRAC)
+        proc, _, _ = sq.subtract_background(
+            img8, ball_radius=ball, bg_centers=[], bg_radius=r_disp,
+            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
+            fiji_path=pd_.ref.path)
     coef = _affine_from_centers(pd_.centers)
     pcy, pcx = pd_.plate_center
 
@@ -231,7 +238,7 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
                   vmin: float | None = None, vmax: float | None = None,
                   mark_row: int | None = None,
                   mark_label: str | None = None,
-                  bg_radius=None) -> Path:
+                  bg_radius=None, proc=None) -> Path:
     """Draw the montage. `mark_row`, if given, outlines one dilution row.
 
     `mark_row` is the row's index WITHIN a replicate block (0 = least dilute,
@@ -261,8 +268,9 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
                              f"{len(plates)} plates")
 
     blocks, masks = [], []
-    for pd_, r in zip(plates, radii):
-        b, m = plate_blocks(pd_, opts, radius=r)
+    procs = list(proc) if proc is not None else [None] * len(plates)
+    for pd_, r, pr in zip(plates, radii, procs):
+        b, m = plate_blocks(pd_, opts, radius=r, proc=pr)
         blocks.extend(b)
         masks.extend(m)
 

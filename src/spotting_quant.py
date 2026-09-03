@@ -373,6 +373,107 @@ close();
 """
 
 
+# Same per-image steps as _FIJI_MACRO, run in a loop inside ONE JVM. Starting
+# Java costs 4.3 s against 6.3 s of actual work per image, so nearly half of
+# every call was paying to boot the VM again. The job list arrives in a FILE
+# rather than on the command line: Windows caps a command line at ~32k
+# characters and these are long OneDrive paths.
+#
+# The IJ macro language has no try/catch, so a job that throws aborts the rest
+# of the batch. The caller therefore checks which outputs actually appeared and
+# re-runs the stragglers one at a time.
+_FIJI_BATCH_MACRO = """
+lines = split(File.openAsString(getArgument()), "\\n");
+for (i = 0; i < lines.length; i++) {
+  s = String.trim(lines[i]);
+  if (lengthOf(s) > 0) {
+    p = split(s, "|");
+    open(p[0]);
+    run("8-bit");
+    run("32-bit");
+    run("Subtract Background...", "rolling=" + p[2] + " sliding");
+    saveAs("Tiff", p[1]);
+    close();
+  }
+}
+"""
+
+
+def fiji_batch_key(path, radius: float) -> tuple:
+    """Identity of one batched subtraction: the file and the rounded radius.
+
+    Rounded because the macro formats the radius with "%.0f" -- two radii that
+    print the same ARE the same job, and must not be run twice.
+    """
+    return (str(Path(path).resolve()), f"{max(1.0, float(radius)):.0f}")
+
+
+def fiji_subtract_background_batch(jobs, out_dir: Path,
+                                   debug: bool = False) -> dict:
+    """`fiji_subtract_background` for many images in one JVM.
+
+    `jobs` is an iterable of (image_path, radius). Returns
+    {fiji_batch_key(...): Path-to-32-bit-TIFF} for every job that produced
+    output; the caller reads them with tifffile.
+
+    Results are bit-for-bit identical to running the images one at a time --
+    verified with np.array_equal across plates from four sets AND with a
+    different radius per image, which is also the check that ImageJ carries no
+    state between opens within a run. Because nothing about the computation
+    changes, cached .npz files stay valid and no version tag moves.
+
+    Returns {} if FIJI is unavailable, so the caller can fall back.
+    """
+    import subprocess
+
+    exe = find_fiji()
+    if not exe:
+        return {}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    wanted, lines = {}, []
+    for path, radius in jobs:
+        key = fiji_batch_key(path, radius)
+        if key in wanted:
+            continue                      # same file at the same radius
+        tif = out_dir / f"bg_{abs(hash(key)) & 0xFFFFFFFFFFFF:012x}.tif"
+        wanted[key] = tif
+        lines.append(f"{key[0]}|{tif}|{key[1]}")
+    if not lines:
+        return {}
+
+    job_file = out_dir / "jobs.txt"
+    job_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    macro = out_dir / "batch.ijm"
+    macro.write_text(_FIJI_BATCH_MACRO, encoding="utf-8")
+    try:
+        subprocess.run([exe, "--headless", "--console", "-macro", str(macro),
+                        str(job_file)],
+                       capture_output=True, text=True, timeout=3600,
+                       encoding="utf-8", errors="replace")
+    except Exception as e:
+        if debug:
+            print(f"    (FIJI batch failed to launch: {e})")
+        return {}
+
+    got = {k: v for k, v in wanted.items() if v.exists()}
+    # A throw inside the macro stops the loop, so anything after the bad image
+    # is simply missing. Those are re-run individually rather than lost.
+    for key, tif in wanted.items():
+        if key in got:
+            continue
+        one = fiji_subtract_background(Path(key[0]), float(key[1]), debug=debug)
+        if one is not None:
+            try:
+                import tifffile
+                tifffile.imwrite(str(tif), one.astype(np.float32))
+                got[key] = tif
+            except Exception:
+                pass
+    return got
+
+
 def find_fiji() -> str | None:
     """Path to a FIJI executable, or None."""
     import shutil
