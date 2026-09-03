@@ -25,9 +25,11 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
 PROJECT_ROOT = HERE.parent
+import spotting_batch as sb        # noqa: E402  (for the shared results root)
 
 # The supplied deck: 13.33 x 7.50 in, montage at x=0.00 w=6.47, graph at
 # x=6.43 w=6.90, both spanning the full height with no gutter and no title.
@@ -140,16 +142,25 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", type=Path, nargs="?", default=PROJECT_ROOT / "Spotting Assays")
+    ap.add_argument("folder", type=Path, nargs="?", default=None,
+                    help="Results folder to assemble (default: "
+                         "Results/Spotting beside the code).")
     ap.add_argument("--combo", nargs=2, metavar=("SET", "TREATMENT"),
                     help="Only this combination, e.g. --combo 4 K-OAc")
     ap.add_argument("--out", type=Path, default=None,
-                    help="Output .pptx (default <folder>/Results/spotting_figures.pptx)")
+                    help="Output .pptx (default <results>/spotting_figures.pptx)")
     args = ap.parse_args(argv)
 
-    results = args.folder / "Results"
+    # Accept either the results folder itself or the old <photos>/Results
+    # layout, so a path typed from memory still works.
+    if args.folder is None:
+        results = sb.MAIN_RESULTS
+    elif (args.folder / "Results").is_dir():
+        results = args.folder / "Results"
+    else:
+        results = args.folder
     if not results.is_dir():
-        print(f"No Results folder in {args.folder}. Run the analysis first.",
+        print(f"No results folder at {results}. Run the analysis first.",
               file=sys.stderr)
         return 2
 

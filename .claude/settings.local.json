@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"import sys; sys.path.insert\\(0,'src'\\); import spotting_timecourse, spotting_batch; print\\('imports OK'\\)\")",
-      "Bash(python \"src/spotting_timecourse.py\" \"C:\\\\Users\\\\darre\\\\OneDrive - The University of Western Ontario\\\\Vault\\\\2.  Projects\\\\Martin Lab\\\\Data\\\\Spotting Assays\\\\Deletion Strains\\\\Set09\" --estimate)"
-    ]
-  }
-}

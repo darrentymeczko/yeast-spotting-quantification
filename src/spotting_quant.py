@@ -844,6 +844,82 @@ EDGE_FRAC = 0.70
 DIAM_STRENGTH_PCT = 60.0
 
 
+def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
+                         C: np.ndarray) -> np.ndarray:
+    """Distance from every pixel of a patch to the nearest of the 48 centres.
+
+    The same field is needed by every full-resolution pass -- centring, the
+    diameter profile, the footprint, the outline check, the per-spot radii --
+    which between them rebuild it about fifteen times per plate over patches of
+    a few hundred thousand pixels. This used to be a cKDTree query over all 48
+    centres for every pixel.
+
+    The saving is locality, not the tree. A patch spans a fraction of the plate,
+    so almost every centre is far too distant to be nearest to any pixel in it,
+    and can be discarded before any per-pixel work happens. The test below is
+    exact, not a heuristic: with pc the patch centre and R its half-diagonal,
+    every pixel p satisfies |p - c| >= |pc - c| - R and |p - c_j| <= |pc - c_j| +
+    R, so a centre that is nearest to some pixel must have |pc - c| <=
+    min_j |pc - c_j| + 2R. Keeping exactly that set cannot change any answer.
+    In practice it leaves 1-9 of the 48. Verified against the cKDTree result,
+    bit-for-bit, for all 48 spots at each patch size the callers use.
+
+    Chunked over rows so the (H, W, n) intermediate never lands in memory whole.
+    """
+    C = np.asarray(C, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    xs = np.asarray(xs, dtype=float)
+
+    pcy = 0.5 * (float(ys[0, 0]) + float(ys[-1, -1]))
+    pcx = 0.5 * (float(xs[0, 0]) + float(xs[-1, -1]))
+    half_diag = 0.5 * float(np.hypot(ys[-1, -1] - ys[0, 0],
+                                     xs[-1, -1] - xs[0, 0]))
+    d = np.hypot(C[:, 0] - pcy, C[:, 1] - pcx)
+    C = C[d <= d.min() + 2.0 * half_diag]
+
+    out = np.empty(ys.shape, dtype=float)
+    rows = max(1, int(4_000_000 // max(ys.shape[1] * C.shape[0], 1)))
+    for a in range(0, ys.shape[0], rows):
+        b = min(a + rows, ys.shape[0])
+        dy = ys[a:b, :, None] - C[None, None, :, 0]
+        dx = xs[a:b, :, None] - C[None, None, :, 1]
+        np.sqrt((dy * dy + dx * dx).min(axis=2), out=out[a:b])
+    return out
+
+
+def _radial_bin_mean(rr: np.ndarray, values: np.ndarray, mask: np.ndarray,
+                     bins: np.ndarray, step: float,
+                     min_px: int = 30) -> np.ndarray:
+    """Mean of `values` in each annulus of `bins`, over the pixels in `mask`.
+
+    Equivalent to the obvious loop --
+
+        for k, a in enumerate(bins):
+            sel = (rr >= a) & (rr < a + step) & mask
+            if sel.sum() > min_px:
+                out[k] = values[sel].mean()
+
+    -- but in one pass instead of one full-patch boolean comparison per bin.
+    With ~100 bins over a ~300k-pixel patch, 48 spots, and the caller running up
+    to seven times per plate, that loop was tens of thousands of full-patch
+    passes. Bins are empty (NaN) below the pixel floor exactly as before.
+
+    The sums are accumulated in a different order than a per-bin mean, so
+    results agree to floating-point round-off rather than bit-for-bit.
+    """
+    r = rr[mask]
+    v = values[mask]
+    idx = np.floor(r / step).astype(np.intp)
+    keep = (idx >= 0) & (idx < bins.size)
+    idx, v = idx[keep], v[keep]
+    cnt = np.bincount(idx, minlength=bins.size)
+    tot = np.bincount(idx, weights=v, minlength=bins.size)
+    out = np.full(bins.size, np.nan)
+    ok = cnt > min_px
+    out[ok] = tot[ok] / cnt[ok]
+    return out
+
+
 def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
                           debug: bool = False) -> float | None:
     """Spot diameter from the mean radial intensity profile, at full resolution.
@@ -870,8 +946,6 @@ def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
     Returns None when too few spots are usable, in which case the caller should
     keep the detection-pass estimate.
     """
-    from scipy.spatial import cKDTree
-
     C = np.asarray(centers, float).reshape(-1, 2)
     if len(C) < 4:
         return None
@@ -879,7 +953,6 @@ def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
     if not np.isfinite(pitch) or pitch <= 0:
         return None
 
-    tree = cKDTree(C)
     rmax = 0.70 * pitch
     step = max(2.0, pitch / 100.0)
     bins = np.arange(0.0, rmax, step)
@@ -894,17 +967,13 @@ def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         patch = img8[y0:y1, x0:x1].astype(float)
-        dmin = tree.query(np.column_stack([ys.ravel(), xs.ravel()]))[0].reshape(rr.shape)
+        dmin = _nearest_center_dist(ys, xs, C)
         clear = dmin > 0.42 * pitch
         if clear.sum() < 500:
             continue
         own = dmin >= rr - 1e-6
         base = patch[clear].mean()
-        prof = np.full(bins.size, np.nan)
-        for k, a in enumerate(bins):
-            sel = (rr >= a) & (rr < a + step) & own
-            if sel.sum() > 30:
-                prof[k] = patch[sel].mean() - base
+        prof = _radial_bin_mean(rr, patch, own, bins, step) - base
         profiles.append(prof)
         strength.append(np.nanmean(prof[:n_inner]))
 
@@ -1013,7 +1082,6 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
     lattice predicts, so one bad spot can never drag its ROI off the grid.
     """
     from scipy.signal import fftconvolve
-    from scipy.spatial import cKDTree
     from scipy.ndimage import uniform_filter
 
     C = np.asarray(centers, float)
@@ -1023,7 +1091,6 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
     if not np.isfinite(pitch) or pitch <= 0:
         return C
 
-    tree = cKDTree(flat_c)
     search = max(4, int(round(FULLRES_SEARCH_PITCH * pitch)))
     rr_k = max(4, int(round(disc_radius)))
     # The patch has to hold the whole search window PLUS a disc radius beyond it,
@@ -1046,7 +1113,7 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y1, x0:x1]
         P = img8[y0:y1, x0:x1].astype(np.float32)
-        dmin = tree.query(np.column_stack([ys.ravel(), xs.ravel()]))[0].reshape(P.shape)
+        dmin = _nearest_center_dist(ys, xs, flat_c)
         # Agar only -- for the baseline fit AND for the correlation.
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
@@ -1065,9 +1132,14 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
         # brightness gradient and slides outward; texture cannot, because the
         # gradient is smooth and carries no speckle. On 2.1K-OAc r1c1 sat 51px
         # toward the rim on blank agar until texture rescued it.
-        sd = np.sqrt(np.maximum(uniform_filter(P.astype(float) * P, 7)
-                                - uniform_filter(P.astype(float), 7) ** 2, 0))
-        tex = ((sd - np.median(sd[agar])) * valid).astype(np.float32)
+        # Only the rescue pass consumes it, and that is one of the seven calls
+        # per plate -- the other six used to build it and throw it away, at two
+        # full-resolution box filters per spot.
+        tex = None
+        if texture_rescue:
+            sd = np.sqrt(np.maximum(uniform_filter(P.astype(float) * P, 7)
+                                    - uniform_filter(P.astype(float), 7) ** 2, 0))
+            tex = ((sd - np.median(sd[agar])) * valid).astype(np.float32)
 
         # Masked correlation: the MEAN over agar pixels inside the disc, not a
         # sum over everything. Without the denominator a disc that overhangs the
@@ -1163,7 +1235,6 @@ def measure_spot_footprint(img8: np.ndarray, centers: np.ndarray,
     pass, this returns garbage (the edge smears out and the profile tail
     becomes noise). Run it after `refine_centers_fullres`.
     """
-    from scipy.spatial import cKDTree
     from scipy.ndimage import uniform_filter
 
     C = np.asarray(centers, float)
@@ -1174,7 +1245,6 @@ def measure_spot_footprint(img8: np.ndarray, centers: np.ndarray,
     if not np.isfinite(pitch) or pitch <= 0:
         return None
 
-    tree = cKDTree(flat_c)
     rmax = 0.70 * pitch
     step = max(2.0, pitch / 100.0)
     bins = np.arange(0.0, rmax, step)
@@ -1189,14 +1259,10 @@ def measure_spot_footprint(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         P = img8[y0:y1, x0:x1].astype(float)
-        dmin = tree.query(np.column_stack([ys.ravel(), xs.ravel()]))[0].reshape(rr.shape)
+        dmin = _nearest_center_dist(ys, xs, flat_c)
         own = dmin >= rr - 1e-6
         sd = np.sqrt(np.maximum(uniform_filter(P * P, 7) - uniform_filter(P, 7) ** 2, 0))
-        t = np.full(bins.size, np.nan)
-        for k, a in enumerate(bins):
-            sel = (rr >= a) & (rr < a + step) & own
-            if sel.sum() > 30:
-                t[k] = sd[sel].mean()
+        t = _radial_bin_mean(rr, sd, own, bins, step)
         prof.append(t)
         strength.append(P[rr < 0.15 * pitch].mean())
 
@@ -1269,13 +1335,11 @@ def measure_spot_outlines(img8: np.ndarray, centers: np.ndarray,
 
     Returns NaN where no edge was found.
     """
-    from scipy.spatial import cKDTree
     from scipy.ndimage import uniform_filter, map_coordinates
 
     C = np.asarray(centers, float)
     flat_c = C.reshape(-1, 2)
     pitch = float(np.median(np.diff(C[0, :, 1])))
-    tree = cKDTree(flat_c)
     W = int(round(1.9 * measure_radius))
     out = np.full(len(flat_c), np.nan)
     rs = np.arange(0.30 * measure_radius, 1.7 * measure_radius, 2.0)
@@ -1286,7 +1350,7 @@ def measure_spot_outlines(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
         Q = img8[y0:y0 + 2 * W, x0:x0 + 2 * W].astype(float)
-        dmin = tree.query(np.column_stack([ys.ravel(), xs.ravel()]))[0].reshape(Q.shape)
+        dmin = _nearest_center_dist(ys, xs, flat_c)
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
                      <= FULLRES_AGAR_FRAC * plate_radius)
@@ -1442,25 +1506,33 @@ def measure_spot_radii(img8: np.ndarray, centers: np.ndarray,
     steepest decline in the spot's radial texture profile; `exists` is True where
     that profile rises meaningfully above the surrounding agar.
     """
-    from scipy.spatial import cKDTree
     from scipy.ndimage import uniform_filter, map_coordinates
 
     C = np.asarray(centers, float)
     flat_c = C.reshape(-1, 2)
     pitch = float(np.median(np.diff(C[0, :, 1])))
-    tree = cKDTree(flat_c)
     W = int(round(1.9 * measure_radius))
     rs = np.arange(SIZE_SEARCH_FLOOR * measure_radius, 1.7 * measure_radius, 2.0)
     thetas = np.arange(0, 360, 10) * np.pi / 180.0
 
+    # Memoized on the spot: the sigma-sampling loop below and the main loop both
+    # ask for the first up-to-12 spots, and this is three full-resolution box
+    # filters over a (2W)^2 patch each time.
+    _tex_cache: dict = {}
+
     def texture(cy, cx):
-        y0, x0 = int(round(cy)) - W, int(round(cx)) - W
+        key = (int(round(cy)), int(round(cx)))
+        if key in _tex_cache:
+            return _tex_cache[key]
+        y0, x0 = key[0] - W, key[1] - W
         if y0 < 0 or x0 < 0 or y0 + 2 * W >= img8.shape[0] or x0 + 2 * W >= img8.shape[1]:
+            _tex_cache[key] = None
             return None
         Q = img8[y0:y0 + 2 * W, x0:x0 + 2 * W].astype(float)
         sd = uniform_filter(np.sqrt(np.maximum(
             uniform_filter(Q * Q, 7) - uniform_filter(Q, 7) ** 2, 0)), 15)
-        return sd, y0, x0
+        _tex_cache[key] = (sd, y0, x0)
+        return _tex_cache[key]
 
     # plate-wide agar texture scatter, for the existence test
     samples = []
@@ -1470,7 +1542,7 @@ def measure_spot_radii(img8: np.ndarray, centers: np.ndarray,
             continue
         sd, y0, x0 = got
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
-        m = tree.query(np.column_stack([ys.ravel(), xs.ravel()]))[0].reshape(sd.shape)             > 0.40 * pitch
+        m = _nearest_center_dist(ys, xs, flat_c)             > 0.40 * pitch
         if plate_center is not None and plate_radius:
             m &= np.hypot(ys - plate_center[0], xs - plate_center[1])                 <= FULLRES_AGAR_FRAC * plate_radius
         if m.sum():

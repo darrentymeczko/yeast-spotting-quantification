@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +64,21 @@ AGAR_KEEP_FRAC = 0.90
 # Any rim left in frame after this is physically underneath a spot, and those
 # spots are already rim-flagged in the quantification.
 SPOT_HALO = 1.15
+# Colour of the quantified-row outline. Amber reads clearly against both
+# the black agar and a bright spot, and is not a colour any spot can be.
+MARK_COLOR = "#ffb000"
+# Plates whose resampled blocks are kept in memory. A plate is two ~449x1299
+# float32 blocks plus their bool masks -- about 6 MB -- so this is a ~190 MB
+# ceiling. Sized to hold a whole capture tree (30 photos for Set09) rather than
+# just a working set, because that is what makes each photo's background
+# subtraction happen exactly ONCE per run instead of once per pairing it
+# appears in. Lower it if a much larger tree ever strains memory.
+BLOCK_CACHE_SIZE = 32
+# Decoded 8-bit photos. 24 MB each as uint8; unlike the blocks these ARE shared
+# across dilution choices, so a small ring covers a pairing and its neighbours.
+IMG_CACHE_SIZE = 6
+_IMG_CACHE: "OrderedDict" = OrderedDict()
+_BLOCK_CACHE: "OrderedDict" = OrderedDict()
 # Display range. The montage is shown over the full 8-bit scale, exactly as the
 # background-subtracted image comes out -- NO automatic brightness or contrast.
 # Auto-stretching would silently alter how grown every spot looks, which is not
@@ -111,46 +127,144 @@ def _sample_block(img: np.ndarray, coef: np.ndarray, row0: int,
     return vals.reshape(h, w), xy[:, 1].reshape(h, w), xy[:, 0].reshape(h, w)
 
 
+def _load_gray8_cached(path: Path, rgb_mode) -> np.ndarray:
+    """`sq.load_gray8`, memoized on (path, mtime, size, rgb_mode).
+
+    A 24 MP photo decodes to 24 MB as uint8, so a handful of them is cheap to
+    hold, and every dilution choice of every pairing that photo appears in wants
+    the identical array. Returned READ-ONLY: callers must not write through it,
+    and `subtract_background` does not.
+    """
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size, rgb_mode)
+    hit = _IMG_CACHE.get(key)
+    if hit is None:
+        hit = sq.load_gray8(path, rgb_mode=rgb_mode)
+        hit.flags.writeable = False
+        _IMG_CACHE[key] = hit
+        while len(_IMG_CACHE) > IMG_CACHE_SIZE:
+            _IMG_CACHE.popitem(last=False)
+    else:
+        _IMG_CACHE.move_to_end(key)
+    return hit
+
+
+def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
+                 radius: "float | None" = None):
+    """The two replicate blocks of one plate, with their rim masks.
+
+    Split out of `build_montage` so repeated draws of the same plate can share
+    the work -- a 24 MP decode plus a full background subtraction.
+
+    `radius` overrides the ROI radius used for the display background
+    subtraction and the spot halo, and IS THE ONLY WAY the three dilution
+    choices of one plate can share this work. By default the radius comes from
+    `pd_.radius`, which is sized to the chosen dilution rows: measured on Set09
+    16h GLU the same plate gives 103.5 / 96.4 / 91.6 px for least / middle /
+    most, i.e. ball radii of 250 / 234 / 223. So by default the three choices
+    really do produce three different subtractions, and the cache key carries
+    the radius so they never share one by accident.
+
+    Passing a fixed `radius` -- the time-course sheets pass each photo's largest,
+    which is the least-dilute row's and is closest to the protocol's own "largest
+    spot diameter + 20" -- makes the picture depend on the photo alone. The plate
+    then looks identical across its three sheets, so only the marked row changes,
+    and one subtraction serves all three. The caller owns saying so on the figure:
+    the image is no longer subtracted with the exact radius that candidate's
+    numbers used.
+
+    The cache is bounded to `BLOCK_CACHE_SIZE` entries. Blocks are kept as
+    float32 -- they are display data bound for imshow over a 0-255 range, and
+    float64 doubled the memory for no visible difference.
+    """
+    r_disp = float(pd_.radius if radius is None else radius)
+    st = pd_.ref.path.stat()
+    key = (str(pd_.ref.path), st.st_mtime_ns, st.st_size, int(pd_.ref.plate),
+           opts.rgb_mode, opts.bg_mode, opts.bg_iters, opts.shrink, r_disp)
+    hit = _BLOCK_CACHE.get(key)
+    if hit is not None:
+        _BLOCK_CACHE.move_to_end(key)
+        return hit
+
+    n_rows, n_cols = sq.N_ROWS, sq.N_COLS
+    per_rep = n_rows // 2
+    # The DECODE, unlike the subtraction below, really is dilution-independent,
+    # so it is cached separately and shared across all three dilution choices.
+    img8 = _load_gray8_cached(pd_.ref.path, opts.rgb_mode)
+    # Same background treatment the numbers come from, so the picture and
+    # the quantification are showing the same thing.
+    ball = opts.resolve_ball_radius(2 * r_disp / sq.MEASURE_RADIUS_FRAC)
+    proc, _, _ = sq.subtract_background(
+        img8, ball_radius=ball, bg_centers=[], bg_radius=r_disp,
+        iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
+        fiji_path=pd_.ref.path)
+    coef = _affine_from_centers(pd_.centers)
+    pcy, pcx = pd_.plate_center
+
+    blocks, masks = [], []
+    for r0 in range(0, n_rows, per_rep):
+        blk, sy, sx = _sample_block(proc, coef, r0, per_rep, n_cols)
+        keep = np.hypot(sy - pcy, sx - pcx) <= AGAR_KEEP_FRAC * pd_.plate_radius
+        halo = (SPOT_HALO * r_disp / sq.MEASURE_RADIUS_FRAC) ** 2
+        # ...but only spots that are not themselves rim-flagged. A flagged
+        # spot is one the rim has already spoiled; it is dropped from the
+        # quantification, and exempting it here just re-admits the glare as
+        # a blown-out disc that reads as enormous growth.
+        blk_c = pd_.centers[r0:r0 + per_rep].reshape(-1, 2)
+        blk_f = pd_.rim[r0:r0 + per_rep].reshape(-1)
+        for cyx, flagged in zip(blk_c, blk_f):
+            if flagged:
+                continue
+            keep |= (sy - cyx[0]) ** 2 + (sx - cyx[1]) ** 2 <= halo
+        blocks.append(blk.astype(np.float32))
+        masks.append(keep)
+
+    _BLOCK_CACHE[key] = (blocks, masks)
+    while len(_BLOCK_CACHE) > BLOCK_CACHE_SIZE:
+        _BLOCK_CACHE.popitem(last=False)
+    return blocks, masks
+
+
 def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | None],
                   opts: sq.MeasureOptions, out_path: Path,
                   rep_label: str = "Replicant",
-                  vmin: float | None = None, vmax: float | None = None) -> Path:
+                  vmin: float | None = None, vmax: float | None = None,
+                  mark_row: int | None = None,
+                  mark_label: str | None = None,
+                  bg_radius=None) -> Path:
+    """Draw the montage. `mark_row`, if given, outlines one dilution row.
+
+    `mark_row` is the row's index WITHIN a replicate block (0 = least dilute,
+    2 = most), so the same index is outlined in all four blocks -- which is
+    exactly how a dilution choice applies. It is drawn as an overlay: no pixel
+    of the image is altered, and the display range is untouched.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
     set_id, treatment = combo.split("|", 1)
     n_rows, n_cols = sq.N_ROWS, sq.N_COLS
     per_rep = n_rows // 2                      # 3 dilution rows per replicate
 
+    # bg_radius: one value for every plate, or one PER plate. Per-plate is what
+    # the time-course sheets use -- it keeps each photo's display subtraction a
+    # function of that photo alone, so it is computed once however many pairings
+    # the photo takes part in.
+    if bg_radius is None or np.isscalar(bg_radius):
+        radii = [bg_radius] * len(plates)
+    else:
+        radii = list(bg_radius)
+        if len(radii) != len(plates):
+            raise ValueError(f"bg_radius has {len(radii)} entries for "
+                             f"{len(plates)} plates")
+
     blocks, masks = [], []
-    for pd_ in plates:
-        img8 = sq.load_gray8(pd_.ref.path, rgb_mode=opts.rgb_mode)
-        # Same background treatment the numbers come from, so the picture and
-        # the quantification are showing the same thing.
-        ball = opts.resolve_ball_radius(2 * pd_.radius / sq.MEASURE_RADIUS_FRAC)
-        proc, _, _ = sq.subtract_background(
-            img8, ball_radius=ball, bg_centers=[], bg_radius=pd_.radius,
-            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
-            fiji_path=pd_.ref.path)
-        coef = _affine_from_centers(pd_.centers)
-        pcy, pcx = pd_.plate_center
-        for r0 in range(0, n_rows, per_rep):
-            blk, sy, sx = _sample_block(proc, coef, r0, per_rep, n_cols)
-            keep = np.hypot(sy - pcy, sx - pcx) <= AGAR_KEEP_FRAC * pd_.plate_radius
-            halo = (SPOT_HALO * pd_.radius / sq.MEASURE_RADIUS_FRAC) ** 2
-            # ...but only spots that are not themselves rim-flagged. A flagged
-            # spot is one the rim has already spoiled; it is dropped from the
-            # quantification, and exempting it here just re-admits the glare as
-            # a blown-out disc that reads as enormous growth.
-            blk_c = pd_.centers[r0:r0 + per_rep].reshape(-1, 2)
-            blk_f = pd_.rim[r0:r0 + per_rep].reshape(-1)
-            for cyx, flagged in zip(blk_c, blk_f):
-                if flagged:
-                    continue
-                keep |= (sy - cyx[0]) ** 2 + (sx - cyx[1]) ** 2 <= halo
-            blocks.append(blk)
-            masks.append(keep)
+    for pd_, r in zip(plates, radii):
+        b, m = plate_blocks(pd_, opts, radius=r)
+        blocks.extend(b)
+        masks.extend(m)
 
     # No display stretch: vmin/vmax are the fixed 8-bit bounds unless the
     # caller passes an explicit range, which is then stamped on the figure so
@@ -184,6 +298,22 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
         ax.set_facecolor("black")
         ax.text(-0.012, 0.5, f"{rep_label} {k + 1}", transform=ax.transAxes,
                 color="white", fontsize=15, ha="right", va="center")
+        if mark_row is not None:
+            # A cell is CELL_PX across and row i is centred at
+            # (PAD_CELLS + i) * CELL_PX -- the same mapping the strain labels
+            # use, so the box lands square on the row.
+            # Half-height is PAD_CELLS, not 0.5 cells: the block is cropped
+            # exactly PAD_CELLS past the outer row centres, so a taller box gets
+            # clipped by the panel edge when the marked row is the first or last
+            # one -- which is precisely the case that matters most to see.
+            y_mid = (PAD_CELLS + mark_row) * CELL_PX
+            box_h = 2 * PAD_CELLS * CELL_PX
+            ax.add_patch(Rectangle((0, y_mid - box_h / 2), bw, box_h,
+                                   fill=False, edgecolor=MARK_COLOR,
+                                   linewidth=2.2))
+            if mark_label and k == 0:
+                ax.text(bw + 0.05 * CELL_PX, y_mid, mark_label,
+                        color=MARK_COLOR, fontsize=11, ha="left", va="center")
         if k == 0:
             for j, name in enumerate(strains):
                 if not name:
@@ -216,7 +346,7 @@ def main(argv=None) -> int:
     ap.add_argument("--combo", nargs=2, metavar=("SET", "TREATMENT"),
                     help="Only this treatment-set combination, e.g. --combo 4 K-OAc")
     ap.add_argument("--out", type=Path, default=None,
-                    help="Output folder (default <folder>/Results/montages).")
+                    help="Output folder (default Results/Spotting/montages beside the code).")
     ap.add_argument("--label", default="Replicant",
                     help="Row label text (default 'Replicant').")
     ap.add_argument("--ball-radius", type=float, default=None, metavar="PX",
@@ -251,7 +381,7 @@ def main(argv=None) -> int:
 
     cfg = sb.load_config(folder / sb.CONFIG_NAME)
     opts = sq.MeasureOptions(ball_radius=args.ball_radius)
-    outdir = args.out or folder / "Results" / "montages"
+    outdir = args.out or sb.MAIN_RESULTS / "montages"
 
     for k in keys:
         s, t = k.split("|", 1)

@@ -49,6 +49,16 @@ sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
 PROJECT_ROOT = HERE.parent
+# Results live beside the code, not inside the photo folder. Two reasons: the
+# photos sit on OneDrive and everything written next to them gets synced back
+# up, and a Results folder buried in the image tree is easy to miss and easy to
+# copy around by accident. The two pipelines get their own subfolder so a
+# run_spotting.bat run can never overwrite or be confused with a
+# run_timecourse.bat one -- they answer different questions and the timecourse
+# output is triage, not a result to report.
+RESULTS_ROOT = PROJECT_ROOT / "Results"
+MAIN_RESULTS = RESULTS_ROOT / "Spotting"
+TIMECOURSE_RESULTS = RESULTS_ROOT / "Timecourse"
 import spotting_quant as sq   # noqa: E402
 
 # <set>.<plate><treatment>; the treatment may contain hyphens ("K-OAc").
@@ -798,7 +808,9 @@ def main(argv=None) -> int:
     ap.add_argument("folder", type=Path, nargs="?", default=PROJECT_ROOT / "Spotting Assays",
                     help="Folder of <set>.<plate><TREATMENT> images.")
     ap.add_argument("--out", type=Path, default=None,
-                    help="Where results go (default: <folder>/Results).")
+                    help=f"Where results go (default: {RESULTS_ROOT.name}/"
+                         f"{MAIN_RESULTS.name}/ beside the code, NOT inside the "
+                         "photo folder).")
     ap.add_argument("--config", type=Path, default=None,
                     help=f"Config file (default: <folder>/{CONFIG_NAME}).")
     ap.add_argument("--reask", action="store_true",
@@ -839,7 +851,7 @@ def main(argv=None) -> int:
     if not folder.is_dir():
         print(f"Not a folder: {folder}", file=sys.stderr)
         return 2
-    outdir = args.out or folder / "Results"
+    outdir = args.out or MAIN_RESULTS
     cfg_path = args.config or folder / CONFIG_NAME
 
     combos, skipped = discover(folder)

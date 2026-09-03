@@ -45,7 +45,9 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +64,9 @@ import spotting_batch as sb        # noqa: E402
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 CONFIG_NAME = "timecourse_config.json"
 ROW_SETS = [(0, 3), (1, 4), (2, 5)]
+# Measured wall-clock for one uncached photo (full-res centring + one
+# headless FIJI background subtraction). Re-check with --timing.
+SECONDS_PER_MEASUREMENT = 70
 ROW_NAMES = ["least", "middle", "most"]
 
 MEDIUM_CODES = {
@@ -95,6 +100,11 @@ def _hours(name: str):
         return float(m.group(1))
     m = re.match(r"\s*(\d+(?:\.\d+)?)\s*$", name)
     return float(m.group(1)) if m else None
+
+
+def safe_dirname(name: str) -> str:
+    """A Windows-safe folder name derived from the capture-tree folder name."""
+    return re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .") or "timecourse"
 
 
 def _plate_no(name: str):
@@ -159,6 +169,358 @@ def candidates(shots):
     return out
 
 
+def is_capture_tree(path: Path) -> bool:
+    """True if this folder is itself a capture tree (has photos to score)."""
+    try:
+        shots, _ = discover(path)
+    except OSError:
+        return False
+    return bool(shots)
+
+
+@dataclass(frozen=True)
+class Tree:
+    """One capture tree to run, and what to call its results.
+
+    `label` names the results folder, and `set_hint` is the set number its
+    strain panel comes from. They differ for an extra take: `Set01/Take02` runs
+    as "Set01 - Take02" but takes Set 1's panel, because "Take02" contains no
+    set number of its own and would otherwise have to be typed in by hand.
+    """
+    path: Path
+    label: str
+    set_hint: "str | None" = None
+
+
+def _images_below(path: Path, cap: int = 10_000) -> int:
+    """How many images live anywhere under this folder."""
+    n = 0
+    for p in path.rglob("*"):
+        if p.suffix.lower() in IMAGE_EXT and p.is_file():
+            n += 1
+            if n >= cap:
+                break
+    return n
+
+
+def scan_extras(root: Path, max_depth: int = 4) -> tuple:
+    """Find photo folders inside a capture tree that `discover` would skip.
+
+    A set folder often holds a second session beside its timepoint folders --
+    `Take02`, or somebody's name. `discover` walks only the timepoint folders,
+    so those photos are silently left out of the analysis; on this data six of
+    ten sets hid 249 photos that way, more than the 194 the run was counting.
+
+    Returns (extras, unreadable):
+
+    * `extras` are folders that ARE valid capture trees, as (path, n_photos).
+      The scan does not descend into one once found -- its own subfolders are
+      that tree's timepoints, not further takes.
+    * `unreadable` are folders holding photos in a layout `discover` cannot
+      read, as (path, n_photos, reason). Reported so the photos are visibly
+      excluded rather than invisibly, but never offered for inclusion: working
+      out which photo is plate 1 and which is plate 2 would be a guess, and
+      getting it wrong silently mislabels replicates.
+    """
+    extras, unreadable = [], []
+
+    def walk(d: Path, depth: int) -> bool:
+        """True if anything worth reporting was found at or below `d`."""
+        if depth > max_depth:
+            return False
+        if is_capture_tree(d):
+            extras.append((d, len(discover(d)[0])))
+            return True
+        found = False
+        try:
+            subs = sorted(p for p in d.iterdir() if p.is_dir())
+        except OSError:
+            return False
+        for sub in subs:
+            if sub.name.startswith("."):
+                continue
+            found |= walk(sub, depth + 1)
+        if not found:
+            n = _images_below(d)
+            if n:
+                unreadable.append((d, n, "no 'Plate N' folder, or an extra "
+                                         "folder level above the timepoints"))
+                return True
+        return found
+
+    try:
+        subs = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return [], []
+    for sub in subs:
+        # Timepoint folders are the tree itself; anything else is a candidate.
+        if sub.name.startswith(".") or _hours(sub.name) is not None:
+            continue
+        walk(sub, 1)
+    return extras, unreadable
+
+
+def choose_extras(roots, assume=None) -> list:
+    """Show the extra sessions found inside each tree and ask which to include.
+
+    Asked immediately after the folders are chosen and before any measuring, so
+    a long batch can be left alone once it starts. An included take runs as its
+    OWN tree -- own results folder, own ranking -- so a photo from one session
+    is never paired with a photo from another.
+
+    `assume` of True/False answers everything without prompting, for
+    --include-takes / --no-takes.
+    """
+    out = list(roots)
+    for tree in roots:
+        extras, unreadable = scan_extras(tree.path)
+        if not extras and not unreadable:
+            continue
+        print(f"\n  {tree.label}: extra photo folder(s) beside the timepoints")
+        for d, n, why in unreadable:
+            print(f"    - {d.relative_to(tree.path)}  ({n} photo(s)) "
+                  f"CANNOT be read: {why}")
+            print(f"      Left out. Restructure it as "
+                  f"<timepoint>/<medium>/Plate N/ to include it.")
+        for d, n in extras:
+            rel = d.relative_to(tree.path)
+            # Which strain panel? A take usually inherits its parent's set, but
+            # some name a set of their OWN -- Set05/Andrea/"Set 1" claims set 1
+            # while sitting inside Set05. That disagreement decides which strain
+            # names get attached to all eight columns, so it is never guessed
+            # silently: the local claim wins (it is the more specific label) and
+            # the conflict is spelled out, with the panel still shown for
+            # confirmation before anything runs.
+            parent_id = tree.set_hint or set_id_from_name(tree.label)
+            own_id = next((set_id_from_name(part) for part in reversed(rel.parts)
+                           if set_id_from_name(part)), None)
+            use_id = own_id or parent_id
+            if own_id and parent_id and own_id != parent_id:
+                print(f"      [!] {rel} says set {own_id} but sits in set "
+                      f"{parent_id}. Using set {own_id} -- check the strain "
+                      f"panel it offers before accepting it.")
+            if assume is None:
+                ans = sb._ask(f"    Include {rel} ({n} photo(s)) as its own "
+                              f"set? [y/N]: ", "n")
+                take = ans.strip().lower().startswith("y")
+            else:
+                take = bool(assume)
+                print(f"    {rel} ({n} photo(s)): "
+                      f"{'included' if take else 'skipped'}")
+            if take:
+                label = f"{tree.label} - {'-'.join(rel.parts)}"
+                out.append(Tree(d, label, use_id))
+    return out
+
+
+def expand_roots(paths) -> tuple:
+    """Turn what the user pointed at into the list of capture trees to run.
+
+    A path is taken as-is if it holds photos. If it does not, its immediate
+    subfolders are checked instead, so pointing at the folder that CONTAINS the
+    sets -- `Deletion Strains`, holding Set01..Set10 -- runs all of them. That is
+    the common case when re-running everything, and it saves picking ten folders
+    one at a time.
+
+    Returns (roots, complaints). Order is preserved and duplicates are dropped,
+    so overlapping selections (a parent and one of its children) run each tree
+    once.
+    """
+    roots, seen, bad = [], set(), []
+    for p in paths:
+        p = Path(p)
+        if not p.is_dir():
+            bad.append(f"{p}: not a folder")
+            continue
+        if is_capture_tree(p):
+            found = [p]
+        else:
+            found = [d for d in sorted(p.iterdir())
+                     if d.is_dir() and not d.name.startswith(".")
+                     and is_capture_tree(d)]
+            if not found:
+                bad.append(f"{p}: no photos here, and no subfolder looks like "
+                           f"a capture tree (timepoint/medium/Plate N/images)")
+                continue
+            print(f"  {p.name}: found {len(found)} capture tree(s) inside "
+                  f"-- {', '.join(d.name for d in found)}")
+        for d in found:
+            key = str(d.resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                roots.append(Tree(d, d.name))
+    return roots, bad
+
+
+# --- native Windows multi-select folder dialog -----------------------------
+# tkinter's askdirectory and .NET's FolderBrowserDialog are both single-select,
+# so neither can do what this needs. The shell's own IFileOpenDialog can --
+# FOS_PICKFOLDERS turns it into a folder picker and FOS_ALLOWMULTISELECT lets
+# Ctrl/Shift-click pick several -- but pywin32 does not wrap that interface and
+# comtypes is not installed, so it is driven through its vtable with ctypes.
+# Slot numbers below are fixed by the interface definitions and never change:
+#   IUnknown        0 QueryInterface  1 AddRef  2 Release
+#   IModalWindow    3 Show
+#   IFileDialog     9 SetOptions  10 GetOptions  17 SetTitle  12 SetFolder
+#   IFileOpenDialog 27 GetResults
+#   IShellItemArray 7 GetCount  8 GetItemAt
+#   IShellItem      5 GetDisplayName
+_CLSID_FileOpenDialog = "{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}"
+_IID_IFileOpenDialog = "{D57C7288-D4AD-4768-BE02-9D969532D960}"
+_FOS_PICKFOLDERS, _FOS_ALLOWMULTISELECT, _FOS_FORCEFILESYSTEM = 0x20, 0x200, 0x40
+_SIGDN_FILESYSPATH = 0x80058000
+_ERROR_CANCELLED = 0x800704C7
+
+
+def _pick_folders_native(title: str, start: "Path | None" = None) -> list:
+    """Multi-select folder picker. Raises if the shell dialog is unavailable."""
+    import ctypes
+    from ctypes import POINTER, byref, c_void_p, c_uint, c_ulong, c_long
+
+    ole32 = ctypes.OleDLL("ole32")
+    shell32 = ctypes.OleDLL("shell32")
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+        def __init__(self, s):
+            super().__init__()
+            ole32.CLSIDFromString(ctypes.c_wchar_p(s), byref(self))
+
+    def call(p, slot, *args, restype=ctypes.HRESULT, argtypes=()):
+        vtbl = ctypes.cast(p, POINTER(POINTER(c_void_p)))[0]
+        proto = ctypes.WINFUNCTYPE(restype, c_void_p, *argtypes)
+        return proto(vtbl[slot])(p, *args)
+
+    ole32.CoInitialize(None)
+    dlg = c_void_p()
+    ole32.CoCreateInstance(byref(GUID(_CLSID_FileOpenDialog)), None, 1,
+                           byref(GUID(_IID_IFileOpenDialog)), byref(dlg))
+    try:
+        opts = c_uint()
+        call(dlg, 10, byref(opts), argtypes=(POINTER(c_uint),))
+        call(dlg, 9, opts.value | _FOS_PICKFOLDERS | _FOS_ALLOWMULTISELECT
+             | _FOS_FORCEFILESYSTEM, argtypes=(c_uint,))
+        call(dlg, 17, ctypes.c_wchar_p(title), argtypes=(ctypes.c_wchar_p,))
+        if start and Path(start).is_dir():
+            item = c_void_p()
+            try:
+                shell32.SHCreateItemFromParsingName(
+                    ctypes.c_wchar_p(str(start)), None,
+                    byref(GUID("{43826D1E-E718-42EE-BC55-A1E261C37BFE}")),
+                    byref(item))
+                call(dlg, 12, item, argtypes=(c_void_p,))
+                call(item, 2, restype=c_ulong)
+            except OSError:
+                pass                      # a bad start folder must not stop it
+
+        # Show returns a plain HRESULT so Cancel can be told from failure;
+        # ctypes.HRESULT would turn the cancel into an exception.
+        hr = call(dlg, 3, None, restype=c_long, argtypes=(c_void_p,))
+        if (hr & 0xFFFFFFFF) == _ERROR_CANCELLED:
+            return []
+        if hr < 0:
+            raise OSError(f"folder dialog failed: 0x{hr & 0xFFFFFFFF:08x}")
+
+        arr = c_void_p()
+        call(dlg, 27, byref(arr), argtypes=(POINTER(c_void_p),))
+        out = []
+        try:
+            n = c_uint()
+            call(arr, 7, byref(n), argtypes=(POINTER(c_uint),))
+            for i in range(n.value):
+                item = c_void_p()
+                call(arr, 8, i, byref(item),
+                     argtypes=(c_uint, POINTER(c_void_p)))
+                try:
+                    s = ctypes.c_wchar_p()
+                    call(item, 5, _SIGDN_FILESYSPATH, byref(s),
+                         argtypes=(c_uint, POINTER(ctypes.c_wchar_p)))
+                    if s.value:
+                        out.append(Path(s.value))
+                        ole32.CoTaskMemFree(s)
+                finally:
+                    call(item, 2, restype=c_ulong)
+        finally:
+            call(arr, 2, restype=c_ulong)
+        return out
+    finally:
+        call(dlg, 2, restype=c_ulong)
+
+
+def pick_folders() -> list:
+    """Ask for the folders to run.
+
+    Uses the shell's multi-select folder picker so several sets can be chosen in
+    one go with Ctrl or Shift-click, and reopens until Cancel so folders in
+    different places can be added. Picking the folder that CONTAINS the sets is
+    quicker still -- see `expand_roots`.
+
+    Returns [] if no dialog can be shown at all, so the caller can fall back to
+    typing a path.
+    """
+    print("\n  A folder picker will open.")
+    print("    * Ctrl-click or Shift-click to select SEVERAL folders at once.")
+    print("    * Or pick the one folder that CONTAINS your sets -- every "
+          "capture")
+    print("      tree inside it is found automatically.")
+    print("    * It reopens so you can add folders from elsewhere; press "
+          "Cancel when done.")
+
+    picked, start, native = [], None, True
+    while True:
+        title = (f"Select time-course folder(s) -- {len(picked)} chosen so far"
+                 if picked else
+                 "Select time-course folder(s) (Ctrl-click for several)")
+        got = []
+        if native:
+            try:
+                got = _pick_folders_native(title, start)
+            except Exception as e:
+                # Never let a picker problem block the run: fall back to the
+                # single-select dialog, which only needs tkinter.
+                print(f"  (multi-select picker unavailable: {e}; "
+                      f"falling back to one folder at a time)")
+                native = False
+                continue
+        else:
+            got = _pick_folder_tk(title, start)
+        if not got:
+            break
+        for p in got:
+            picked.append(p)
+            print(f"    + {p}")
+        start = str(got[-1].parent)
+    return picked
+
+
+def _pick_folder_tk(title: str, start) -> list:
+    """Single-folder fallback picker. Returns [] on cancel or if tkinter fails."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as e:
+        print(f"  (folder picker unavailable: {e})")
+        return []
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+    except Exception as e:
+        print(f"  (folder picker unavailable: {e})")
+        return []
+    try:
+        d = filedialog.askdirectory(title=title, initialdir=start,
+                                    mustexist=True)
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    return [Path(d)] if d else []
+
+
 def _init_worker():
     """Keep each worker single-threaded.
 
@@ -199,6 +561,8 @@ def _measure_one(job):
     """
     path, rows, cache_dir = job
     tmp: "Path | None" = None
+    t0 = time.perf_counter()
+    cached = False
     try:
         ref = sb.PhotoRef(Path(path), 0, 1, "TC")
         opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
@@ -207,8 +571,9 @@ def _measure_one(job):
         # If the result is already cached, the photo never needs to be read —
         # skip the download entirely.
         cf = cache_dir_path / f"{sb._cache_key(ref.path, opts)}.npz"
+        cached = cf.exists()
         read_path = None
-        if not cf.exists() and _is_cloud_stub(ref.path):
+        if not cached and _is_cloud_stub(ref.path):
             fd, tmp_str = tempfile.mkstemp(suffix=ref.path.suffix)
             os.close(fd)
             tmp = Path(tmp_str)
@@ -216,9 +581,11 @@ def _measure_one(job):
             read_path = tmp
 
         sb.measure(ref, opts, cache_dir_path, read_path=read_path)
-        return (str(path), tuple(rows), None)
+        return (str(path), tuple(rows), None,
+                time.perf_counter() - t0, cached)
     except Exception as e:
-        return (str(path), tuple(rows), f"{type(e).__name__}: {e}")
+        return (str(path), tuple(rows), f"{type(e).__name__}: {e}",
+                time.perf_counter() - t0, cached)
     finally:
         if tmp is not None:
             try:
@@ -227,40 +594,78 @@ def _measure_one(job):
                 pass
 
 
-def measure_all(jobs, cache_dir: Path, workers: int):
-    """Measure every (photo, dilution) pair, in parallel.
+def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
+    """Measure every photo, in parallel.
 
-    Safe to parallelise: each measurement is independent and writes its own
-    cache entry, keyed on the photo AND the row choice, so two workers never
-    touch the same file. Processes rather than threads -- detect_grid is numpy
-    work, and every call also spawns its own headless FIJI.
+    Safe to parallelise: `build_jobs` emits one job per photo, and each writes
+    its own cache entry keyed on that photo, so two workers never touch the same
+    file. Processes rather than threads -- detect_grid is numpy work, and every
+    call also spawns its own headless FIJI.
 
-    Worker count is kept modest by default because each one carries a JVM and a
-    24 MP image; oversubscribing trades throughput for paging.
+    Worker count defaults to one per physical core: each worker carries a JVM
+    and a 24 MP image, and `_init_worker` pins its BLAS to a single thread so
+    the pool scales on processes rather than fighting itself for threads.
+
+    Returns (errors, elapsed) where elapsed is a list of (seconds, was_cached)
+    per job -- see the --timing report.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    errors = []
+    errors, elapsed = [], []
     total = len(jobs)
+    t_start = time.perf_counter()
     if workers <= 1:
         for i, j in enumerate(jobs, 1):
-            _, _, err = _measure_one(j)
+            _, _, err, dt, cached = _measure_one(j)
             if err:
                 errors.append((j[0], err))
+            elapsed.append((dt, cached))
             print(f"\r    {i}/{total}", end="", flush=True)
         print()
-        return errors
+    else:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_init_worker) as pool:
+            futs = [pool.submit(_measure_one, j) for j in jobs]
+            for i, fut in enumerate(as_completed(futs), 1):
+                path, rows, err, dt, cached = fut.result()
+                if err:
+                    errors.append((path, err))
+                elapsed.append((dt, cached))
+                print(f"\r    {i}/{total}  ({workers} workers)",
+                      end="", flush=True)
+        print()
 
-    with ProcessPoolExecutor(max_workers=workers,
-                             initializer=_init_worker) as pool:
-        futs = [pool.submit(_measure_one, j) for j in jobs]
-        for i, fut in enumerate(as_completed(futs), 1):
-            path, rows, err = fut.result()
-            if err:
-                errors.append((path, err))
-            print(f"\r    {i}/{total}  ({workers} workers)", end="", flush=True)
-    print()
-    return errors
+    if timing:
+        wall = time.perf_counter() - t_start
+        fresh = sorted(dt for dt, c in elapsed if not c)
+        hits = sum(1 for _, c in elapsed if c)
+        print(f"    timing: {wall / 60:.1f} min wall-clock on {workers} "
+              f"worker(s) for {total} job(s)")
+        if fresh:
+            mid = fresh[len(fresh) // 2]
+            print(f"            {len(fresh)} measured: "
+                  f"min {fresh[0]:.0f}s / median {mid:.0f}s / "
+                  f"max {fresh[-1]:.0f}s each")
+            print(f"            throughput {sum(fresh) / wall:.1f}x "
+                  f"(serial-seconds per wall-second)")
+        if hits:
+            print(f"            {hits} served from cache")
+    return errors, elapsed
+
+
+@lru_cache(maxsize=None)
+def _cached_measure(path: Path, plate: int, rows: tuple, cache_dir: Path):
+    """`sb.measure` off the cache, memoized for the scoring pass.
+
+    Scoring reads the same photo once per (candidate, row-set, shot) -- six
+    times per candidate, and again for every other candidate that shares the
+    photo. Each of those calls re-opens and zlib-decompresses the same .npz.
+    The measurement itself is already cached on disk; this just stops the
+    decompression being repeated. Read-only: nothing mutates a PlateData.
+    """
+    ref = sb.PhotoRef(path, 0, plate, "TC")
+    opts = replace(sq.MeasureOptions(), quant_rows=rows)
+    return sb.measure(ref, opts, cache_dir)
 
 
 def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
@@ -277,11 +682,9 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
     cc = control_col - 1
     rel, ctrl_vals = {}, []
     for shot in (cand["plate1"], cand["plate2"]):
-        ref = sb.PhotoRef(shot.path, 0, shot.plate, "TC")
-        opts = replace(sq.MeasureOptions(),
-                       quant_rows=tuple(r + 1 for r in rows))
         try:
-            pd_ = sb.measure(ref, opts, cache_dir)
+            pd_ = _cached_measure(shot.path, shot.plate,
+                                  tuple(r + 1 for r in rows), cache_dir)
         except Exception:
             return None
         good = [pd_.net[r, cc] for r in rows if not pd_.rim[r, cc]]
@@ -433,20 +836,32 @@ def cloud_placeholders(shots):
 
 
 def build_jobs(cands, cache_dir: Path):
-    """One measurement per (photo, dilution) -- deduplicated.
+    """One measurement per PHOTO -- not per (photo, dilution).
 
-    A photo shared by several pairings is measured once, which is most of the
-    saving when there are technical replicates.
+    `sb.measure` computes every dilution choice in a single pass and stores them
+    all in one cache entry, and `sb._cache_key` deliberately leaves `quant_rows`
+    out of the key. So three jobs differing only in the row-set are three jobs
+    with the SAME cache key: whichever finishes first writes the entry the other
+    two would have written. Submitting them together, as this used to, handed the
+    same 24 MP photo to three workers before any of them had written the cache --
+    three full 41 s centrings, three JVM launches and, for a OneDrive stub, three
+    downloads of the same file.
+
+    The row-set below is therefore only a placeholder to make `opts.quant_rows`
+    well-formed for the cache-key computation in `_measure_one`; all three are
+    measured and cached regardless of which one is named here.
+
+    A photo shared by several pairings is likewise measured once, which is most
+    of the saving when there are technical replicates.
     """
+    rows = tuple(r + 1 for r in ROW_SETS[0])
     jobs, seen = [], set()
     for c in cands:
-        for rows in ROW_SETS:
-            for shot in (c["plate1"], c["plate2"]):
-                key = (str(shot.path), tuple(r + 1 for r in rows))
-                if key not in seen:
-                    seen.add(key)
-                    jobs.append((str(shot.path), tuple(r + 1 for r in rows),
-                                 str(cache_dir)))
+        for shot in (c["plate1"], c["plate2"]):
+            key = str(shot.path)
+            if key not in seen:
+                seen.add(key)
+                jobs.append((key, rows, str(cache_dir)))
     return jobs
 
 
@@ -458,12 +873,33 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(
         description="Pick the best photo set out of a spotting time course.")
-    ap.add_argument("root", type=Path, help="Top of the capture tree")
+    ap.add_argument("roots", type=Path, nargs="*", metavar="FOLDER",
+                    help="One or more capture trees. A folder that CONTAINS "
+                         "capture trees expands to all of them, so pointing at "
+                         "the folder holding Set01..Set10 runs all ten. With "
+                         "none given, a folder picker opens.")
+    ap.add_argument("--include-takes", action="store_true",
+                    help="Include every extra session found inside a set "
+                         "(Take02, a person's name) without asking. Each runs "
+                         "as its own set.")
+    ap.add_argument("--no-takes", action="store_true",
+                    help="Skip every extra session without asking.")
+    ap.add_argument("--pick", action="store_true",
+                    help="Open the folder picker even when folders were given, "
+                         "and add whatever you choose to them.")
     ap.add_argument("--workers", type=int, default=0,
-                    help="Parallel measurements (default: half the cores, "
-                         "max 6 -- each runs its own headless FIJI)")
+                    help="Parallel measurements (default: one per physical "
+                         "core, max 8 -- each runs its own headless FIJI)")
     ap.add_argument("--estimate", action="store_true",
                     help="Report how much work it is, then stop.")
+    ap.add_argument("--timing", action="store_true",
+                    help="Report measured per-measurement and total wall-clock "
+                         "time. Use it to compare --workers settings.")
+    ap.add_argument("--figures", default="all", metavar="all|none|N",
+                    help="Draw a spots-plus-graph sheet per candidate. "
+                         "'all' (default) draws every candidate so they can be "
+                         "compared side by side; N keeps only the best N of "
+                         "each medium; 'none' skips them.")
     ap.add_argument("--rank-by",
                     choices=["combined", "variability", "significance"],
                     default="combined",
@@ -479,14 +915,92 @@ def main(argv=None) -> int:
                     help="Where to keep measurements (default: a .spotting_cache "
                          "folder beside the photos). Point this at a LOCAL disk "
                          "when the photos live on OneDrive.")
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="Output CSV, or a folder to write the run into "
+                         "(default: Results/Timecourse/<set> beside the code).")
     args = ap.parse_args(argv)
 
-    root = args.root
-    if not root.is_dir():
-        print(f"Not a folder: {root}", file=sys.stderr)
+    given = list(args.roots)
+    if args.pick or not given:
+        given += pick_folders()
+    if not given:
+        typed = sb._ask("  Path to the time-course folder "
+                        "(or the folder holding your sets): ", "").strip('" ')
+        if typed:
+            given = [Path(typed)]
+    if not given:
+        print("No folder given.", file=sys.stderr)
         return 2
 
+    roots, bad_roots = expand_roots(given)
+    for b in bad_roots:
+        print(f"  ! {b}", file=sys.stderr)
+    if not roots:
+        print("Nothing to run.", file=sys.stderr)
+        return 2
+
+    if len(roots) > 1 and args.out and args.out.suffix.lower() == ".csv":
+        print("--out names a single CSV, but this run covers "
+              f"{len(roots)} folders. Give a FOLDER instead and each gets its "
+              "own subfolder under it.", file=sys.stderr)
+        return 2
+
+    if len(roots) > 1 and args.from_set:
+        print("--from-set names one set's strain panel, so it cannot apply to "
+              f"{len(roots)} folders. Run them one at a time, or let each "
+              "folder's name resolve its own panel.", file=sys.stderr)
+        return 2
+
+    # Extra sessions are found and settled BEFORE anything heavy, so every
+    # question in a long batch is asked in the first minute.
+    assume = True if args.include_takes else (False if args.no_takes else None)
+    roots = choose_extras(roots, assume=assume)
+
+    print(f"\n  {len(roots)} capture tree(s) to run:")
+    for r in roots:
+        print(f"    {r.label}")
+
+    # Every strain-panel question is asked NOW too, for the same reason: a
+    # ten-set run is hours of work, and interleaving prompts through it means
+    # finding the machine waiting on question six after an hour of unattended
+    # progress. --estimate skips this: it answers "how long?" without setup.
+    cfgs = {}
+    if not args.estimate:
+        for r in roots:
+            if len(roots) > 1:
+                print(f"\n  --- {r.label} ---")
+            try:
+                cfgs[str(r.path)] = load_or_ask_config(
+                    r.path, r.set_hint or args.from_set, args.main_config)
+            except Exception as e:
+                print(f"  ! {r.label}: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+
+    rc = 0
+    for i, r in enumerate(roots, 1):
+        if len(roots) > 1:
+            print(f"\n{'=' * 62}\n  [{i}/{len(roots)}]  {r.label}\n{'=' * 62}")
+        cfg = cfgs.get(str(r.path))
+        if not args.estimate and cfg is None:
+            print(f"  skipped -- no strain panel for {r.label}")
+            rc = rc or 1
+            continue
+        try:
+            one = run_one(r, args, cfg, multi=len(roots) > 1)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            # One bad tree must not abandon the rest of an overnight batch.
+            print(f"  ! {r.label} failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            one = 1
+        rc = rc or one
+    return rc
+
+
+def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
+    """Score one capture tree. `cfg` is its already-resolved strain panel."""
+    root = tree.path
     shots, bad = discover(root)
     for b in bad:
         print(f"  ! {b}")
@@ -504,19 +1018,39 @@ def main(argv=None) -> int:
     cache = args.cache_dir or (root / ".spotting_cache")
     jobs = build_jobs(cands, cache)
     # Each measurement is memory-bandwidth heavy and carries its own JVM, so the
-    # useful ceiling is physical cores -- and well below even that. --workers 1
-    # is the honest baseline to compare any setting against.
+    # useful ceiling is PHYSICAL cores, not logical ones -- hence cpu_count()//2
+    # on an SMT machine. The old cap of min(4, cpus//4) dated from the
+    # oversubscription incident in `_init_worker`, which the BLAS thread pinning
+    # there already fixes; it left half the machine idle (measured: 4 workers on
+    # a 16-logical-core box ran at ~45% total CPU). --workers 1 is the honest
+    # baseline to compare any setting against; --timing reports the real cost.
+    #
+    # RE-MEASURED 2026-09-02, 8-core/16-thread 7840U, 8 cold photos:
+    #     4 workers -> 185 s wall, median 91 s per photo, 98% of ideal scaling
+    #     8 workers -> 124 s wall, median 119 s per photo, 96% of ideal
+    # Per-photo time RISES with 8 -- they compete for memory bandwidth -- but
+    # throughput still improves 1.49x, so 8 wins. Re-time before changing this
+    # again; the naive estimate has been badly wrong here before.
     workers = args.workers or max(
-        1, min(4, (multiprocessing.cpu_count() or 2) // 4))
+        1, min(8, (multiprocessing.cpu_count() or 2) // 2))
     n_cond = len({(c["medium"], c["tp_label"]) for c in cands})
     print(f"\n  {len(shots)} photo(s), "
           f"{len({c['medium'] for c in cands})} medium/media, "
           f"{n_cond} condition-timepoints")
     print(f"  {len(cands)} photo pairing(s) x 3 dilutions = "
           f"{len(cands) * 3} candidates")
-    print(f"  {len(jobs)} measurement(s) after de-duplication; at ~70 s each "
-          f"that is about {len(jobs) * 70 / 60 / max(workers, 1):.0f} min "
-          f"on {workers} worker(s)")
+    # One measurement per photo, not per (photo, dilution): every dilution
+    # choice comes out of the same pass. SECONDS_PER_MEASUREMENT is a measured
+    # figure -- re-check it with --timing after any change to worker count or to
+    # the measurement code, because the naive estimate has been badly wrong here
+    # before (see _init_worker).
+    n_todo = sum(
+        1 for j in jobs
+        if not (cache / f"{sb._cache_key(Path(j[0]), replace(sq.MeasureOptions(), quant_rows=j[1]))}.npz").exists())
+    print(f"  {len(jobs)} measurement(s) after de-duplication, "
+          f"{n_todo} not yet cached; at ~{SECONDS_PER_MEASUREMENT} s each that "
+          f"is about {n_todo * SECONDS_PER_MEASUREMENT / 60 / max(workers, 1):.0f} "
+          f"min on {workers} worker(s)")
     stubs = cloud_placeholders(shots)
     if stubs:
         # Count how many will actually need downloading (cached ones are free).
@@ -546,11 +1080,10 @@ def main(argv=None) -> int:
     if args.estimate:
         return 0
 
-    cfg = load_or_ask_config(root, args.from_set, args.main_config)
     cache.mkdir(parents=True, exist_ok=True)
 
     print(f"\n  Measuring on {workers} worker(s) ...")
-    errs = measure_all(jobs, cache, workers)
+    errs, _ = measure_all(jobs, cache, workers, timing=args.timing)
     for path, e in errs[:10]:
         print(f"  ! {Path(path).name}: {e}")
     if len(errs) > 10:
@@ -598,7 +1131,21 @@ def main(argv=None) -> int:
                             ascending=[True, by_var, True]).reset_index(drop=True)
     df["ranked_by"] = args.rank_by
 
-    out = args.out or (root / "timecourse_candidates.csv")
+    # Results live beside the code under Results/Timecourse/<set>, never inside
+    # the photo tree: the photos are on OneDrive, and a run's output written
+    # next to them gets synced up and is easy to mistake for part of the raw
+    # capture. The main pipeline writes to Results/Spotting for the same reason,
+    # and the two stay apart because they answer different questions -- this one
+    # is triage, that one is the result.
+    # With several trees in one run, --out names the PARENT: each still gets its
+    # own subfolder, or they would overwrite each other's CSV one by one.
+    if args.out and args.out.is_dir():
+        outdir = (args.out / safe_dirname(tree.label) if multi else args.out)
+    else:
+        outdir = sb.TIMECOURSE_RESULTS / safe_dirname(tree.label)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = (args.out if args.out and args.out.suffix.lower() == ".csv" and not multi
+           else outdir / "timecourse_candidates.csv")
     df.to_csv(out, index=False, encoding="utf-8-sig")
     print(f"  wrote {out}  ({len(df)} scored candidates)")
 
@@ -619,6 +1166,29 @@ def main(argv=None) -> int:
               f"{b['control_mean']:.1f} (CV {b['control_CV']:.2f})   "
               f"{int(b['n_significant'])}/{int(b['n_strains'])} significant")
         print(f"               {b['plate1']}  +  {b['plate2']}")
+    want = str(args.figures).strip().lower()
+    if want != "none":
+        n_per = None if want == "all" else max(1, int(want))
+        print("\n  Drawing "
+              + ("a sheet for every candidate" if n_per is None
+                 else f"sheets for the best {n_per} candidate(s) per medium")
+              + " ...")
+        try:
+            import spotting_timecourse_figures as tcf
+            made = tcf.build_figures(
+                df, cands, cache, cfg["strains"], cfg["control_col"],
+                outdir / "figures", n_per_medium=n_per,
+                exclude=cfg.get("exclude"),
+                rank_note=f"ranked by {args.rank_by}")
+            if made:
+                print(f"  wrote {len(made)} sheet(s) to {outdir / 'figures'}")
+            else:
+                print("  (no sheets drawn)")
+        except Exception as e:
+            # The CSV is already on disk. Losing the figures must not lose the
+            # run: they are a convenience drawn over data that is already saved.
+            print(f"  ! figures skipped: {type(e).__name__}: {e}")
+
     print("\n  Every candidate is in the CSV -- the ranking is a suggestion, "
           "not a decision.")
     return 0

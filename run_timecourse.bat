@@ -12,13 +12,23 @@ REM
 REM  and scores every timepoint x photo pairing x dilution, so you can see which
 REM  are worth opening first.
 REM
-REM  Drag the top folder onto this file, or run it and type the path.
+REM  SEVERAL SETS AT ONCE:
+REM    * Just double-click this file -- a folder picker opens, and reopens until
+REM      you press Cancel, so you can add as many as you like.
+REM    * Pick the folder that CONTAINS your sets (e.g. "Deletion Strains") and
+REM      every capture tree inside it runs -- Set01..Set10 in one go.
+REM    * Or drag one or more folders onto this file.
+REM
+REM  Every strain-panel question is asked up front, before any measuring, so a
+REM  long batch can be left alone once it starts.
+REM
 REM  Extra options pass straight through, e.g.
 REM      run_timecourse.bat "D:\Set09" --workers 8
 REM      run_timecourse.bat "D:\Set09" --estimate
+REM      run_timecourse.bat --pick --figures none
 REM ---------------------------------------------------------------------------
 
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "PYEXE="
@@ -37,33 +47,23 @@ if not defined PYEXE (
 set "PYTHONIOENCODING=utf-8"
 chcp 65001 >nul
 
-set "ROOT=%~1"
-if "%ROOT%"=="" (
-    echo.
-    set /p "ROOT=  Path to the time-course folder (e.g. D:\Set09): "
-)
-if "%ROOT%"=="" (
-    echo   No folder given.
-    pause
-    exit /b 1
-)
-
 echo.
 echo  ============================================================
 echo   Spotting time course -- scoring photo sets
 echo  ============================================================
 
-REM %~2 onwards are passed through; %* would repeat the folder.
-set "EXTRA="
-shift
+REM Pass every argument through untouched. Folders and switches are told apart
+REM by the Python side, so dragging several folders on works, and so does
+REM dragging none (which opens the picker).
+set "ARGS="
 :collect
 if "%~1"=="" goto run
-set "EXTRA=%EXTRA% %1"
+set "ARGS=!ARGS! "%~1""
 shift
 goto collect
 
 :run
-%PYEXE% "%~dp0src\spotting_timecourse.py" "%ROOT%" %EXTRA%
+%PYEXE% "%~dp0src\spotting_timecourse.py" %ARGS%
 set "RC=%ERRORLEVEL%"
 
 echo.
