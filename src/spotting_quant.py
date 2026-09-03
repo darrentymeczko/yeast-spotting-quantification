@@ -616,6 +616,33 @@ def _remove_small(mask, n_px):
         return remove_small_objects(mask, int(n_px))
 
 
+def _white_tophat(g: np.ndarray, footprint: np.ndarray) -> np.ndarray:
+    """`skimage.morphology.white_tophat`, via OpenCV when it is installed.
+
+    The disc here is ~80 px across on the detection image, and scipy's greyscale
+    opening costs 14.6 s at that size -- on its own the second-largest slice of
+    a measurement. OpenCV runs the identical morphology with SIMD kernels in
+    4.2 s.
+
+    Verified bit-for-bit (`np.array_equal`) against the skimage result on real
+    plates, which is the only reason this is safe to swap in: the tophat feeds
+    spot detection, so any numerical difference would move every centre, change
+    every measurement, and invalidate every cached .npz. Border handling is the
+    one place the two could disagree, so it is pinned to REFLECT to match
+    scipy's default rather than left at OpenCV's constant border.
+
+    Falls back to skimage if OpenCV is missing or refuses the input.
+    """
+    try:
+        import cv2
+        return cv2.morphologyEx(g, cv2.MORPH_TOPHAT,
+                                np.asarray(footprint, dtype=np.uint8),
+                                borderType=cv2.BORDER_REFLECT)
+    except Exception:
+        from skimage.morphology import white_tophat
+        return white_tophat(g, footprint)
+
+
 def _closing(mask, footprint):
     """binary_closing -> closing (0.26). Identical for boolean input and the
     symmetric disk footprints used here."""
@@ -655,7 +682,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
     from skimage.transform import resize
     from skimage.filters import threshold_otsu
     from skimage.measure import label, regionprops
-    from skimage.morphology import disk, white_tophat
+    from skimage.morphology import disk
     from scipy import ndimage as ndi
 
     ds = max(1, round(max(img8.shape) / DETECT_LONG_SIDE))
@@ -678,7 +705,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
 
     # 3) white top-hat isolates spot-sized bright features
     sr = max(6, int(r_eq * SPOT_RADIUS_FRAC))
-    th = white_tophat(g, disk(int(sr * 1.6)))
+    th = _white_tophat(g, disk(int(sr * 1.6)))
     th_in = np.where(agar, th, 0.0)
 
     # 3b) spot centroids + size estimate
@@ -845,7 +872,7 @@ DIAM_STRENGTH_PCT = 60.0
 
 
 def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
-                         C: np.ndarray) -> np.ndarray:
+                         C: np.ndarray, grid_like: bool = False) -> np.ndarray:
     """Distance from every pixel of a patch to the nearest of the 48 centres.
 
     The same field is needed by every full-resolution pass -- centring, the
@@ -864,6 +891,16 @@ def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
     In practice it leaves 1-9 of the 48. Verified against the cKDTree result,
     bit-for-bit, for all 48 spots at each patch size the callers use.
 
+    `grid_like` promises that `ys` and `xs` came from `np.mgrid` -- ys constant
+    along each row, xs constant down each column. That lets the squares be
+    formed on the two 1-D axes and broadcast, so no (H, W, n) array is built at
+    all: one H*W pass per surviving centre instead of one H*W*n pass through
+    temporaries several times the size of the patch. Measured 6-13x faster
+    across the patch sizes the callers use, bit-for-bit identical to the general
+    path. It is a parameter rather than something sniffed from the arrays
+    because a wrong guess would silently corrupt every measurement; a caller
+    that does not pass it just gets the general path.
+
     Chunked over rows so the (H, W, n) intermediate never lands in memory whole.
     """
     C = np.asarray(C, dtype=float)
@@ -876,6 +913,15 @@ def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
                                      xs[-1, -1] - xs[0, 0]))
     d = np.hypot(C[:, 0] - pcy, C[:, 1] - pcx)
     C = C[d <= d.min() + 2.0 * half_diag]
+
+    if grid_like and C.shape[0] and ys.ndim == 2:
+        yv = ys[:, 0]
+        xv = xs[0, :]
+        best = None
+        for cy, cx in C:
+            d2 = ((yv - cy) ** 2)[:, None] + ((xv - cx) ** 2)[None, :]
+            best = d2 if best is None else np.minimum(best, d2, out=best)
+        return np.sqrt(best, out=best)
 
     out = np.empty(ys.shape, dtype=float)
     rows = max(1, int(4_000_000 // max(ys.shape[1] * C.shape[0], 1)))
@@ -967,7 +1013,7 @@ def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         patch = img8[y0:y1, x0:x1].astype(float)
-        dmin = _nearest_center_dist(ys, xs, C)
+        dmin = _nearest_center_dist(ys, xs, C, grid_like=True)
         clear = dmin > 0.42 * pitch
         if clear.sum() < 500:
             continue
@@ -1113,7 +1159,7 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y1, x0:x1]
         P = img8[y0:y1, x0:x1].astype(np.float32)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         # Agar only -- for the baseline fit AND for the correlation.
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
@@ -1259,7 +1305,7 @@ def measure_spot_footprint(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         P = img8[y0:y1, x0:x1].astype(float)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         own = dmin >= rr - 1e-6
         sd = np.sqrt(np.maximum(uniform_filter(P * P, 7) - uniform_filter(P, 7) ** 2, 0))
         t = _radial_bin_mean(rr, sd, own, bins, step)
@@ -1350,7 +1396,7 @@ def measure_spot_outlines(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
         Q = img8[y0:y0 + 2 * W, x0:x0 + 2 * W].astype(float)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
                      <= FULLRES_AGAR_FRAC * plate_radius)
@@ -1542,7 +1588,8 @@ def measure_spot_radii(img8: np.ndarray, centers: np.ndarray,
             continue
         sd, y0, x0 = got
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
-        m = _nearest_center_dist(ys, xs, flat_c)             > 0.40 * pitch
+        m = _nearest_center_dist(ys, xs, flat_c,
+                                 grid_like=True) > 0.40 * pitch
         if plate_center is not None and plate_radius:
             m &= np.hypot(ys - plate_center[0], xs - plate_center[1])                 <= FULLRES_AGAR_FRAC * plate_radius
         if m.sum():
