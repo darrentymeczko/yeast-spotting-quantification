@@ -1242,7 +1242,7 @@ def run_r(csv_path: Path, outdir: Path) -> None:
     # Absolute paths, always. Rscript does not necessarily start in the working
     # directory it was launched from -- an Rprofile that calls setwd() moves it
     # -- and a relative path then resolves against somewhere else entirely. That
-    # happened here: R reported the CSV missing from 'C:/Users/darre/Workplace'
+    # happened here: R reported the CSV missing from an unrelated home folder
     # and silently drew no figures, leaving the previous run's figures in place
     # and looking current.
     csv_path = Path(csv_path).resolve()

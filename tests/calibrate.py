@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -483,10 +484,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="Ground-truth folder (see tests/gt/README.md).")
     ap.add_argument("--image", type=Path,
                     help="Plate image. Defaults to image_relpath from gt_meta.csv.")
+    # image_relpath in gt_meta.csv is relative to wherever the photographs
+    # happen to live, which differs on every machine. This used to default to
+    # one particular local folder, which silently did the wrong thing for
+    # anybody else who ran it.
     ap.add_argument("--data-root", type=Path,
-                    default=Path(r"C:\Users\darre\OneDrive - The University of Western Ontario"
-                                 r"\Vault\2.  Projects\Martin Lab\Data\Spotting Assays"),
-                    help="Root that image_relpath in gt_meta.csv is relative to.")
+                    default=Path(os.environ.get("SPOTTING_DATA_ROOT", ".")),
+                    help="Root that image_relpath in gt_meta.csv is relative "
+                         "to. Defaults to $SPOTTING_DATA_ROOT, or the current "
+                         "folder.")
     ap.add_argument("--sweep", nargs=2, metavar=("PARAM", "VALUES"),
                     help="Sweep a parameter, e.g. --sweep ball-radius 107,150,214")
     ap.add_argument("--plot", action="store_true", help="Save scatter plots.")
