@@ -106,7 +106,14 @@ def find_pairs(results: Path) -> list:
     return pairs
 
 
-def build(pairs: list, out_path: Path) -> Path:
+def build(pairs: list, out_path: Path, note=None) -> Path:
+    """Assemble one slide per (montage, graph) pair.
+
+    `note` optionally overrides the speaker-note text: a callable taking the
+    two key fields. The time-course pipeline uses it because its slides are
+    keyed on a capture-tree label rather than a set number, and the default
+    "Set <id> <treatment>" wording does not fit them.
+    """
     from pptx import Presentation
     from pptx.util import Inches
     from PIL import Image
@@ -127,7 +134,8 @@ def build(pairs: list, out_path: Path) -> Path:
                                      Inches(w), Inches(h))
         # Not shown on the slide -- the example carries no text -- but it makes
         # the deck navigable and searchable.
-        slide.notes_slide.notes_text_frame.text = f"Set {set_id} {treatment}"
+        slide.notes_slide.notes_text_frame.text = (
+            note(set_id, treatment) if note else f"Set {set_id} {treatment}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pres.save(str(out_path))

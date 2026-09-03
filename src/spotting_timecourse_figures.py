@@ -89,15 +89,24 @@ def _dil_choice(rows: tuple) -> str:
 
 def build_tidy_for_candidate(cand: dict, rows: tuple, cache_dir: Path,
                              strains: list, control_col: int,
-                             exclude=None):
+                             exclude=None, resolve=None):
     """The tidy frame for one candidate, normalized exactly as the pipeline does.
 
     Returns (tidy, plates), or None if either plate is missing from the cache or
     the frame came back empty -- both mean there is nothing to draw. Returning a
     tuple whose first element could itself be None invited the caller to test
     only the tuple and then hand an empty frame to to_csv.
+
+    `resolve` optionally maps this candidate's medium to its own
+    (control_col, exclude), overriding the defaults passed in. The main
+    pipeline picks the control per medium -- WT BY does not grow on K-OAc --
+    and a sheet drawn against the wrong control is not comparable to the figure
+    the run finally produces.
     """
     import spotting_timecourse as tc
+
+    if resolve is not None:
+        control_col, exclude = resolve(cand["medium"])
 
     plates = []
     for shot in (cand["plate1"], cand["plate2"]):
@@ -156,7 +165,8 @@ def build_candidate_figure(cand: dict, rows: tuple, cache_dir: Path,
                            strains: list, control_col: int, outdir: Path,
                            opts: "sq.MeasureOptions | None" = None,
                            exclude=None, rank_note: str = "",
-                           metrics: "dict | None" = None) -> "Path | None":
+                           metrics: "dict | None" = None,
+                           resolve=None) -> "Path | None":
     """One sheet: marked spot montage on the left, its own R graph on the right.
 
     Returns the sheet path, or None if the candidate could not be drawn (a
@@ -166,7 +176,7 @@ def build_candidate_figure(cand: dict, rows: tuple, cache_dir: Path,
     opts = opts or sq.MeasureOptions()
     cid = candidate_id(cand, rows)
     got = build_tidy_for_candidate(cand, rows, cache_dir, strains,
-                                   control_col, exclude)
+                                   control_col, exclude, resolve)
     if got is None:
         return None
     tidy, plates = got
@@ -282,7 +292,8 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
                   strains: list, control_col: int, outdir: Path,
                   n_per_medium: "int | None" = None,
                   opts: "sq.MeasureOptions | None" = None,
-                  exclude=None, rank_note: str = "") -> list:
+                  exclude=None, rank_note: str = "",
+                  resolve=None) -> list:
     """Draw a sheet per candidate -- every one by default, so they can be compared.
 
     `n_per_medium=None` means all; an integer keeps only that many per medium,
@@ -341,7 +352,7 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
         frames, keep = [], []
         for medium, cand, rows, metrics in picked:
             got = build_tidy_for_candidate(cand, rows, cache_dir, strains,
-                                           control_col, exclude)
+                                           control_col, exclude, resolve)
             if got is None:
                 print(f"  ! no measurement for {candidate_id(cand, rows)}; "
                       f"skipped")

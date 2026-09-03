@@ -32,6 +32,24 @@ chance, and the p-value printed beside them would no longer mean what it says.
 The --rank-by significance switch exists because you may want to look, but it
 warns, and results chosen that way must not be reported as if the candidate had
 been fixed in advance.
+
+THE "BEST SET" AND ITS CONSENSUS
+
+Separately from that ranking, the run aggregates which strains reach
+significance across ALL candidates and in which direction. Strains that agree
+often enough (CONSENSUS_MIN_FRAC) form the "core" -- on this data POS5, GTR1 and
+SOD2 come out reduced in almost every candidate, while CTA1 only occasionally
+does. A candidate is then scored on how much of that core it recovers in the
+agreed direction, whether its control has all four replicates, how clean it is,
+and how much of its significance NOTHING else supports. The single best-scoring
+candidate is written out in full -- montage, graph and deck -- under best/.
+
+The off-consensus penalty is load-bearing, not decoration. Rewarding matches
+alone let the noisiest candidate win by accumulating false positives, because
+every extra hit added score; it was demoted only once unsupported hits started
+costing. The same caveat as above still applies: the core is derived from these
+candidates, so the winner's p-values remain optimistic as a final claim and the
+chosen set is still confirmed by eye.
 """
 
 from __future__ import annotations
@@ -62,12 +80,25 @@ import spotting_quant as sq        # noqa: E402
 import spotting_batch as sb        # noqa: E402
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+# The measurement cache lives with the PROGRAM, never in the photo folders.
+# Two reasons it must not go beside the photos: those folders are the raw
+# capture and nothing generated belongs in them, and they sit on OneDrive, so
+# every .npz would be synced up and pushed to every other machine.
+#
+# One shared cache serves every tree because `sb._cache_key` is keyed on the
+# file NAME, size and mtime -- not the path -- so an entry stays valid when
+# folders are reorganised or renamed. Verified against this dataset: 450 photos
+# produce 450 distinct keys with no collisions, even though `_9.JPG` is reused
+# 256 times.
+TIMECOURSE_CACHE = PROJECT_ROOT / ".spotting_cache"
 CONFIG_NAME = "timecourse_config.json"
 ROW_SETS = [(0, 3), (1, 4), (2, 5)]
 # Measured wall-clock for one uncached photo (full-res centring + one
 # headless FIJI background subtraction). Re-check with --timing.
 SECONDS_PER_MEASUREMENT = 70
 ROW_NAMES = ["least", "middle", "most"]
+# The order the media are run in, for slide and report ordering.
+MEDIUM_ORDER = ["GLU", "GLY", "K-OAc"]
 
 MEDIUM_CODES = {
     "glucose": "GLU",
@@ -568,7 +599,7 @@ def _measure_one(job):
         opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
         cache_dir_path = Path(cache_dir)
 
-        # If the result is already cached, the photo never needs to be read —
+        # If the result is already cached, the photo never needs to be read --
         # skip the download entirely.
         cf = cache_dir_path / f"{sb._cache_key(ref.path, opts)}.npz"
         cached = cf.exists()
@@ -705,7 +736,8 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
     cm = float(np.mean(ctrl_vals))
     floor = sq.MIN_CONTROL_GRAY / max(cm, 1e-9)
     cvs, n_sig, n_str = [], 0, 0
-    for v in rel.values():
+    strain_sigs: dict[str, int] = {}  # strain -> +1 increased / -1 reduced
+    for strain_name, v in rel.items():
         v = np.asarray(v, float)
         if len(v) < 3 or v.mean() <= 0:
             continue
@@ -715,12 +747,15 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
         if np.all(w > 0) and float(
                 stats.ttest_1samp(np.log(w), 0).pvalue) < p_thresh:
             n_sig += 1
+            strain_sigs[strain_name] = 1 if float(v.mean()) > 1.0 else -1
     if not cvs:
         return None
     return {"median_CV": float(np.median(cvs)),
             "control_mean": cm,
             "control_CV": float(np.std(ctrl_vals) / cm) if cm > 0 else np.nan,
-            "n_strains": n_str, "n_significant": n_sig}
+            "n_strains": n_str, "n_significant": n_sig,
+            "control_n": len(ctrl_vals),
+            "_strain_sigs": strain_sigs}
 
 
 def set_id_from_name(name: str):
@@ -749,10 +784,57 @@ def strains_from_main_config(set_id, main_cfg: Path):
     entry = (cfg.get("sets") or {}).get(str(set_id))
     if not entry or not entry.get("strains"):
         return None
+    set_cc = int(entry.get("control_col") or 1)
+
+    # The control is chosen PER MEDIUM in the main pipeline, not per set, and
+    # that choice is stored in cfg["combo"] under "<set>|<medium>". It is not a
+    # formality: WT BY has a growth defect on K-OAc, so sets 1-4 name a
+    # different strain as the control there and exclude WT BY outright. Reading
+    # only the set-level column silently normalises K-OAc against a strain that
+    # barely grew, which divides by ~0 and inflates every ratio on the plate.
+    media = {}
+    for key, ent in (cfg.get("combo") or {}).items():
+        sid, _, medium = str(key).partition("|")
+        if sid != str(set_id) or not ent or not medium:
+            continue
+        media[medium] = {
+            "control_col": int(ent.get("control_col") or set_cc),
+            "exclude": list(ent.get("exclude") or []),
+        }
     return {"strains": entry["strains"],
-            "control_col": int(entry.get("control_col") or 1),
-            "exclude": [], "from_set": str(set_id),
+            "control_col": set_cc,
+            "exclude": [], "media": media,
+            "from_set": str(set_id),
             "from_config": str(main_cfg)}
+
+
+def medium_cfg(cfg: dict, medium: str):
+    """(control_col, exclude) for one medium, falling back to the set default.
+
+    Every scoring and normalising path goes through here so a per-medium
+    control cannot be honoured in one place and missed in another.
+    """
+    m = (cfg.get("media") or {}).get(medium) or {}
+    cc = int(m.get("control_col") or cfg.get("control_col") or 1)
+    ex = list(m.get("exclude") if m.get("exclude") is not None
+              else (cfg.get("exclude") or []))
+    return cc, ex
+
+
+def _report_media(cfg: dict) -> None:
+    """Print the per-medium control, so a wrong one is visible before the run."""
+    media = cfg.get("media") or {}
+    if not media:
+        return
+    strains = cfg.get("strains") or []
+    print("    per-medium control:")
+    for medium in sorted(media, key=_medium_rank):
+        cc, ex = medium_cfg(cfg, medium)
+        name = strains[cc - 1] if 0 < cc <= len(strains) else "?"
+        drop = (" -- excluding "
+                + ", ".join(str(strains[i - 1]) if 0 < i <= len(strains)
+                            else f"col{i}" for i in ex)) if ex else ""
+        print(f"      {medium:>7}: {name} (column {cc}){drop}")
 
 
 def load_or_ask_config(root: Path, set_id=None, main_cfg: Path = None):
@@ -762,12 +844,28 @@ def load_or_ask_config(root: Path, set_id=None, main_cfg: Path = None):
     entry for the set the folder is named after (Set09 -> sets["9"]), then ask.
     """
     path = root / CONFIG_NAME
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-
     sid = set_id or set_id_from_name(root.name)
+    default_main = PROJECT_ROOT / "Spotting Assays" / "spotting_config.json"
+
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        # Configs written before the per-medium control was understood have no
+        # "media" block, so they would keep normalising K-OAc against WT BY.
+        # Backfill from the main config rather than making the user delete and
+        # re-answer: the panel is unchanged, only the per-medium control is new.
+        if "media" not in saved and sid:
+            got = strains_from_main_config(sid, main_cfg or default_main)
+            if got and got.get("media"):
+                saved["media"] = got["media"]
+                path.write_text(json.dumps(saved, indent=2, ensure_ascii=False),
+                                encoding="utf-8")
+                print(f"  updated {path.name}: added per-medium controls "
+                      f"from {Path(main_cfg or default_main).name}")
+        _report_media(saved)
+        return saved
+
     if sid:
-        main_cfg = main_cfg or (PROJECT_ROOT / "Spotting Assays" / "spotting_config.json")
+        main_cfg = main_cfg or default_main
         got = strains_from_main_config(sid, main_cfg)
         if got:
             named = [x for x in got["strains"] if x]
@@ -776,6 +874,7 @@ def load_or_ask_config(root: Path, set_id=None, main_cfg: Path = None):
             print(f"    {', '.join(named)}")
             print(f"    control: {got['strains'][got['control_col']-1]} "
                   f"(column {got['control_col']})")
+            _report_media(got)
             if sb._ask("    Use this? [Y/n]: ", "y").lower().startswith("y"):
                 path.write_text(json.dumps(got, indent=2, ensure_ascii=False),
                                 encoding="utf-8")
@@ -865,6 +964,321 @@ def build_jobs(cands, cache_dir: Path):
     return jobs
 
 
+def _aggregate_strain_significance(strain_sigs_list):
+    """Count how many candidates found each strain significant, by direction.
+
+    Returns {strain: {+1: n_increased, -1: n_reduced}}.
+    """
+    counts: dict[str, dict[int, int]] = {}
+    for sigs in strain_sigs_list:
+        for strain, direction in sigs.items():
+            if strain not in counts:
+                counts[strain] = {1: 0, -1: 0}
+            counts[strain][direction] += 1
+    return counts
+
+
+CONSENSUS_MIN_FRAC = 0.5   # a strain is "core" if this fraction of candidates agree
+W_ALIGN, W_COMPLETE, W_VARIANCE, W_OFF = 3.0, 1.0, 1.5, 1.0
+
+# A candidate only gets a vote in the consensus if its control grew enough for
+# the assay to resolve anything. `sq.MIN_CONTROL_GRAY` censors an individual
+# spot; this is the same idea one level up, on the candidate.
+#
+# Why it matters: relative growth is censored at MIN_CONTROL_GRAY/control, so a
+# candidate whose control read 1.6 gray cannot see a strain unless it is down
+# more than 33%, while one at 25 gray resolves 2%. The dim candidate finds
+# nothing -- not because nothing is there, but because it could not look. Left
+# in the denominator that reads as evidence of absence. On Set02 K-OAc the 18
+# undergrown 40-46 h candidates held PIM1 at 25/51 = 49%, one short of core,
+# while every one of its 25 hits came from the readable timepoints (25/36 = 69%).
+READABLE_CONTROL_MULT = 10.0        # control must reach 10x the spot floor
+# ... but only when enough candidates survive to still be a consensus. Some
+# set/medium combinations are dim THROUGHOUT (sets 5-8 on K-OAc), and gating
+# those would build a "consensus" out of two candidates, which is worse than
+# not gating. There the whole medium is the finding, and it is reported instead.
+MIN_READABLE_CANDIDATES = 8
+MIN_READABLE_FRAC = 0.30
+
+
+def core_strains(consensus, n_total, min_frac: float = CONSENSUS_MIN_FRAC):
+    """The strains that are significant OFTEN, and the direction they agree on.
+
+    Returns {strain: (direction, frequency)} for strains whose dominant
+    direction appears in at least `min_frac` of all candidates. This is the
+    "POS5, GTR1 and SOD2 are commonly reduced" set; a strain that only
+    occasionally reaches significance (CTA1) is deliberately left out, because
+    matching it says more about noise than about the biology.
+    """
+    core = {}
+    for strain, dirs in consensus.items():
+        direction = max(dirs, key=lambda d: dirs[d])
+        freq = dirs[direction] / max(n_total, 1)
+        if dirs[direction] and freq >= min_frac:
+            core[strain] = (direction, freq)
+    return core
+
+
+def _off_consensus_penalty(sigs, consensus, n_total, core,
+                           min_frac: float = CONSENSUS_MIN_FRAC):
+    """How much of this candidate's significance is unsupported by the others.
+
+    Scaled by how RARE each unsupported hit is, not merely counted. A strain
+    reaching significance in a third of candidates is a weak but real effect
+    and should barely register; one that fires once in thirty is noise and
+    should cost most of a point. Anything at or above the core threshold costs
+    nothing.
+    """
+    if not sigs:
+        return 0.0
+    total = 0.0
+    for strain, direction in sigs.items():
+        if core.get(strain, (None,))[0] == direction:
+            continue
+        freq = consensus.get(strain, {}).get(direction, 0) / max(n_total, 1)
+        total += max(0.0, 1.0 - freq / min_frac)
+    return total / len(sigs)
+
+
+def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0):
+    """Composite score for best-candidate selection.
+
+    (1) Alignment (weight 3): how much of the CORE consensus this candidate
+        recovers, in the agreed direction, as a fraction of the total core
+        weight available. Bounded [0, 1] on purpose -- an earlier version
+        summed matches without normalising, so a candidate that reached
+        significance on everything simply accumulated points and beat a
+        cleaner one on the strength of its false positives.
+    (2) Completeness (weight 1): control replicates / 4, capped at 1. The
+        control is the denominator for every ratio on the plate, so a missing
+        control replicate costs more than a missing anything else.
+    (3) Variance (weight 1.5): 1 - the candidate's CV percentile among all
+        candidates, so the cleanest data scores 1 and the noisiest 0. Raw CV
+        was useless here -- it spans too narrow a range to break ties.
+    (4) Off-consensus penalty (weight 1): see `_off_consensus_penalty`. A
+        candidate firing on strains nothing else agrees on is reporting noise,
+        not signal, and without this term the noisiest candidate wins simply by
+        accumulating false positives.
+    """
+    total_w = sum(f for _, f in core.values())
+    matched = sum(f for s, (d, f) in core.items() if sigs.get(s) == d)
+    alignment = matched / total_w if total_w else 0.0
+
+    completeness = min(control_n / 4.0, 1.0)
+    return (W_ALIGN * alignment + W_COMPLETE * completeness
+            + W_VARIANCE * cv_pct - W_OFF * off_frac)
+
+
+def _tc_experiment(cand, label: str) -> str:
+    """What one best-candidate graph is called, e.g. "Set01 GLU 22 Hours".
+
+    This is the `treatment` column, so R keys both the figure title and the
+    figure filename on it. It carries the capture-tree label because the deck
+    gathers every tree in the run: "GLU 22 Hours" alone would not say which set
+    a slide came from.
+    """
+    return f"{label} {cand['medium']} {cand['tp_label']}"
+
+
+def _medium_rank(medium: str):
+    """Sort key putting media in the order they are run, not alphabetically."""
+    return (MEDIUM_ORDER.index(medium) if medium in MEDIUM_ORDER
+            else len(MEDIUM_ORDER), medium)
+
+
+def _r_safe(s: str) -> str:
+    """R's safe() from plot_spotting.R, so montage names match graph names."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+
+
+def build_tidy_for_candidate(cand, rows, cfg, cache_dir, label):
+    """Tidy DataFrame for one candidate -- suitable for the R plotting script.
+
+    Mirrors `spotting_batch.build_tidy` for a timecourse candidate: each shot
+    contributes two rows of the dilution (rep 1+2 from plate 1, rep 3+4 from
+    plate 2), and relative growth is normalised against the control column.
+    """
+    strains = cfg["strains"]
+    control_col, ex_list = medium_cfg(cfg, cand["medium"])
+    exclude = set(ex_list)
+    experiment = _tc_experiment(cand, label)
+
+    plates_m = []
+    result_rows = []
+    for shot in (cand["plate1"], cand["plate2"]):
+        pd_ = _cached_measure(shot.path, shot.plate,
+                              tuple(r + 1 for r in rows), cache_dir)
+        plates_m.append(pd_)
+        for rep_idx, row in enumerate(rows, start=1):
+            rep_no = (shot.plate - 1) * 2 + rep_idx
+            for col in range(sq.N_COLS):
+                name = strains[col]
+                if not name:
+                    continue
+                result_rows.append({
+                    "experiment": experiment,
+                    "treatment": experiment,
+                    "set": "TC",
+                    "plate": shot.plate,
+                    "image": shot.path.name,
+                    "replicate": f"rep{rep_no}",
+                    "dilution_row": row + 1,
+                    "dilution": ROW_NAMES[row % 3],
+                    "strain_col": col + 1,
+                    "strain": name,
+                    "raw_growth": float(pd_.net[row, col]),
+                    "artifact": bool(pd_.rim[row, col]),
+                    "excluded": (col + 1) in exclude,
+                    "is_control": (col + 1) == control_col,
+                })
+
+    full = pd.DataFrame(result_rows)
+    if full.empty:
+        return full
+
+    keep = full[~full["excluded"]].copy()
+    if keep.empty or control_col in exclude:
+        return full
+
+    # Same noise-aware floor the main pipeline uses: a fixed gray cutoff cannot
+    # work across media whose signal ranges differ by an order of magnitude.
+    noise = max([sq.bg_noise(p.bg_samples) for p in plates_m] or [0.0])
+    min_control = max(sq.MIN_CONTROL_GRAY, sq.CONTROL_NOISE_MULT * noise)
+
+    keep = sq.add_relative_growth(keep, control_col=control_col,
+                                  group_keys=["experiment"],
+                                  min_control=min_control)
+    key_cols = ["experiment", "replicate", "strain_col"]
+    added = [c for c in keep.columns if c not in full.columns]
+    return full.merge(keep[key_cols + added], on=key_cols, how="left")
+
+
+def _draw_montage_job(job):
+    """Worker: draw one montage from already-cached measurements.
+
+    Module level so a process pool can pickle it -- Windows has no fork.
+
+    Drawing a montage costs a headless FIJI background subtraction per plate,
+    measured at ~20 s each against 1.4 s to decode the photo, so a sheet is
+    ~40 s of almost entirely idle CPU. Serially that is ~27 min for a 36-slide
+    run. The work is per-photo and independent, exactly like `measure_all`, so
+    it parallelises the same way.
+    """
+    (p1, pl1, p2, pl2, rows, strains, out_path, cache_dir, experiment) = job
+    try:
+        import spotting_montage as sm
+        opts_m = replace(sq.MeasureOptions(),
+                         quant_rows=tuple(r + 1 for r in rows))
+        plates = [_cached_measure(Path(p), pl, tuple(r + 1 for r in rows),
+                                  Path(cache_dir))
+                  for p, pl in ((p1, pl1), (p2, pl2))]
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        sm.build_montage(f"TC|{experiment}", plates, strains, opts_m,
+                         Path(out_path), rep_label="Replicant")
+        return (experiment, None)
+    except Exception as e:
+        return (experiment, f"{type(e).__name__}: {e}")
+
+
+def draw_montages(jobs, workers: int):
+    """Draw every pending montage, in parallel. Returns the list of failures."""
+    if not jobs:
+        return []
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    errors = []
+    total = len(jobs)
+    t0 = time.perf_counter()
+    if workers <= 1:
+        for i, j in enumerate(jobs, 1):
+            exp, err = _draw_montage_job(j)
+            if err:
+                errors.append((exp, err))
+            print(f"\r    {i}/{total}", end="", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=_init_worker) as pool:
+            futs = [pool.submit(_draw_montage_job, j) for j in jobs]
+            for i, fut in enumerate(as_completed(futs), 1):
+                exp, err = fut.result()
+                if err:
+                    errors.append((exp, err))
+                print(f"\r    {i}/{total}  ({workers} workers)",
+                      end="", flush=True)
+    print(f"\n    {total} montage(s) in {(time.perf_counter() - t0) / 60:.1f} min")
+    for exp, err in errors[:10]:
+        print(f"  ! montage failed for {exp}: {err}")
+    return errors
+
+
+def output_best_candidates(bests, cfg, cache, outdir, label):
+    """Full pipeline output for the best candidate of EACH medium.
+
+    One per medium, not one per set. Each medium is its own experiment -- the
+    main pipeline draws a separate figure for every treatment-set combination
+    -- so collapsing a set to a single winner silently discards the other two
+    thirds of the work. On this data that dropped K-OAc and glycerol from eight
+    of ten sets.
+
+    All media go into ONE tidy CSV and ONE R invocation, exactly as the main
+    pipeline does it: R keys its figures on `treatment` and emits one per
+    medium, and the paired t-test table it writes covers them together instead
+    of each run overwriting the last.
+
+    Returns (slides, montage_jobs). The montages are drawn later, in one
+    parallel pass over the whole run, and the deck is assembled once by
+    `build_best_deck` after they land.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # --- one tidy CSV covering every medium ---
+    frames = []
+    for cand, rows in bests:
+        try:
+            t = build_tidy_for_candidate(cand, rows, cfg, cache, label)
+            if not t.empty:
+                frames.append(t)
+        except Exception as e:
+            print(f"  ! {_tc_experiment(cand, label)}: {type(e).__name__}: {e}")
+    if not frames:
+        print("  ! no medium could be built -- skipping output")
+        return []
+    tidy = pd.concat(frames, ignore_index=True)
+    tidy = sq.flag_outliers(tidy, group_keys=["experiment", "strain"])
+    csv_path = outdir / "spotting_results_normalized.csv"
+    tidy.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"  wrote {csv_path.name}  ({len(frames)} medium/media)")
+
+    # --- R figures, once for all media ---
+    try:
+        sb.run_r(csv_path, outdir)
+    except Exception as e:
+        print(f"  ! R figures skipped: {e}")
+
+    # --- queue one montage per medium, and the slide it belongs to ---
+    # The montages are NOT drawn here. Each costs two headless FIJI
+    # subtractions (~40 s) and they are independent, so they are collected
+    # across every tree in the run and drawn in one parallel pass at the end;
+    # doing them inline made a 36-slide run ~27 min of near-idle CPU.
+    slides, jobs = [], []
+    for cand, rows in bests:
+        experiment = _tc_experiment(cand, label)
+        safe = _r_safe(experiment)
+        mont = outdir / "montages" / f"montage_{safe}.png"
+        # R names its figure from the same treatment string, so the graph path
+        # is derivable rather than searched for.
+        graph = outdir / "figures" / f"spotting_{safe}.png"
+        if not graph.exists():
+            print(f"  (no deck slide for {experiment}: graph missing)")
+            continue
+        jobs.append((str(cand["plate1"].path), cand["plate1"].plate,
+                     str(cand["plate2"].path), cand["plate2"].plate,
+                     tuple(rows), cfg["strains"], str(mont), str(cache),
+                     experiment))
+        slides.append(((label, experiment), mont, graph))
+    return slides, jobs
+
+
 def main(argv=None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -912,9 +1326,9 @@ def main(argv=None) -> int:
     ap.add_argument("--main-config", type=Path, default=None,
                     help="Path to the main pipeline spotting_config.json.")
     ap.add_argument("--cache-dir", type=Path, default=None,
-                    help="Where to keep measurements (default: a .spotting_cache "
-                         "folder beside the photos). Point this at a LOCAL disk "
-                         "when the photos live on OneDrive.")
+                    help="Where to keep measurements (default: .spotting_cache "
+                         "inside the program folder, shared by every tree). "
+                         "Nothing is ever written into the photo folders.")
     ap.add_argument("--out", type=Path, default=None,
                     help="Output CSV, or a folder to write the run into "
                          "(default: Results/Timecourse/<set> beside the code).")
@@ -951,6 +1365,13 @@ def main(argv=None) -> int:
               "folder's name resolve its own panel.", file=sys.stderr)
         return 2
 
+    # A folder given to --out is CREATED, not silently ignored. Both the
+    # per-tree output and the deck test `args.out.is_dir()`, so pointing at a
+    # folder that does not exist yet used to drop the whole run back into the
+    # default Results/Timecourse without saying so.
+    if args.out and args.out.suffix.lower() != ".csv":
+        args.out.mkdir(parents=True, exist_ok=True)
+
     # Extra sessions are found and settled BEFORE anything heavy, so every
     # question in a long batch is asked in the first minute.
     assume = True if args.include_takes else (False if args.no_takes else None)
@@ -977,6 +1398,7 @@ def main(argv=None) -> int:
                       file=sys.stderr)
 
     rc = 0
+    slides, mont_jobs = [], []
     for i, r in enumerate(roots, 1):
         if len(roots) > 1:
             print(f"\n{'=' * 62}\n  [{i}/{len(roots)}]  {r.label}\n{'=' * 62}")
@@ -986,7 +1408,8 @@ def main(argv=None) -> int:
             rc = rc or 1
             continue
         try:
-            one = run_one(r, args, cfg, multi=len(roots) > 1)
+            one = run_one(r, args, cfg, multi=len(roots) > 1, slides=slides,
+                          mont_jobs=mont_jobs)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -995,11 +1418,95 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             one = 1
         rc = rc or one
+
+    # Every montage in the run, drawn in one parallel pass. Each is two
+    # headless FIJI subtractions and they share nothing, so this is where the
+    # run's remaining wall-clock actually goes.
+    if mont_jobs:
+        workers = args.workers or max(
+            1, min(8, (multiprocessing.cpu_count() or 2) // 2))
+        print(f"\n{'=' * 62}\n  Drawing {len(mont_jobs)} montage(s) on "
+              f"{workers} worker(s) ...")
+        draw_montages(mont_jobs, workers)
+
+    # A montage that failed leaves its slide half-built; drop those rather than
+    # letting sp.build fail on a missing file.
+    ready = [s for s in slides if s[1].exists() and s[2].exists()]
+    if len(ready) != len(slides):
+        for (lbl, exp), mont, _ in slides:
+            if not mont.exists():
+                print(f"  (no slide for {exp}: montage missing)")
+    build_best_deck(ready, args)
     return rc
 
 
-def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
-    """Score one capture tree. `cfg` is its already-resolved strain panel."""
+def build_best_deck(slides, args) -> "Path | None":
+    """One deck for the whole run: each tree's best candidate, one slide each.
+
+    Deliberately run-wide rather than per-set. The best set of Set01 is only
+    interesting next to the best set of Set02, and a folder of thirteen
+    one-slide PowerPoints has to be reassembled by hand before it can be
+    looked at.
+
+    Slides are ordered by tree label and then by medium in run order, so an
+    extra take sits directly after the set it came from and each set's media
+    read GLU, GLY, K-OAc rather than alphabetically.
+    """
+    if not slides:
+        return None
+    try:
+        import spotting_pptx as sp
+    except Exception as e:
+        print(f"\n  (deck skipped -- could not import spotting_pptx: {e})")
+        return None
+
+    root = (args.out if args.out and args.out.is_dir()
+            else sb.TIMECOURSE_RESULTS)
+    out = root / "timecourse_best_sets.pptx"
+    # The experiment already starts with the label, so the medium is what is
+    # left after it -- enough to order GLU, GLY, K-OAc within each set.
+    ordered = sorted(slides, key=lambda s: (
+        s[0][0], _medium_rank(s[0][1][len(s[0][0]):].split()[0])))
+    print(f"\n{'=' * 62}\n  Building the combined deck ...")
+    try:
+        sp.build(ordered, out, note=lambda label, exp: exp)
+    except PermissionError:
+        # Almost always the deck is open in PowerPoint, which locks it on
+        # Windows. Losing a run's worth of montages to that is absurd, so the
+        # deck goes to a numbered sibling and says so loudly.
+        alt = None
+        for i in range(2, 100):
+            cand = out.with_name(f"{out.stem}_{i}{out.suffix}")
+            if not cand.exists():
+                alt = cand
+                break
+        try:
+            sp.build(ordered, alt, note=lambda label, exp: exp)
+        except Exception as e:
+            print(f"  ! deck failed: {type(e).__name__}: {e}")
+            return None
+        print(f"  [!] {out.name} is LOCKED (open in PowerPoint?) and still "
+              f"holds the PREVIOUS run.\n      This run was written to "
+              f"{alt.name} instead -- close the old one and\n      delete it, "
+              f"or you will be reading stale numbers.")
+        return alt
+    except Exception as e:
+        print(f"  ! deck failed: {type(e).__name__}: {e}")
+        return None
+    print(f"  wrote {out}  ({len(ordered)} slide(s))")
+    for (label, exp), _, _ in ordered:
+        print(f"    {exp}")
+    return out
+
+
+def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
+            mont_jobs=None) -> int:
+    """Score one capture tree. `cfg` is its already-resolved strain panel.
+
+    `slides` collects this tree's best-candidate (montage, graph) pairs for the
+    run-wide PowerPoint and `mont_jobs` the montages still to be drawn; pass
+    None to skip either.
+    """
     root = tree.path
     shots, bad = discover(root)
     for b in bad:
@@ -1015,7 +1522,7 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
               "images -- four replicates need both.", file=sys.stderr)
         return 1
 
-    cache = args.cache_dir or (root / ".spotting_cache")
+    cache = args.cache_dir or TIMECOURSE_CACHE
     jobs = build_jobs(cands, cache)
     # Each measurement is memory-bandwidth heavy and carries its own JVM, so the
     # useful ceiling is PHYSICAL cores, not logical ones -- hence cpu_count()//2
@@ -1070,13 +1577,6 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
             print(f"\n  Note: {len(stubs)} photo(s) are cloud-only but all "
                   "measurements are cached -- no download needed.")
 
-    if args.cache_dir is None and "onedrive" in str(root).lower():
-        print("\n  Note: the photos are on OneDrive, so the measurement cache "
-              "would be\n     written there too and synced back up. "
-              "--cache-dir <local path> keeps it\n     off OneDrive; the cache "
-              "is small (a few KB per measurement) but it is\n     one less "
-              "thing for sync to touch.")
-
     if args.estimate:
         return 0
 
@@ -1091,24 +1591,36 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
 
     print("\n  Scoring ...")
     recs = []
+    cand_meta = []  # (cand, rows, strain_sigs, control_n) parallel to recs
     for c in cands:
+        # The control column and the excluded strains are per MEDIUM: on K-OAc
+        # the WT control does not grow, so several sets normalise against a
+        # different strain entirely. Resolving it here means the CV and the
+        # significance counts are computed against the same control the figure
+        # will use.
+        cc_m, ex_m = medium_cfg(cfg, c["medium"])
         for rows, nm in zip(ROW_SETS, ROW_NAMES):
-            m = score_candidate(c, rows, cache, cfg["strains"],
-                                cfg["control_col"], cfg.get("exclude"))
+            m = score_candidate(c, rows, cache, cfg["strains"], cc_m, ex_m)
             if not m:
                 continue
+            sigs = m.pop("_strain_sigs", {})
+            ctrl_n = m.pop("control_n", 0)
             recs.append({"medium": c["medium"],
                          "medium_label": c["medium_label"],
                          "timepoint": c["tp_label"], "hours": c["hours"],
                          "plate1": c["plate1"].path.name,
                          "plate2": c["plate2"].path.name,
-                         "dilution": nm, **m})
+                         "dilution": nm, "control_n": ctrl_n, **m})
+            cand_meta.append((c, rows, sigs, ctrl_n))
     if not recs:
         print("  Nothing could be scored -- every candidate had a control at "
               "or below the noise floor.", file=sys.stderr)
         return 1
 
     df = pd.DataFrame(recs)
+    # Preserve original order index so the sorted df can look up cand_meta.
+    df["_idx"] = range(len(df))
+
     # Combined score: rank each candidate within its medium on spread (low is
     # good) and on how many strains separate from the control (high is good),
     # then average the two ranks. Darren asked for both because this is a triage
@@ -1130,6 +1642,130 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
         df = df.sort_values(["medium", key, "median_CV"],
                             ascending=[True, by_var, True]).reset_index(drop=True)
     df["ranked_by"] = args.rank_by
+
+    # --- Cross-candidate strain significance consensus, PER MEDIUM ---
+    # A strain's behaviour is a property of the strain ON THAT MEDIUM, so the
+    # consensus is computed within each medium and never pooled across them.
+    # Pooling actively misleads: on Set01, SOD2 is reduced in 11/24 glucose
+    # candidates (46%) but only 3/29 glycerol ones (10%). Pooled that is 26%,
+    # which put it under the core threshold AND had the off-consensus penalty
+    # charge glucose candidates for detecting it -- enough to lose 20 Hours the
+    # pick to a candidate with a worse CV.
+    #
+    # The CV percentile is per medium for the same reason: glycerol is noisier
+    # than glucose throughout, so ranking a glucose candidate's spread against
+    # glycerol's measures the medium, not the candidate. One winner is taken per
+    # medium, so within-medium is the only comparison that has to be fair.
+    core_by_medium, cons_by_medium, gate_by_medium = {}, {}, {}
+    best_scores = [0.0] * len(df)
+    floor = READABLE_CONTROL_MULT * sq.MIN_CONTROL_GRAY
+    for medium, grp in df.groupby("medium", sort=False):
+        pos = [df.index.get_loc(i) for i in grp.index]
+
+        # Only candidates whose control actually resolved anything get a vote.
+        vote = [p for p in pos if df["control_mean"].iloc[p] >= floor]
+        enough = (len(vote) >= MIN_READABLE_CANDIDATES
+                  and len(vote) >= MIN_READABLE_FRAC * len(pos))
+        if not enough:
+            vote = pos
+        gate_by_medium[medium] = (len(vote), len(pos), enough)
+
+        sigs_all = [cand_meta[int(df["_idx"].iloc[p])][2] for p in vote]
+        cons_m = _aggregate_strain_significance(sigs_all)
+        n_m = len(vote)
+        core_m = core_strains(cons_m, n_m)
+        cons_by_medium[medium] = (cons_m, n_m)
+        core_by_medium[medium] = core_m
+
+        cvs = grp["median_CV"]
+        pct = (cvs.rank(ascending=False, pct=True) if n_m > 1
+               else pd.Series([1.0] * n_m, index=cvs.index))
+        for p, pv in zip(pos, pct):
+            _, _, sigs, ctrl_n = cand_meta[int(df["_idx"].iloc[p])]
+            off = _off_consensus_penalty(sigs, cons_m, n_m, core_m)
+            best_scores[p] = _best_set_score(sigs, ctrl_n, float(pv),
+                                             core_m, off)
+    df["best_set_score"] = best_scores
+
+    for medium in sorted(cons_by_medium, key=_medium_rank):
+        cons_m, n_m = cons_by_medium[medium]
+        core_m = core_by_medium[medium]
+        n_vote, n_all, enough = gate_by_medium[medium]
+        if not cons_m:
+            continue
+        if enough and n_vote < n_all:
+            print(f"\n  {medium} strain significance "
+                  f"({n_vote} of {n_all} candidates; {n_all - n_vote} had a "
+                  f"control below {floor:.1f} gray and could not resolve an "
+                  f"effect):")
+        elif not enough:
+            med_ctrl = float(df.loc[df["medium"] == medium, "control_mean"].median())
+            print(f"\n  {medium} strain significance ({n_all} candidates):")
+            print(f"    [!] this medium is dim THROUGHOUT (median control "
+                  f"{med_ctrl:.1f} gray, floor {floor:.1f}); only {n_vote} "
+                  f"candidate(s)\n        would have qualified, too few for a "
+                  f"consensus, so none were excluded.\n        Treat these "
+                  f"results with caution -- and check the control column is "
+                  f"right\n        for this medium, since a control that does "
+                  f"not grow looks exactly like this.")
+        else:
+            print(f"\n  {medium} strain significance ({n_m} candidates):")
+        for strain, _, dirs in sorted(
+                ((s, max(d.values()), d) for s, d in cons_m.items()),
+                key=lambda x: x[1], reverse=True):
+            parts = []
+            for sign, word in ((-1, "reduced"), (1, "increased")):
+                if dirs.get(sign):
+                    parts.append(f"{word} {dirs[sign]}/{n_m} "
+                                 f"({dirs[sign] * 100 // n_m}%)")
+            mark = " <- core" if strain in core_m else ""
+            print(f"    {strain:<12} {' | '.join(parts)}{mark}")
+        if core_m:
+            names = ", ".join(
+                f"{s} {'reduced' if d < 0 else 'increased'}"
+                for s, (d, _) in sorted(core_m.items(),
+                                        key=lambda kv: -kv[1][1]))
+            print(f"    core (>={int(CONSENSUS_MIN_FRAC * 100)}% agree): {names}")
+        else:
+            print(f"    (nothing reaches {int(CONSENSUS_MIN_FRAC * 100)}% -- "
+                  f"this medium is picked on replicates and spread alone)")
+
+    # One winner PER MEDIUM. Each medium is a separate experiment, so picking a
+    # single winner for the whole tree would throw away the other media
+    # entirely. Ties break toward the LOWER median CV -- the cleanest data, and
+    # the only honest tiebreak available: alignment saturates at 1.0 once a
+    # candidate recovers the whole core, so candidates routinely tie on score.
+    ranked = df.sort_values(["best_set_score", "median_CV"],
+                            ascending=[False, True])
+    bests = []
+    print("\n  Best candidate per medium:")
+    for medium in sorted(df["medium"].unique(), key=_medium_rank):
+        row = ranked[ranked["medium"] == medium].iloc[0]
+        cand, rws, sigs, _ = cand_meta[int(row["_idx"])]
+        bests.append((cand, rws))
+        print(f"    {medium:>7}  {row['timepoint']:>10}  {row['dilution']:>6} "
+              f"dilution   score {row['best_set_score']:.3f}   "
+              f"CV {row['median_CV']:.2f}   "
+              f"control {row['control_mean']:.1f} "
+              f"({int(row['control_n'])}/4 reps)   "
+              f"{int(row['n_significant'])}/{int(row['n_strains'])} significant")
+        print(f"             {row['plate1']}  +  {row['plate2']}")
+        if sigs:
+            labels = {1: "increased", -1: "reduced"}
+            core_m = core_by_medium.get(medium, {})
+            # Core hits first: those are what the choice was actually made on.
+            parts = [f"{s} ({labels.get(d, '?')})"
+                     + ("" if core_m.get(s, (None,))[0] == d else " [not core]")
+                     for s, d in sorted(sigs.items(),
+                                        key=lambda kv: (core_m.get(kv[0], (None,))[0]
+                                                        != kv[1], kv[0]))]
+            print(f"             significant: {', '.join(parts)}")
+    print("\n  Note: the core consensus is derived from these same candidates, "
+          "so the\n     best sets' p-values are optimistic as a final claim. "
+          "Confirm them by eye\n     before reporting them.")
+
+    # Drop the internal index before writing to CSV.
+    df = df.drop(columns=["_idx"]).reset_index(drop=True)
 
     # Results live beside the code under Results/Timecourse/<set>, never inside
     # the photo tree: the photos are on OneDrive, and a run's output written
@@ -1179,7 +1815,8 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
                 df, cands, cache, cfg["strains"], cfg["control_col"],
                 outdir / "figures", n_per_medium=n_per,
                 exclude=cfg.get("exclude"),
-                rank_note=f"ranked by {args.rank_by}")
+                rank_note=f"ranked by {args.rank_by}",
+                resolve=lambda medium: medium_cfg(cfg, medium))
             if made:
                 print(f"  wrote {len(made)} sheet(s) to {outdir / 'figures'}")
             else:
@@ -1188,6 +1825,19 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False) -> int:
             # The CSV is already on disk. Losing the figures must not lose the
             # run: they are a convenience drawn over data that is already saved.
             print(f"  ! figures skipped: {type(e).__name__}: {e}")
+
+    # Full output for each medium's winner. The slides and the montage work go
+    # into the run-wide passes driven by `main`, not a deck here.
+    print(f"\n  Building full output for {len(bests)} best candidate(s) ...")
+    try:
+        got, jobs = output_best_candidates(bests, cfg, cache, outdir / "best",
+                                           tree.label)
+        if slides is not None:
+            slides.extend(got)
+        if mont_jobs is not None:
+            mont_jobs.extend(jobs)
+    except Exception as e:
+        print(f"  ! best-candidate output failed: {type(e).__name__}: {e}")
 
     print("\n  Every candidate is in the CSV -- the ranking is a suggestion, "
           "not a decision.")
