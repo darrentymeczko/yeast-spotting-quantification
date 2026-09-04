@@ -222,6 +222,106 @@ def prepare_subtractions(keep, cache_dir: Path, opts: "sq.MeasureOptions",
     return out
 
 
+def _r_chunk_worker(job):
+    """Worker: one R call over a slice of the candidates."""
+    import pandas as _pd
+    import spotting_batch as _sb
+    frames, out_dir = job
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "candidates.csv"
+    _pd.concat(frames, ignore_index=True).to_csv(
+        csv_path, index=False, encoding="utf-8-sig")
+    try:
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            _sb.run_r(csv_path, out_dir)
+    except Exception:
+        return {}
+    return {p.stem[len("spotting_"):]: str(p)
+            for p in (out_dir / "figures").glob("spotting_*.png")}
+
+
+def draw_graphs(frames, work: Path, workers: int = 1) -> dict:
+    """Draw every candidate's graph, splitting the work across R processes.
+
+    plot_spotting.R loops over the distinct values of `treatment` and writes a
+    figure per value, so one call already served every candidate -- but one call
+    means one core, and at ~0.9 s a graph a tree of 47 sheets spent 45 s here
+    with fifteen cores idle. Each candidate is independent (its own
+    `experiment`, its own normalisation, its own paired test), so the frames
+    split cleanly across several calls.
+
+    Every chunk writes into its own directory, which is what keeps this safe:
+    R also emits spotting_paired_ttests.csv per run, and concurrent calls
+    sharing an outdir would overwrite each other's copy. That file is not used
+    here -- only the PNGs are -- and `work` is discarded at the end.
+
+    Returns {candidate id: graph path} merged across chunks.
+    """
+    if not frames:
+        return {}
+    n_chunks = max(1, min(workers, len(frames)))
+    chunks = [frames[i::n_chunks] for i in range(n_chunks)]
+    chunks = [c for c in chunks if c]
+    print(f"    drawing {len(frames)} graph(s) in {len(chunks)} R call(s) "
+          f"...")
+    t0 = time.perf_counter()
+    graphs = {}
+    if len(chunks) == 1:
+        graphs.update(_r_chunk_worker((chunks[0], str(work / "r0"))))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+            futs = [pool.submit(_r_chunk_worker, (c, str(work / f"r{i}")))
+                    for i, c in enumerate(chunks)]
+            for fut in as_completed(futs):
+                graphs.update(fut.result())
+    print(f"    R finished in {time.perf_counter() - t0:.0f}s "
+          f"({len(graphs)} graph(s))")
+    return {k: Path(v) for k, v in graphs.items()}
+
+
+def _compose_chunk_worker(job):
+    """Worker: draw the montage and compose the sheet for several candidates.
+
+    Takes whole PAIRINGS, so the two subtracted images are loaded once and
+    reused across that pairing's three dilutions -- the same locality the
+    serial loop relied on, preserved across the split.
+    """
+    import tifffile
+    import spotting_montage as _sm
+    import spotting_quant as _sq
+
+    items, strains, opts, outdir, rank_note, work = job
+    made, errs = [], []
+    cur_key, cur_proc = None, [None, None]
+    for (medium, cand, rows, metrics, plates, bg_r, sub_keys) in items:
+        cid = candidate_id(cand, rows)
+        try:
+            pair_key = (str(cand["plate1"].path), str(cand["plate2"].path))
+            if sub_keys and pair_key != cur_key:
+                cur_proc = [tifffile.imread(t).astype(np.float64) if t else None
+                            for t in sub_keys]
+                cur_key = pair_key
+            montage_png = Path(work) / f"{cid}_montage.png"
+            _sm.build_montage(f"TC|{cid}", plates, strains, opts, montage_png,
+                              rep_label="Replicate",
+                              mark_row=int(rows[0]) % (_sq.N_ROWS // 2),
+                              mark_label="quantified", bg_radius=bg_r,
+                              proc=(cur_proc if sub_keys else None))
+            sheet = (Path(outdir) / safe_name(medium)
+                     / f"{_sort_prefix(cand, rows)}{cid}.png")
+            gp = metrics.pop("_graph", None)
+            _compose(sheet, montage_png, Path(gp) if gp else None,
+                     cand, rows, metrics, rank_note, bg_radius=bg_r)
+            made.append(str(sheet))
+        except Exception as e:
+            errs.append((cid, f"{type(e).__name__}: {e}"))
+    return made, errs
+
+
 def _run_r(csv_path: Path, outdir: Path) -> "Path | None":
     """Draw the graph with plot_spotting.R and return the PNG it wrote."""
     sb.run_r(csv_path, outdir)
@@ -431,63 +531,69 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
         if not frames:
             return made
 
-        csv_path = work / "all_candidates_normalized.csv"
-        pd.concat(frames, ignore_index=True).to_csv(
-            csv_path, index=False, encoding="utf-8-sig")
-        print(f"    drawing {len(keep)} graph(s) in one R call ...")
-        t0 = time.perf_counter()
-        sb.run_r(csv_path, work)
-        graphs = {p.stem[len("spotting_"):]: p
-                  for p in (work / "figures").glob("spotting_*.png")}
-        print(f"    R finished in {time.perf_counter() - t0:.0f}s "
-              f"({len(graphs)} graph(s))")
+        graphs = draw_graphs(frames, work, workers)
 
         # --- every subtraction the sheets need, once, in parallel -------------
         subs = prepare_subtractions(keep, cache_dir, opts, work, workers)
 
-        # --- compose each sheet ------------------------------------------------
-        # `keep` is sorted so a pairing's three dilutions are adjacent, so the
-        # two subtracted images are loaded once and reused across them rather
-        # than re-read from disk per sheet (96 MB each).
-        cur_key, cur_proc = None, [None, None]
+        # --- compose the sheets, in parallel by PAIRING -----------------------
+        # Grouped by pairing rather than sliced arbitrarily, so each worker
+        # keeps the locality the serial loop depended on: a pairing's three
+        # dilutions share the two subtracted images, loaded once at 96 MB each
+        # instead of re-read per sheet.
+        by_pair = {}
         for medium, cand, rows, metrics, plates in keep:
-            cid = candidate_id(cand, rows)
-            try:
-                # One radius per PHOTO, not per dilution -- see _display_radius.
-                # Per plate, NOT shared between the pairing's two plates: a
-                # shared value would make plate 1's cache entry depend on which
-                # plate 2 it happened to be paired with, and the same photo
-                # would be subtracted again for every pairing it appears in.
-                bg_r = [_display_radius(s.path, s.plate, cache_dir)
-                        for s in (cand["plate1"], cand["plate2"])]
-                pair_key = (str(cand["plate1"].path), str(cand["plate2"].path))
-                if subs and pair_key != cur_key:
-                    import tifffile
-                    cur_proc = []
-                    for s, r_disp in zip((cand["plate1"], cand["plate2"]), bg_r):
-                        tif = None
-                        if r_disp is not None:
-                            ball = opts.resolve_ball_radius(
-                                2 * float(r_disp) / sq.MEASURE_RADIUS_FRAC)
-                            tif = subs.get(sq.fiji_batch_key(s.path, ball))
-                        cur_proc.append(
-                            tifffile.imread(tif).astype(np.float64)
-                            if tif else None)
-                    cur_key = pair_key
-                montage_png = work / f"{cid}_montage.png"
-                sm.build_montage(f"TC|{cid}", plates, strains, opts,
-                                 montage_png, rep_label="Replicate",
-                                 mark_row=int(rows[0]) % (sq.N_ROWS // 2),
-                                 mark_label="quantified", bg_radius=bg_r,
-                                 proc=(cur_proc if subs else None))
-                sheet = outdir / safe_name(medium) / f"{_sort_prefix(cand, rows)}{cid}.png"
-                _compose(sheet, montage_png, graphs.get(cid),
-                         cand, rows, metrics, rank_note, bg_radius=bg_r)
-            except Exception as e:
-                print(f"  ! figure failed for {cid}: {type(e).__name__}: {e}")
-                continue
-            made.append(sheet)
-            print(f"    {sheet.parent.name}/{sheet.name}")
+            # One radius per PHOTO, not per dilution -- see _display_radius.
+            # Per plate, NOT shared between the pairing's two plates: a shared
+            # value would make plate 1's cache entry depend on which plate 2 it
+            # happened to be paired with, and the same photo would be
+            # subtracted again for every pairing it appears in.
+            bg_r = [_display_radius(s.path, s.plate, cache_dir)
+                    for s in (cand["plate1"], cand["plate2"])]
+            tifs = []
+            for s, r_disp in zip((cand["plate1"], cand["plate2"]), bg_r):
+                t = None
+                if subs and r_disp is not None:
+                    ball = opts.resolve_ball_radius(
+                        2 * float(r_disp) / sq.MEASURE_RADIUS_FRAC)
+                    got = subs.get(sq.fiji_batch_key(s.path, ball))
+                    t = str(got) if got else None
+                tifs.append(t)
+            m = dict(metrics)
+            g = graphs.get(candidate_id(cand, rows))
+            m["_graph"] = str(g) if g else None
+            key = (str(cand["plate1"].path), str(cand["plate2"].path))
+            by_pair.setdefault(key, []).append(
+                (medium, cand, rows, m, plates, bg_r,
+                 tifs if any(tifs) else None))
+
+        groups = list(by_pair.values())
+        n_chunks = max(1, min(workers, len(groups)))
+        chunks = [[it for g in groups[i::n_chunks] for it in g]
+                  for i in range(n_chunks)]
+        chunks = [c for c in chunks if c]
+        print(f"    composing {len(keep)} sheet(s) on {len(chunks)} worker(s) ...")
+        t0 = time.perf_counter()
+        results = []
+        if len(chunks) == 1:
+            results.append(_compose_chunk_worker(
+                (chunks[0], strains, opts, str(outdir), rank_note, str(work))))
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+                futs = [pool.submit(_compose_chunk_worker,
+                                    (c, strains, opts, str(outdir), rank_note,
+                                     str(work)))
+                        for c in chunks]
+                for fut in as_completed(futs):
+                    results.append(fut.result())
+        for sheets, errs in results:
+            made.extend(Path(p) for p in sheets)
+            for cid, err in errs:
+                print(f"  ! figure failed for {cid}: {err}")
+        made.sort()
+        print(f"    {len(made)} sheet(s) composed in "
+              f"{time.perf_counter() - t0:.0f}s")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return made
