@@ -2064,7 +2064,9 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
                 outdir / "figures", n_per_medium=n_per,
                 exclude=cfg.get("exclude"),
                 rank_note=f"ranked by {args.rank_by}",
-                resolve=lambda medium: medium_cfg(cfg, medium))
+                resolve=lambda medium: medium_cfg(cfg, medium),
+                workers=args.workers or max(
+                    1, min(8, (multiprocessing.cpu_count() or 2) // 2)))
             if made:
                 print(f"  wrote {len(made)} sheet(s) to {outdir / 'figures'}")
             else:

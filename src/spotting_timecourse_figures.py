@@ -39,6 +39,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -152,6 +153,73 @@ def _display_radius(path: Path, plate: int, cache_dir: Path) -> "float | None":
             continue
         radii.append(float(pd_.radius))
     return max(radii) if radii else None
+
+
+PHOTOS_PER_FIJI_BATCH = 4
+
+
+def _fiji_batch_worker(job):
+    """Worker: one FIJI run over several (path, ball_radius) pairs."""
+    import spotting_quant as _sq
+    jobs, out_dir = job
+    try:
+        got = _sq.fiji_subtract_background_batch(
+            [(Path(p), r) for p, r in jobs], Path(out_dir))
+        return {k: str(v) for k, v in got.items()}
+    except Exception:
+        return {}
+
+
+def prepare_subtractions(keep, cache_dir: Path, opts: "sq.MeasureOptions",
+                         work: Path, workers: int = 1) -> dict:
+    """Background-subtract every photo the sheets need, once, in parallel.
+
+    The sheets need ONE subtraction per photo -- `_display_radius` is keyed on
+    the photo, not the pairing or the dilution, so the same photo re-used across
+    pairings shares a result. That was already true, but the subtractions were
+    run one at a time from inside the compose loop, each starting its own
+    headless FIJI: on Set04 that is 36 JVM launches and roughly eight minutes
+    for a tree with 96 sheets.
+
+    Here every photo's radius is resolved first (all of it comes off the
+    measurement cache), then the subtractions run as batched FIJI jobs spread
+    across a process pool. Returns {(path, ball_radius) key: tif path}; a photo
+    missing from the result simply falls back to being subtracted in place.
+    """
+    import spotting_quant as _sq
+
+    wanted = {}
+    for _medium, cand, _rows, _metrics, _plates in keep:
+        for s in (cand["plate1"], cand["plate2"]):
+            r_disp = _display_radius(s.path, s.plate, cache_dir)
+            if r_disp is None:
+                continue
+            ball = opts.resolve_ball_radius(2 * float(r_disp)
+                                            / sq.MEASURE_RADIUS_FRAC)
+            wanted[_sq.fiji_batch_key(s.path, ball)] = (str(s.path), ball)
+    if not wanted or opts.bg_mode != "fiji":
+        return {}
+
+    jobs = list(wanted.values())
+    groups = [jobs[i:i + PHOTOS_PER_FIJI_BATCH]
+              for i in range(0, len(jobs), PHOTOS_PER_FIJI_BATCH)]
+    print(f"    subtracting {len(jobs)} photo(s) in {len(groups)} FIJI "
+          f"batch(es) on {min(workers, len(groups))} worker(s) ...")
+    t0 = time.perf_counter()
+    out = {}
+    if workers <= 1 or len(groups) == 1:
+        for gi, g in enumerate(groups):
+            out.update(_fiji_batch_worker((g, str(work / f"bg{gi}"))))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=min(workers, len(groups))) as pool:
+            futs = [pool.submit(_fiji_batch_worker,
+                                (g, str(work / f"bg{gi}")))
+                    for gi, g in enumerate(groups)]
+            for fut in as_completed(futs):
+                out.update(fut.result())
+    print(f"    {len(out)} subtraction(s) in {time.perf_counter() - t0:.0f}s")
+    return out
 
 
 def _run_r(csv_path: Path, outdir: Path) -> "Path | None":
@@ -293,7 +361,7 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
                   n_per_medium: "int | None" = None,
                   opts: "sq.MeasureOptions | None" = None,
                   exclude=None, rank_note: str = "",
-                  resolve=None) -> list:
+                  resolve=None, workers: int = 1) -> list:
     """Draw a sheet per candidate -- every one by default, so they can be compared.
 
     `n_per_medium=None` means all; an integer keeps only that many per medium,
@@ -374,7 +442,14 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
         print(f"    R finished in {time.perf_counter() - t0:.0f}s "
               f"({len(graphs)} graph(s))")
 
+        # --- every subtraction the sheets need, once, in parallel -------------
+        subs = prepare_subtractions(keep, cache_dir, opts, work, workers)
+
         # --- compose each sheet ------------------------------------------------
+        # `keep` is sorted so a pairing's three dilutions are adjacent, so the
+        # two subtracted images are loaded once and reused across them rather
+        # than re-read from disk per sheet (96 MB each).
+        cur_key, cur_proc = None, [None, None]
         for medium, cand, rows, metrics, plates in keep:
             cid = candidate_id(cand, rows)
             try:
@@ -385,11 +460,26 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
                 # would be subtracted again for every pairing it appears in.
                 bg_r = [_display_radius(s.path, s.plate, cache_dir)
                         for s in (cand["plate1"], cand["plate2"])]
+                pair_key = (str(cand["plate1"].path), str(cand["plate2"].path))
+                if subs and pair_key != cur_key:
+                    import tifffile
+                    cur_proc = []
+                    for s, r_disp in zip((cand["plate1"], cand["plate2"]), bg_r):
+                        tif = None
+                        if r_disp is not None:
+                            ball = opts.resolve_ball_radius(
+                                2 * float(r_disp) / sq.MEASURE_RADIUS_FRAC)
+                            tif = subs.get(sq.fiji_batch_key(s.path, ball))
+                        cur_proc.append(
+                            tifffile.imread(tif).astype(np.float64)
+                            if tif else None)
+                    cur_key = pair_key
                 montage_png = work / f"{cid}_montage.png"
                 sm.build_montage(f"TC|{cid}", plates, strains, opts,
                                  montage_png, rep_label="Replicate",
                                  mark_row=int(rows[0]) % (sq.N_ROWS // 2),
-                                 mark_label="quantified", bg_radius=bg_r)
+                                 mark_label="quantified", bg_radius=bg_r,
+                                 proc=(cur_proc if subs else None))
                 sheet = outdir / safe_name(medium) / f"{_sort_prefix(cand, rows)}{cid}.png"
                 _compose(sheet, montage_png, graphs.get(cid),
                          cand, rows, metrics, rank_note, bg_radius=bg_r)
