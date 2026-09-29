@@ -19,15 +19,22 @@ than applied silently.
 
 | | |
 |---|---|
+| `run_plate_designer.bat` | **Plate designer.** Draw the layout of the assay: which cell holds which sample, replicate and dilution. Strain-free, so one template serves many experiments. |
+| `run_experiment_designer.bat` | **Experiment designer.** Bind a template to real strains, conditions and photographs, and drive either pipeline from it. |
 | `run_spotting.bat` | **Main pipeline.** A folder of chosen photos → measurements, statistics, figures. |
 | `run_timecourse.bat` | **Selection pipeline.** A raw capture tree → which photos are worth quantifying. |
+| `run_review.bat` | **Review.** Every candidate the selection pipeline scored → the one you choose, with bad spots corrected. |
+| `spotting_app.py` | **All five stages behind one launcher window.** See [One program, every stage](#one-program-every-stage). |
+| `plate_template/` | The plate designer: model, schema, validation, autofill, and its window. |
+| `experiments/` | The experiment layer: strain panels, conditions, photo intake, and the bridge that drives the pipelines. |
 | `src/spotting_quant.py` | Measurement engine: plate finding, grid detection, ROI placement and sizing, background subtraction, normalisation, statistics. |
 | `src/spotting_batch.py` | Driver for the main pipeline: discovery, prompts, caching, exports. |
 | `src/spotting_montage.py` | Figure of the spots themselves, one block per biological replicate. |
 | `src/spotting_pptx.py` | Slide deck pairing each montage with its graph. |
 | `src/spotting_timecourse.py` | Scores every timepoint × photo pairing × dilution and ranks them. |
 | `src/spotting_timecourse_figures.py` | Turns each of those candidates into a comparison sheet: marked spots beside their graph. |
-| `src/plot_spotting.R` | Prism-style dot plots and the significance tests. |
+| `src/spotting_plots.py` | PyPrism/Matplotlib dot plots and paired significance tests. |
+| `results_review/` | The review window: browse every candidate, pick one, correct spots, export `chosen/`. |
 | `tests/` | Calibration harness and the hand-measured ground truth. |
 
 ---
@@ -40,20 +47,137 @@ than applied silently.
 pip install -r requirements.txt
 ```
 
-**FIJI / ImageJ** — used for background subtraction, called headlessly. The code
-looks for it in the usual install locations (e.g.
-`C:\Program Files\Fiji.app\ImageJ-win64.exe`). If it is not found the run falls
-back to an equivalent implementation in `src/spotting_quant.py`, which is
-analytically correct but flattens the background slightly less well
-(measured: background spread 0.32 vs FIJI's 0.08 on the same plate).
+**Background subtraction runs entirely in Python.** FIJI and Java are not
+required. `src/spotting_background.py` implements ImageJ's sliding paraboloid;
+Numba (installed by `requirements.txt`) compiles its Python loops for speed.
+The first measurement includes a one-time compilation cost. A full-resolution
+plate and six synthetic reference cases matched ImageJ pixel for pixel; see
+[the comparison report](validation/background/README.md).
 
-**R** — only needed for the figures and statistics:
+Figures and statistics are also Python-native. `requirements.txt` installs
+[`PyPrism_Plots`](https://github.com/darrentymeczko/PyPrism_Plots) directly
+from GitHub; R, ggplot2, and ggprism are not required.
 
-```r
-install.packages(c("ggplot2", "ggprism", "dplyr", "tidyr", "readr"))
+---
+
+## Setting up an experiment
+
+The three pipelines below read their photographs from one of two fixed layouts:
+`<set>.<plate><TREATMENT>.JPG` in a flat folder, or
+`<N Hours>/<Medium>/Plate N/` in a capture tree. Anything else is unreadable,
+and who is in which column has to be typed in at a console prompt every time.
+
+The **experiment designer** removes both constraints.
+
+```
+run_experiment_designer.bat
 ```
 
-Without R the run still writes every CSV; it just draws no graphs.
+An *experiment* is one strain panel, spotted across one or more conditions, with
+a positive control that every strain is reported relative to. The photo folder
+is chosen at the top of the window, since both ways of quantifying need it.
+
+1. **Panel** — choose the plate template the assay was spotted on, name each
+   sample slot, and mark the control. Leaving a slot blank says nothing was
+   spotted there.
+2. **Conditions** — each medium or treatment. A condition may name its **own**
+   control, which is what you want when a strain does not grow on one medium
+   and so cannot be the reference there.
+3. **Plates** — handpicked quantification only. One row per plate the template
+   needs. Flip through the photographs, press *Use this photograph*, then set
+   that plate's dilution row while you can see it.
+4. **Run** — handpicked quantification, or the time course.
+
+**The dilution row is chosen per plate, not per treatment.** Every spot is
+divided by the control on its *own* plate, so two plates of one medium that grew
+to different densities can each be scored at whichever row is actually readable
+without the two becoming incomparable.
+
+**However many dilution levels the template declares.** The console pipeline
+assumes three, spotted twice down six rows — `least`, `middle`, `most`. The
+experiment designer reads the levels off the plate template instead, so a design
+that puts six levels down the plate with one replicate each, or two levels with
+three, works without changing anything: the levels are numbered `1`, `2`, `3`…
+and named only where the template names them. Which rows a level occupies, and
+which biological replicate each row belongs to, come from the design rather than
+from arithmetic.
+
+**And grids other than 8 × 6.** `detect_grid` takes the grid size as an argument
+and derives the expected spot pitch from it, so a 12 × 16 design is looked for at
+a 12 × 16 pitch rather than being read as a sparse 8 × 6. The invariant it relies
+on is that a frogger prints its grid centred and filling roughly the same part of
+the dish whatever its pin count — so more positions mean a finer pitch, not a
+wider footprint. The floor is 2 × 2: below that there is no lattice to fit and no
+agar gap between diagonally adjacent spots to read the background from.
+
+Recovery of the lattice is verified against synthetic plates of known geometry at
+6 × 8, 8 × 12, 12 × 8, 12 × 16, 16 × 24 and 4 × 4, square-on and tilted, including
+with a whole edge row or column failed to grow — see `tests/test_grid_sizes.py`.
+The lab's own 8 × 6 remains the default and is bit-identical: same pitch, same
+spot size, same cache keys, same measured numbers.
+
+**The time course takes any number of dilution levels too.** Its scoring,
+candidate table, best-candidate output, montages, comparison sheets and the
+review window's rebuilds all read a `DilutionLayout` built from the template —
+every level, on whichever rows it sits on each plate, with its own replicate
+numbering. A photograph is measured once for all of its levels, and the
+measurement cache now *adds* row choices to an existing entry rather than
+replacing it, so two designs over the same photo never evict each other. The
+lab's own design becomes exactly the classic layout, so its candidate CSVs, sheet
+filenames and cache keys are unchanged.
+
+**And any number of plates.** Every strain is divided by the mean of all the
+control replicates on its *own* plate, so one plate carrying four control
+replicates and four of every strain is a complete experiment — and so is a design
+spread over three or four plates. The time course takes one photograph of every
+plate the design has and tries every combination of their re-shots; the
+candidates CSV gets a `plate1`, `plate2`, … column per plate (the lab's two-plate
+runs keep exactly the columns they always had). A sitting missing any plate is
+skipped, since a missing plate is missing replicates. The ranking's completeness
+term now compares the control replicates found with the number the design
+actually spotted on those plates, instead of assuming four.
+
+One limit remains, refused up front rather than failing mid-run: the time course
+ranks candidates on each strain's spread and significance, which need at least
+three biological replicates in total. Handpicked quantification has no such
+limit.
+
+**Which photograph is which plate is never guessed.** In handpicked mode you say
+so outright — which is why a folder of raw camera dumps, every file named
+`_9.JPG`, works perfectly well. In a time course the folder layout is read
+automatically, and where no folder names a plate those photos are reported as
+unreadable rather than assigned. Inferring it would silently mislabel biological
+replicates, and a mislabelled replicate still produces a confident-looking
+result.
+
+To set up a whole season at once, **File → New from several folders**: pick the
+folders, one plate template and one set of conditions for all of them, then type
+each folder's own strain panel. Slots left blank are empty, so the panels may
+differ in how many strains they carry while staying the same assay on the same
+layout.
+
+The same thing without the window:
+
+```
+py -m experiments.cli scan    "<photo folder>"     # what is in there, and what it read
+py -m experiments.cli check   "<experiment.json>"  # validate one
+py -m experiments.cli run     "<experiment.json>"  # quantify it
+py -m experiments.cli migrate "<folder or config>" # convert existing config files
+```
+
+`migrate` converts the answers the pipelines have already collected —
+`spotting_config.json` and each `timecourse_config.json` — into experiment
+files, so existing work is not re-entered. Where the two disagree about a
+control the per-medium one wins, and the disagreement is printed rather than
+resolved silently.
+
+Experiments are saved to `Experiment Designs/`. They are git-ignored: they name
+real strains and record an absolute path to the photo folder.
+
+A run also writes `experiment.json` beside its results. That is purely
+additive — every file the review window already reads is still written exactly
+as before — and it lets the review show real strain names and find the
+photographs without being pointed at them.
 
 ---
 
@@ -94,6 +218,12 @@ replicate, rows 4–6 the other, so two plates give four replicates:
 | 3 and 6 | most dilute |
 
 One dilution is scored per replicate. A column can be left empty.
+
+This layout is hardcoded in `src/spotting_batch.py` (`DILUTIONS`) and is what
+this pipeline and the time course both assume. It is *not* the only layout the
+program supports — the experiment designer reads the arrangement off a plate
+template and handles any number of dilution levels, and grids other than 8 × 6.
+See [Setting up an experiment](#setting-up-an-experiment).
 
 ### What a run writes
 
@@ -176,8 +306,8 @@ left with the quantified dilution row outlined in amber, and on the right the
 relative-growth graph for exactly that candidate.
 
 The graph is not a mock-up. It goes through the same tidy-frame builder and the
-same `plot_spotting.R` the main pipeline uses, so it is what quantifying that
-candidate would actually give you.
+same `spotting_plots.py` PyPrism renderer the main pipeline uses, so it is what
+quantifying that candidate would actually give you.
 
 Filenames are prefixed `<hours>h_d<0|1|2>_`, so sorting by name walks the time
 course in order with the three dilution choices grouped under each timepoint.
@@ -217,6 +347,129 @@ only a few KB per measurement, but it is one less thing for sync to touch.
 
 ---
 
+## Pipeline 3 — review the result and correct it
+
+Pipeline 2 ranks the candidates and exports one winner per medium. This is where
+you look at all of them, keep that winner or choose a different one, and correct
+individual spots:
+
+```
+run_review.bat                                # reopens the set you had open last
+run_review.bat --pick                         # choose a different set
+run_review.bat "Results\Timecourse\Set01"     # straight into one set
+run_review.bat --apply                        # re-export every reviewed set, no window
+```
+
+Double-clicking goes straight back to where you left off — reviewing a set takes
+more than one sitting. The first time, a list of the sets appears. No console
+window is left behind; if the window cannot start at all, it says so in a dialog
+and writes `review_error.log`.
+
+Every candidate for the current medium is listed with the numbers it was ranked
+on, and the pipeline's own pick is marked ★ and selected on opening — so the
+starting point is what the run produced, and every difference from it is
+something you chose. Selecting a row shows that candidate's comparison sheet;
+double-click, or press **Use this candidate**, to choose it. Click any column
+heading to sort by it, and again to reverse; a fresh column starts on its useful
+end — highest score, but *lowest* spread.
+
+### Getting around
+
+| | |
+|---|---|
+| `←` `→` | previous / next medium |
+| `↑` `↓` | previous / next candidate (previews it; it is not chosen until you press Enter) |
+| `PgUp` `PgDn` | ten candidates at a time |
+| ◀ ▶ in the top bar | previous / next set |
+| `G` | swap between the pipeline's sheet and your redrawn graph |
+
+Inside the spot table the arrows still move between spots, and inside a text box
+they still move the cursor.
+
+### Correcting spots
+
+Below the sheet is the per-spot data behind whatever is chosen: every spot's grey
+value, its relative growth, and its flags.
+
+| | |
+|---|---|
+| double-click a grey value | type one you measured by hand |
+| `O` | flag it as an outlier, or clear the flag |
+| `N` | add a note |
+| `Backspace` | forget every correction to that spot |
+| **↻ Redraw graph** (`Ctrl+R`) | put the corrected numbers back through the PyPrism renderer |
+
+The strain means beside the table move the instant you change something. The
+*graph* waits for **↻ Redraw graph** — the button sits above the graph itself —
+so flagging four spots in a row does not redraw four intermediate states you
+never wanted to see. Until you press it the button reads `out of date`, so a figure can never
+quietly predate the numbers under it. Anything slow shows a progress bar.
+
+The redraw goes through the same `spotting_plots.py` path as the export, so it is the
+figure you would get, not an impression of one — written to a scratch folder,
+never into your results. The candidate's spot-image panel and amber quantified-row
+outlines stay alongside the updated graph, so the redraw remains a complete
+comparison sheet. `G` swaps back to the pipeline's original sheet.
+
+Choose the analysis beside the medium tabs at the top of the review window. **Ratio paired
+t-tests** compare each strain with its normalized control on the log-ratio
+scale; the adjacent menu can leave the p-values unadjusted or control the
+family-wise error rate with Holm, Bonferroni, or Šidák correction. **One-way
+ANOVA** instead reports a single omnibus test across all strains, so the
+multiple-comparison menu is disabled for that choice. The selection is saved
+in `review.json` and is used by both **Redraw graph** and **Export chosen/**.
+
+Corrections run through the pipeline's own normalisation, not over the top of
+it. Re-measuring a **control** spot therefore changes that plate's divisor and
+moves every strain on it. Flagging an outlier omits that observation from the
+figure and statistical test.
+
+Pressing a flag a second time clears your decision back to the pipeline's
+opinion rather than asserting the opposite. "I have no view on this spot" and "I
+checked this and it is fine" are different claims and the CSV records which one
+you made.
+
+### What a review writes
+
+Decisions go to `Results/Timecourse/<set>/review.json` — which candidate per
+medium, and what changed about which spot, with your reasons. Numbers are never
+stored there; they are rebuilt from the photographs through the same functions
+the pipeline uses, so a review still means something after a re-measure.
+
+**Export chosen/** then writes the result to `Results/Timecourse/<set>/chosen/`,
+laid out exactly like `best/` and produced by the same PyPrism renderer and the
+same montage code:
+
+| file | contents |
+|---|---|
+| `spotting_results_normalized.csv` | one row per spot, plus who changed what and why |
+| `figures/` | one graph per medium, plus `spotting_paired_ttests.csv` or `spotting_anova.csv` for the selected analysis |
+| `montages/` | the spots themselves |
+| `chosen_summary.csv` | what was picked per medium, the selected statistical analysis, whether it was the pipeline's pick, and the reason |
+
+`best/` is never written to, so re-running pipeline 2 cannot destroy a review,
+and the automatic pick stays there to be compared against.
+
+### What it needs
+
+Browsing the sheets and choosing a candidate need nothing but the results
+folder. **Editing** needs the photographs, because only the automatic winner's
+per-spot data survives a run — every other candidate's numbers are regenerated
+on demand from the capture tree and the measurement cache.
+
+**Locate photos…** is how you point a set at its photographs. A results folder
+does not record where its photographs were: the measurement cache is keyed on
+file name, size and modification time rather than path, which is what lets you
+reorganise the photos without invalidating it, but it also means the real files
+have to be in hand before a cached measurement can be found again. The window
+looks for them automatically under the usual data folders and remembers what it
+finds, so normally you never press this. You need it when the photographs have
+moved or been renamed since the run, when they live somewhere unusual, or when
+the top bar says `not linked` — which it will, honestly, rather than quietly
+falling back to a similarly-named folder holding different plates.
+
+---
+
 ## How the measurement works
 
 Each stage exists because the obvious approach failed on real plates.
@@ -248,7 +501,7 @@ halo around a spot. The edge is taken at the inner boundary of the fall-off, and
 the outlier rejection is MAD-based, since one bad spot would otherwise size the
 whole plate.
 
-**Background subtraction.** FIJI's sliding paraboloid, radius = spot diameter +
+**Background subtraction.** Python implementation of ImageJ's sliding paraboloid, radius = spot diameter +
 20 px, run on a 32-bit copy so negatives are preserved. An 8-bit result clips at
 zero, which rectifies the agar noise and biases faint spots upward.
 
@@ -275,7 +528,8 @@ tidy CSV:
   resolved, so its ROI position cannot be confirmed
 - **outlier** — a single replicate dominating a strain's spread; only removed
   when it is both extreme *and* halves the variance
-- **excluded** — a strain you chose to drop
+- **excluded** — a strain excluded by the experiment configuration (shown in
+  review output, but not offered as a second manual omit action)
 
 Weak or sparse growth is never treated as an artifact. It is usually the
 phenotype being looked for.
@@ -321,29 +575,107 @@ Known limits, stated plainly:
 
 ---
 
+## One program, every stage
+
+`spotting_app.py` puts all five stages behind one entry point. Run it bare for a
+launcher window listing them in order — **1** design (plate template,
+experiment), **2** measure (spotting, time course), **3** review — with a button
+each. The `.bat` files are unchanged and still work; this is an alternative to
+them, not a replacement.
+
+Or name a stage. Everything after it goes to that stage exactly as the matching
+`.bat` file would pass it on:
+
+```
+py spotting_app.py spotting
+py spotting_app.py timecourse "D:\Set09" --workers 8
+py spotting_app.py review --apply
+py spotting_app.py --help
+```
+
+Stages are `plate`, `experiment`, `spotting`, `timecourse` and `review`. The
+command-line tools behind them are `plate-cli`, `experiment-cli`, `montage`,
+`pptx` and `quant`. Dragging capture-tree folders onto the file runs the time
+course on them, as it does for `run_timecourse.bat`. Each stage opened from the
+launcher runs as its own process, so one crashing cannot take the others with
+it and several can be open side by side.
+
+`--selftest` imports every stage and exercises the fragile parts — compiled
+Numba code, every figure format, the slide template, Tk — which is the quickest
+way to tell whether an environment is intact.
+
+### Packaging
+
+This is not packaged for distribution here. The intended shape is PyInstaller
+`--onedir` feeding an [Inno Setup](https://jrsoftware.org/isinfo.php) installer:
+an installer is what gives a non-technical user a Start Menu shortcut and an
+uninstaller, and what an IT department expects to see. Both tools are free; only
+code signing costs anything, and
+[SignPath Foundation](https://signpath.org/) signs open-source projects at no
+charge, which this MIT-licensed one qualifies for.
+
+`spotting_app.py` is already written for that: when it detects it is running
+packaged, the project folder becomes the folder holding the program, and this
+project's own `.py` files are used ahead of any copy built into the package — so
+an edit does not require a repackage.
+
+Be aware that **Windows Smart App Control blocks unsigned binaries**, including
+the `.pyd` files inside numpy, scipy, numba and CPython itself. It is on by
+default on much new Windows 11 hardware. Test any distribution on a machine with
+it enabled before publishing, whichever route you take.
+- **Errors from a window** are written to `spotting_error.log` beside the
+  program and shown in a dialog; there is no console to print them to.
+
+---
+
 ## Repository layout
 
 ```
 .
+├── spotting_app.py             launcher window and stage dispatcher
+├── run_plate_designer.bat      plate designer launcher
+├── run_experiment_designer.bat experiment designer launcher
 ├── run_spotting.bat            main pipeline launcher
 ├── run_timecourse.bat          selection pipeline launcher
+├── run_review.bat              review window launcher
+├── plate_template/             the plate designer (model, schema, validation, GUI)
+│   └── templates/              shipped layouts, e.g. the lab standard 8x6
+├── experiments/
+│   ├── model.py                an experiment: panel, conditions, control, mode
+│   ├── profiles.py             how a photo's path says what it is
+│   ├── intake.py               scan, infer the layout, resolve each photo
+│   ├── migrate.py              convert the pipelines' existing config files
+│   ├── run.py                  the bridge into src/ (the only place that imports it)
+│   ├── cli.py                  scan / check / run / migrate
+│   └── app.py                  the experiment designer window
+├── results_review/             the review window
 ├── src/
 │   ├── spotting_quant.py       measurement engine
 │   ├── spotting_batch.py       main pipeline driver
+│   ├── spotting_background.py  ImageJ sliding paraboloid, in Python
+│   ├── spotting_paths.py       where the project folder is (beside the .exe when packaged)
 │   ├── spotting_montage.py     spot montages
 │   ├── spotting_pptx.py        slide deck export
 │   ├── spotting_timecourse.py  time-course scoring
 │   ├── spotting_timecourse_figures.py   comparison sheets
-│   └── plot_spotting.R         figures and statistics
-├── tests/                      calibration harness and ground truth
+│   └── spotting_plots.py       PyPrism figures and statistics
+├── Plate Templates/            saved plate layouts (tracked: strain-free geometry)
+├── Experiment Designs/         saved experiments (ignored: strain names, local paths)
+├── tests/                      calibration harness, ground truth, and the test suites
 ├── requirements.txt
 ├── LICENSE
 └── .gitignore                  keeps photographs and results out of the repo
 ```
 
-Photographs, the measurement cache, per-folder configuration and everything a
-run writes are deliberately not tracked. `Results/` is created beside the code
-when a pipeline runs.
+Photographs, the measurement cache, per-folder configuration, experiment files
+and everything a run writes are deliberately not tracked. `Results/` is created
+beside the code when a pipeline runs.
+
+The two designers are kept free of the measurement stack: their cores import
+nothing beyond the standard library, so they open on a machine that cannot run
+a measurement, and they are tested without a display.
+`experiments/run.py` is the single exception, and the only module allowed to
+import `src/`.
 
 ---
 

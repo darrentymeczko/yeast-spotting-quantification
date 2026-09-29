@@ -28,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
-PROJECT_ROOT = HERE.parent
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_batch as sb        # noqa: E402  (for the shared results root)
 
 # The supplied deck: 13.33 x 7.50 in, montage at x=0.00 w=6.47, graph at
@@ -89,7 +89,7 @@ def find_pairs(results: Path) -> list:
     for p in sorted(fig_dir.glob("spotting_Set_*.png")):
         m = re.match(r"spotting_Set_([^_]+)_(.+)\.png$", p.name)
         if m:
-            # R's safe() turns every run of non-alphanumerics into "_", so
+            # The plotter's safe-name rule turns non-alphanumerics into "_", so
             # "K-OAc" survives but a treatment with a space would not.
             graphs[(m.group(1), m.group(2))] = p
 
@@ -183,7 +183,7 @@ def main(argv=None) -> int:
     if not pairs:
         print("Nothing to build: no combination has both a montage and a graph.\n"
               "  Draw the montages (say yes at the prompt, or run "
-              "spotting_montage.py) and make sure the R figures were written.",
+              "spotting_montage.py) and make sure the PyPrism figures were written.",
               file=sys.stderr)
         return 1
 

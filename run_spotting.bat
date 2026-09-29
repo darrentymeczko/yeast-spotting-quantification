@@ -15,9 +15,13 @@ REM ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
 
-REM Prefer a real python on PATH; fall back to the py launcher.
+REM Prefer the project environment, matching run_review.bat. A base Python on
+REM PATH may be real but not carry pandas, NumPy, or PyPrism Plot.
 set "PYEXE="
-where python >nul 2>nul && set "PYEXE=python"
+if exist "%USERPROFILE%\miniconda3\envs\spotting\python.exe" set "PYEXE=%USERPROFILE%\miniconda3\envs\spotting\python.exe"
+if not defined PYEXE if exist "%LOCALAPPDATA%\miniconda3\envs\spotting\python.exe" set "PYEXE=%LOCALAPPDATA%\miniconda3\envs\spotting\python.exe"
+if not defined PYEXE if exist "%USERPROFILE%\anaconda3\envs\spotting\python.exe" set "PYEXE=%USERPROFILE%\anaconda3\envs\spotting\python.exe"
+if not defined PYEXE where python >nul 2>nul && set "PYEXE=python"
 if not defined PYEXE (
     where py >nul 2>nul && set "PYEXE=py"
 )

@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
-PROJECT_ROOT = HERE.parent
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_quant as sq        # noqa: E402
 import spotting_batch as sb        # noqa: E402
 
@@ -149,9 +149,25 @@ def _load_gray8_cached(path: Path, rgb_mode) -> np.ndarray:
     return hit
 
 
+def block_height(pd_: "sb.PlateData", layout=None) -> int:
+    """Rows in one replicate block of this plate's montage.
+
+    The lab design stacks two replicate blocks of three dilution rows, so a
+    plate is drawn as two blocks of 3. A layout that divides its rows into equal
+    blocks each holding every level once is drawn the same way at its own block
+    size; any other design is drawn as a single block per plate, which is always
+    correct if less compact.
+    """
+    n_rows = int(pd_.centers.shape[0])
+    if layout is None or layout.is_classic():
+        return n_rows // 2
+    k = layout.block_rows()
+    return k if k and n_rows % k == 0 else n_rows
+
+
 def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
                  radius: "float | None" = None,
-                 proc: "np.ndarray | None" = None):
+                 proc: "np.ndarray | None" = None, layout=None):
     """The two replicate blocks of one plate, with their rim masks.
 
     Split out of `build_montage` so repeated draws of the same plate can share
@@ -180,15 +196,15 @@ def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
     """
     r_disp = float(pd_.radius if radius is None else radius)
     st = pd_.ref.path.stat()
+    n_rows, n_cols = int(pd_.centers.shape[0]), int(pd_.centers.shape[1])
+    per_rep = block_height(pd_, layout)
     key = (str(pd_.ref.path), st.st_mtime_ns, st.st_size, int(pd_.ref.plate),
-           opts.rgb_mode, opts.bg_mode, opts.bg_iters, opts.shrink, r_disp)
+           opts.rgb_mode, opts.bg_mode, opts.bg_iters, opts.shrink, r_disp,
+           n_rows, n_cols, per_rep)
     hit = _BLOCK_CACHE.get(key)
     if hit is not None:
         _BLOCK_CACHE.move_to_end(key)
         return hit
-
-    n_rows, n_cols = sq.N_ROWS, sq.N_COLS
-    per_rep = n_rows // 2
     # The DECODE, unlike the subtraction below, really is dilution-independent,
     # so it is cached separately and shared across all three dilution choices.
     img8 = _load_gray8_cached(pd_.ref.path, opts.rgb_mode)
@@ -196,15 +212,12 @@ def plate_blocks(pd_: "sb.PlateData", opts: sq.MeasureOptions,
     # the quantification are showing the same thing.
     #
     # `proc` lets the caller supply that subtraction ready-made. It is the same
-    # array this branch would compute -- the caller obtained it from a BATCHED
-    # FIJI run, which is bit-identical and amortises the 4.3 s JVM start over
-    # many images instead of paying it per plate.
+    # array this branch would compute, reused from a Python subtraction batch.
     if proc is None:
         ball = opts.resolve_ball_radius(2 * r_disp / sq.MEASURE_RADIUS_FRAC)
         proc, _, _ = sq.subtract_background(
             img8, ball_radius=ball, bg_centers=[], bg_radius=r_disp,
-            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
-            fiji_path=pd_.ref.path)
+            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode)
     coef = _affine_from_centers(pd_.centers)
     pcy, pcx = pd_.plate_center
 
@@ -238,7 +251,7 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
                   vmin: float | None = None, vmax: float | None = None,
                   mark_row: int | None = None,
                   mark_label: str | None = None,
-                  bg_radius=None, proc=None) -> Path:
+                  bg_radius=None, proc=None, layout=None) -> Path:
     """Draw the montage. `mark_row`, if given, outlines one dilution row.
 
     `mark_row` is the row's index WITHIN a replicate block (0 = least dilute,
@@ -252,8 +265,6 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
     from matplotlib.patches import Rectangle
 
     set_id, treatment = combo.split("|", 1)
-    n_rows, n_cols = sq.N_ROWS, sq.N_COLS
-    per_rep = n_rows // 2                      # 3 dilution rows per replicate
 
     # bg_radius: one value for every plate, or one PER plate. Per-plate is what
     # the time-course sheets use -- it keeps each photo's display subtraction a
@@ -270,7 +281,7 @@ def build_montage(combo: str, plates: list[sb.PlateData], strains: list[str | No
     blocks, masks = [], []
     procs = list(proc) if proc is not None else [None] * len(plates)
     for pd_, r, pr in zip(plates, radii, procs):
-        b, m = plate_blocks(pd_, opts, radius=r, proc=pr)
+        b, m = plate_blocks(pd_, opts, radius=r, proc=pr, layout=layout)
         blocks.extend(b)
         masks.extend(m)
 

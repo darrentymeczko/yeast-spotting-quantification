@@ -1,0 +1,9 @@
+# Development-only. The plate template designer itself needs nothing beyond
+# the standard library; this is just the test runner.
+pytest>=8
+
+# Packaging is not wired up here. If it is added -- PyInstaller --onedir feeding
+# an Inno Setup installer is the shape that suits distribution -- PyInstaller
+# belongs in this file, at 6.9 or newer: `spotting_app.spawn_stage` relies on
+# PYINSTALLER_RESET_ENVIRONMENT to let a stage outlive the launcher that
+# started it.

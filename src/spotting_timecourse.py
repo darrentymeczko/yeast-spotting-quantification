@@ -75,7 +75,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
-PROJECT_ROOT = HERE.parent
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_quant as sq        # noqa: E402
 import spotting_batch as sb        # noqa: E402
 
@@ -94,7 +94,7 @@ TIMECOURSE_CACHE = PROJECT_ROOT / ".spotting_cache"
 CONFIG_NAME = "timecourse_config.json"
 ROW_SETS = [(0, 3), (1, 4), (2, 5)]
 # Measured wall-clock for one uncached photo (full-res centring + one
-# headless FIJI background subtraction). Re-check with --timing.
+# Python background subtraction). Re-check with --timing.
 SECONDS_PER_MEASUREMENT = 70
 ROW_NAMES = ["least", "middle", "most"]
 # The order the media are run in, for slide and report ordering.
@@ -176,28 +176,57 @@ def discover(root: Path):
     return shots, bad
 
 
-def candidates(shots):
-    """Every (medium, timepoint, plate-1 photo, plate-2 photo) worth scoring.
+def candidates(shots, plates=(1, 2)):
+    """Every (medium, timepoint, one photo per plate) worth scoring.
 
-    Technical replicates multiply out: two photos of plate 1 and two of plate 2
-    at one timepoint give four pairings, each a legitimate way to assemble the
-    four biological replicates.
+    `plates` are the plate numbers the design has -- one, two, or any number.
+    A sitting is a candidate only when every one of them was photographed:
+    each replicate is normalised to the controls on its OWN plate, so a missing
+    plate is missing replicates, not a smaller version of the same result.
+
+    Technical replicates multiply out: two photos of each of two plates give
+    four combinations, each a legitimate way to assemble the replicates.
+
+    Each candidate carries its photos as `plates` (in plate order) and, for
+    every position k, as `plate<k>` -- the key the candidates CSV names its
+    columns by. For the lab's two plates that is exactly the old `plate1` /
+    `plate2`.
     """
+    wanted = tuple(sorted(int(p) for p in plates))
     out = []
     by_key = {}
     for s in shots:
         by_key.setdefault((s.medium, s.tp_label, s.tp_hours), {}) \
               .setdefault(s.plate, []).append(s)
-    for (medium, tp_label, hours), plates in sorted(
+    for (medium, tp_label, hours), got in sorted(
             by_key.items(), key=lambda kv: (kv[0][0], kv[0][2])):
-        p1, p2 = plates.get(1, []), plates.get(2, [])
-        if not p1 or not p2:
+        lists = [got.get(p, []) for p in wanted]
+        if not lists or not all(lists):
             continue
-        for a, b in itertools.product(p1, p2):
-            out.append({"medium": medium, "medium_label": a.medium_label,
-                        "tp_label": tp_label, "hours": hours,
-                        "plate1": a, "plate2": b})
+        for combo in itertools.product(*lists):
+            cand = {"medium": medium, "medium_label": combo[0].medium_label,
+                    "tp_label": tp_label, "hours": hours}
+            for k, shot in enumerate(combo, start=1):
+                cand[f"plate{k}"] = shot
+            cand["plates"] = tuple(combo)
+            out.append(cand)
     return out
+
+
+def cand_shots(cand) -> tuple:
+    """A candidate's photos, one per plate, in plate order.
+
+    Reads `plates` when present, else the `plate1`, `plate2`, ... keys, so a
+    candidate dict built before plates were counted still works.
+    """
+    shots = cand.get("plates")
+    if shots:
+        return tuple(shots)
+    out, k = [], 1
+    while f"plate{k}" in cand:
+        out.append(cand[f"plate{k}"])
+        k += 1
+    return tuple(out)
 
 
 def is_capture_tree(path: Path) -> bool:
@@ -553,14 +582,10 @@ def _pick_folder_tk(title: str, start) -> list:
 
 
 def _init_worker():
-    """Keep each worker single-threaded.
+    """Keep each worker single-threaded to avoid BLAS oversubscription.
 
-    Measured the hard way: 15 measurements on 6 workers took 41 minutes against
-    a 3 minute estimate. Every worker runs numpy -- whose BLAS opens its own
-    thread pool -- and also spawns a headless FIJI JVM, so the pool was
-    competing for several times more threads than there are cores and thrashing
-    memory bandwidth. Pinning each worker to one BLAS thread lets the pool scale
-    on processes, which is the axis that actually helps here.
+    Parallelism is across photos in the process pool. Background subtraction
+    uses single-threaded compiled Python loops in each worker.
     """
     import os
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -579,6 +604,25 @@ def _is_cloud_stub(path: Path) -> bool:
         return False
 
 
+def _job_parts(job):
+    """(path, rows, cache_dir, n_rows, n_cols, row_sets) from a measurement job.
+
+    Jobs used to be (path, rows, cache_dir) and the classic three row pairs
+    were implied. They now carry the grid and every row choice of the design,
+    so a layout with any number of dilution levels is measured in one pass. The
+    old three-element form is still accepted and means the classic layout.
+    """
+    if len(job) == 3:
+        path, rows, cache_dir = job
+        return path, rows, cache_dir, None, None, None
+    return job
+
+
+def _job_opts(rows, n_rows, n_cols):
+    return replace(sq.MeasureOptions(), quant_rows=tuple(rows),
+                   n_rows=n_rows, n_cols=n_cols)
+
+
 def _measure_one(job):
     """Worker: measure one photo at one dilution choice.
 
@@ -590,13 +634,13 @@ def _measure_one(job):
     file underneath a read. The temp file is deleted immediately after; re-runs
     hit the cache and never touch the photo at all.
     """
-    path, rows, cache_dir = job
+    path, rows, cache_dir, n_rows, n_cols, row_sets = _job_parts(job)
     tmp: "Path | None" = None
     t0 = time.perf_counter()
     cached = False
     try:
         ref = sb.PhotoRef(Path(path), 0, 1, "TC")
-        opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
+        opts = _job_opts(rows, n_rows, n_cols)
         cache_dir_path = Path(cache_dir)
 
         # If the result is already cached, the photo never needs to be read --
@@ -611,7 +655,8 @@ def _measure_one(job):
             shutil.copy2(str(ref.path), str(tmp))
             read_path = tmp
 
-        sb.measure(ref, opts, cache_dir_path, read_path=read_path)
+        sb.measure(ref, opts, cache_dir_path, read_path=read_path,
+                   row_sets=row_sets)
         return (str(path), tuple(rows), None,
                 time.perf_counter() - t0, cached)
     except Exception as e:
@@ -625,42 +670,32 @@ def _measure_one(job):
                 pass
 
 
-# Photos whose FIJI subtractions share one JVM inside a measurement worker.
-# Each subtracted plate is a 96 MB TIFF on disk until consumed, so this trades
-# temp space for JVM starts exactly as MONTAGES_PER_FIJI_BATCH does.
-PHOTOS_PER_FIJI_BATCH = 4
+# Bound temporary memory and TIFF storage per measurement worker.
+PHOTOS_PER_BACKGROUND_BATCH = 4
 
 
 def _measure_chunk(chunk):
-    """Worker: measure several photos, sharing FIJI runs between them.
+    """Measure a bounded group of photos with Python background subtraction.
 
-    The measurement pass could not batch FIJI the way the montage pass does,
-    because the ball radius comes from `grid.largest_diameter` -- it is not
-    known until detection has run on that photo. `sq.detect_for_measure` splits
-    detection out, so a worker can detect its whole chunk first, learn every
-    radius, put them through ONE FIJI run, and then measure.
-
-    Detection results stay inside the worker, so nothing is pickled or cached
-    to disk; the only extra state is `small` (~12 MB a photo) held until the
-    chunk finishes.
-
-    Any photo that the batch could not cover falls back to the ordinary
-    per-photo path, so this can only ever save time, never lose a measurement.
+    Detect each photo first to resolve its radius, subtract the group, then
+    measure and cache every dilution. Any unsuccessful batch is retried via
+    the ordinary per-photo measurement path.
     """
     import shutil
     import tifffile
 
     results = []
-    for i in range(0, len(chunk), PHOTOS_PER_FIJI_BATCH):
-        group = chunk[i:i + PHOTOS_PER_FIJI_BATCH]
+    for i in range(0, len(chunk), PHOTOS_PER_BACKGROUND_BATCH):
+        group = chunk[i:i + PHOTOS_PER_BACKGROUND_BATCH]
         tmp = Path(tempfile.mkdtemp(prefix="tcmeas_"))
         dets = {}
         try:
-            # --- phase 1: detect (no FIJI), which yields the radii ---
-            for path, rows, cache_dir in group:
+            # --- phase 1: detect and resolve radii ---
+            for job in group:
+                path, rows, cache_dir, n_rows, n_cols, row_sets = _job_parts(job)
                 t0 = time.perf_counter()
                 ref = sb.PhotoRef(Path(path), 0, 1, "TC")
-                opts = replace(sq.MeasureOptions(), quant_rows=tuple(rows))
+                opts = _job_opts(rows, n_rows, n_cols)
                 cf = Path(cache_dir) / f"{sb._cache_key(ref.path, opts)}.npz"
                 if cf.exists():
                     results.append((path, tuple(rows), None,
@@ -674,7 +709,8 @@ def _measure_chunk(chunk):
                         local = Path(tmp_str)
                         shutil.copy2(str(ref.path), str(local))
                     dets[path] = (ref, opts, Path(cache_dir), local, t0,
-                                  sq.detect_for_measure(local or ref.path, opts))
+                                  sq.detect_for_measure(local or ref.path, opts),
+                                  row_sets)
                 except Exception as e:
                     if local is not None:
                         local.unlink(missing_ok=True)
@@ -682,26 +718,26 @@ def _measure_chunk(chunk):
                                     f"{type(e).__name__}: {e}",
                                     time.perf_counter() - t0, False))
 
-            # --- phase 2: one FIJI run for the whole group ---
+            # --- phase 2: Python subtraction for the group ---
             done = {}
-            fiji_jobs = [((d[3] or d[0].path), d[5]["ball_radius"])
+            background_jobs = [((d[3] or d[0].path), d[5]["ball_radius"])
                          for d in dets.values()
-                         if d[1].bg_mode == "fiji"]
-            if fiji_jobs:
+                         if d[1].bg_mode in ("python", "fiji", "paraboloid")]
+            if background_jobs:
                 try:
-                    done = sq.fiji_subtract_background_batch(fiji_jobs, tmp)
+                    done = sq.subtract_background_batch(background_jobs, tmp)
                 except Exception:
                     done = {}
 
             # --- phase 3: measure and cache ---
-            for path, (ref, opts, cdir, local, t0, det) in dets.items():
+            for path, (ref, opts, cdir, local, t0, det, rsets) in dets.items():
                 try:
                     src = local or ref.path
-                    tif = done.get(sq.fiji_batch_key(src, det["ball_radius"]))
+                    tif = done.get(sq.background_batch_key(src, det["ball_radius"]))
                     proc = (tifffile.imread(str(tif)).astype(np.float64)
                             if tif else None)
                     sb.measure(ref, opts, cdir, read_path=local,
-                               proc=proc, detection=det)
+                               proc=proc, detection=det, row_sets=rsets)
                     results.append((path, tuple(opts.quant_rows), None,
                                     time.perf_counter() - t0, False))
                 except Exception as e:
@@ -720,19 +756,10 @@ def _measure_chunk(chunk):
 
 
 def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
-    """Measure every photo, in parallel.
+    """Measure every photo in parallel, with one cache entry per photo.
 
-    Safe to parallelise: `build_jobs` emits one job per photo, and each writes
-    its own cache entry keyed on that photo, so two workers never touch the same
-    file. Processes rather than threads -- detect_grid is numpy work, and every
-    call also spawns its own headless FIJI.
-
-    Worker count defaults to one per physical core: each worker carries a JVM
-    and a 24 MP image, and `_init_worker` pins its BLAS to a single thread so
-    the pool scales on processes rather than fighting itself for threads.
-
-    Returns (errors, elapsed) where elapsed is a list of (seconds, was_cached)
-    per job -- see the --timing report.
+    Each process holds full-resolution images; BLAS is limited to one thread.
+    Returns errors and elapsed (seconds, was_cached) pairs for the timing report.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -740,8 +767,7 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
     total = len(jobs)
     t_start = time.perf_counter()
     done_n = 0
-    # One chunk per worker so each worker's FIJI runs are shared across the
-    # photos it owns, rather than a JVM started for every photo.
+    # One chunk per worker, with bounded groups of photos inside it.
     n_chunks = max(1, min(workers, total))
     chunks = [c for c in (jobs[i::n_chunks] for i in range(n_chunks)) if c]
 
@@ -787,7 +813,8 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
 
 
 @lru_cache(maxsize=None)
-def _cached_measure(path: Path, plate: int, rows: tuple, cache_dir: Path):
+def _cached_measure(path: Path, plate: int, rows: tuple, cache_dir: Path,
+                    layout: "sb.DilutionLayout | None" = None):
     """`sb.measure` off the cache, memoized for the scoring pass.
 
     Scoring reads the same photo once per (candidate, row-set, shot) -- six
@@ -795,43 +822,77 @@ def _cached_measure(path: Path, plate: int, rows: tuple, cache_dir: Path):
     photo. Each of those calls re-opens and zlib-decompresses the same .npz.
     The measurement itself is already cached on disk; this just stops the
     decompression being repeated. Read-only: nothing mutates a PlateData.
+
+    `layout` supplies the grid to look for and every row choice on this plate,
+    so a cache miss measures the whole design in one pass. None is the classic
+    layout, exactly as before.
     """
     ref = sb.PhotoRef(path, 0, plate, "TC")
-    opts = replace(sq.MeasureOptions(), quant_rows=rows)
-    return sb.measure(ref, opts, cache_dir)
+    if layout is None or layout.is_classic():
+        opts = replace(sq.MeasureOptions(), quant_rows=rows)
+        return sb.measure(ref, opts, cache_dir)
+    opts = replace(sq.MeasureOptions(), quant_rows=rows,
+                   n_rows=layout.n_rows, n_cols=layout.n_cols)
+    return sb.measure(ref, opts, cache_dir, row_sets=layout.row_sets(plate))
+
+
+def as_level(rows_or_level, layout: "sb.DilutionLayout | None" = None):
+    """A `DilutionLevel` from either a level or a legacy 0-based row tuple.
+
+    Candidates used to carry a (lo, hi) row pair that meant the same rows on
+    both plates. That cannot describe a design whose levels sit on different
+    rows per plate, so a level object is carried instead; a bare tuple is still
+    accepted and looked up in the layout (the classic one by default).
+    """
+    if isinstance(rows_or_level, sb.DilutionLevel):
+        return rows_or_level
+    return (layout or sb.classic_layout()).by_rows(rows_or_level)
 
 
 def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
-                    exclude=None, p_thresh: float = 0.05):
-    """Metrics for one (photo pair, dilution).
+                    exclude=None, p_thresh: float = 0.05,
+                    layout: "sb.DilutionLayout | None" = None):
+    """Metrics for one (photo pair, dilution level).
 
     Normalizes exactly as the main pipeline does -- per-plate control average,
     rim-flagged spots dropped, detection floor -- so the CV reported here is the
     CV the real figure would have, not an approximation of it.
+
+    `rows` is a `DilutionLevel` (or a legacy row tuple). Which spots are read,
+    and which is the control, come from the level's cells, so a design with any
+    number of levels -- on any rows of any plate -- scores the same way.
     """
     from scipy import stats
 
+    level = as_level(rows, layout)
     ex = set(exclude or [])
-    cc = control_col - 1
     rel, ctrl_vals = {}, []
-    for shot in (cand["plate1"], cand["plate2"]):
+    ctrl_expected = 0
+    for shot in cand_shots(cand):
         try:
+            cells = level.cells(shot.plate)
             pd_ = _cached_measure(shot.path, shot.plate,
-                                  tuple(r + 1 for r in rows), cache_dir)
+                                  level.quant_rows(shot.plate), cache_dir, layout)
         except Exception:
             return None
-        good = [pd_.net[r, cc] for r in rows if not pd_.rim[r, cc]]
+        # Every control replicate on THIS plate forms its denominator, however
+        # many the design spots -- two per plate in the lab layout, four on a
+        # single plate, or any other number.
+        ctrl_expected += sum(1 for c in cells if c.slot == control_col)
+        good = [pd_.net[c.row, c.col] for c in cells
+                if c.slot == control_col and not pd_.rim[c.row, c.col]]
         if not good:
             return None
         div = float(np.mean(good))
         if div <= sq.MIN_CONTROL_GRAY:
             return None
         ctrl_vals.extend(good)
-        for r in rows:
-            for j in range(sq.N_COLS):
-                if j == cc or not strains[j] or (j + 1) in ex or pd_.rim[r, j]:
-                    continue
-                rel.setdefault(strains[j], []).append(float(pd_.net[r, j]) / div)
+        for c in cells:
+            name = strains[c.slot - 1] if c.slot - 1 < len(strains) else None
+            if (c.slot == control_col or not name or c.slot in ex
+                    or pd_.rim[c.row, c.col]):
+                continue
+            rel.setdefault(name, []).append(float(pd_.net[c.row, c.col]) / div)
 
     if not ctrl_vals:
         return None
@@ -857,6 +918,11 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
             "control_CV": float(np.std(ctrl_vals) / cm) if cm > 0 else np.nan,
             "n_strains": n_str, "n_significant": n_sig,
             "control_n": len(ctrl_vals),
+            # How many control spots the design put on these plates at this
+            # level, for the completeness term. Underscored like _strain_sigs:
+            # it is popped before the row reaches the CSV, whose columns stay
+            # as they were.
+            "_control_expected": ctrl_expected,
             "_strain_sigs": strain_sigs}
 
 
@@ -1036,7 +1102,7 @@ def cloud_placeholders(shots):
     return out
 
 
-def build_jobs(cands, cache_dir: Path):
+def build_jobs(cands, cache_dir: Path, layout=None):
     """One measurement per PHOTO -- not per (photo, dilution).
 
     `sb.measure` computes every dilution choice in a single pass and stores them
@@ -1045,7 +1111,7 @@ def build_jobs(cands, cache_dir: Path):
     with the SAME cache key: whichever finishes first writes the entry the other
     two would have written. Submitting them together, as this used to, handed the
     same 24 MP photo to three workers before any of them had written the cache --
-    three full 41 s centrings, three JVM launches and, for a OneDrive stub, three
+    three full centrings, three subtractions and, for a OneDrive stub, three
     downloads of the same file.
 
     The row-set below is therefore only a placeholder to make `opts.quant_rows`
@@ -1055,14 +1121,30 @@ def build_jobs(cands, cache_dir: Path):
     A photo shared by several pairings is likewise measured once, which is most
     of the saving when there are technical replicates.
     """
-    rows = tuple(r + 1 for r in ROW_SETS[0])
+    if layout is None or layout.is_classic():
+        rows = tuple(r + 1 for r in ROW_SETS[0])
+        jobs, seen = [], set()
+        for c in cands:
+            for shot in cand_shots(c):
+                key = str(shot.path)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append((key, rows, str(cache_dir)))
+        return jobs
+
+    # Any other design: the job names the grid and every row choice for the
+    # photo's own plate, since a level may sit on different rows per plate.
     jobs, seen = [], set()
     for c in cands:
-        for shot in (c["plate1"], c["plate2"]):
+        for shot in cand_shots(c):
             key = str(shot.path)
-            if key not in seen:
-                seen.add(key)
-                jobs.append((key, rows, str(cache_dir)))
+            if key in seen:
+                continue
+            seen.add(key)
+            sets = tuple(layout.row_sets(shot.plate))
+            want = sets[0] if sets else ()
+            jobs.append((key, want, str(cache_dir), layout.n_rows,
+                         layout.n_cols, sets))
     return jobs
 
 
@@ -1142,7 +1224,8 @@ def _off_consensus_penalty(sigs, consensus, n_total, core,
     return total / len(sigs)
 
 
-def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0):
+def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0,
+                    control_expected=4):
     """Composite score for best-candidate selection.
 
     (1) Alignment (weight 3): how much of the CORE consensus this candidate
@@ -1151,9 +1234,12 @@ def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0):
         summed matches without normalising, so a candidate that reached
         significance on everything simply accumulated points and beat a
         cleaner one on the strength of its false positives.
-    (2) Completeness (weight 1): control replicates / 4, capped at 1. The
-        control is the denominator for every ratio on the plate, so a missing
-        control replicate costs more than a missing anything else.
+    (2) Completeness (weight 1): control replicates found / control replicates
+        the design spotted on these plates, capped at 1. The control is the
+        denominator for every ratio on the plate, so a missing control
+        replicate costs more than a missing anything else. The expected count
+        was a fixed 4 -- two plates of two -- which is right for the lab design
+        and wrong for any other, so it now comes from the candidate's plates.
     (3) Variance (weight 1.5): 1 - the candidate's CV percentile among all
         candidates, so the cleanest data scores 1 and the noisiest 0. Raw CV
         was useless here -- it spans too narrow a range to break ties.
@@ -1166,7 +1252,8 @@ def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0):
     matched = sum(f for s, (d, f) in core.items() if sigs.get(s) == d)
     alignment = matched / total_w if total_w else 0.0
 
-    completeness = min(control_n / 4.0, 1.0)
+    completeness = (min(control_n / float(control_expected), 1.0)
+                    if control_expected else 0.0)
     return (W_ALIGN * alignment + W_COMPLETE * completeness
             + W_VARIANCE * cv_pct - W_OFF * off_frac)
 
@@ -1174,7 +1261,7 @@ def _best_set_score(sigs, control_n, cv_pct, core, off_frac=0.0):
 def _tc_experiment(cand, label: str) -> str:
     """What one best-candidate graph is called, e.g. "Set01 GLU 22 Hours".
 
-    This is the `treatment` column, so R keys both the figure title and the
+    This is the `treatment` column, so the renderer keys the figure title and the
     figure filename on it. It carries the capture-tree label because the deck
     gathers every tree in the run: "GLU 22 Hours" alone would not say which set
     a slide came from.
@@ -1188,71 +1275,59 @@ def _medium_rank(medium: str):
             else len(MEDIUM_ORDER), medium)
 
 
-def _r_safe(s: str) -> str:
-    """R's safe() from plot_spotting.R, so montage names match graph names."""
+def _plot_safe(s: str) -> str:
+    """The renderer's safe filename rule, so montage and graph names match."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
 
 
-def build_tidy_for_candidate(cand, rows, cfg, cache_dir, label):
-    """Tidy DataFrame for one candidate -- suitable for the R plotting script.
+def build_tidy_for_candidate(cand, rows, cfg, cache_dir, label, layout=None):
+    """Tidy DataFrame for one candidate -- suitable for the PyPrism renderer.
 
-    Mirrors `spotting_batch.build_tidy` for a timecourse candidate: each shot
-    contributes two rows of the dilution (rep 1+2 from plate 1, rep 3+4 from
-    plate 2), and relative growth is normalised against the control column.
+    `rows` is the candidate's `DilutionLevel` (or a legacy row tuple). Its cells
+    say which spots are read and which replicate and strain each one is, so the
+    frame is right for a design with any number of levels.
     """
+    level = as_level(rows, layout)
     strains = cfg["strains"]
     control_col, ex_list = medium_cfg(cfg, cand["medium"])
-    exclude = set(ex_list)
     experiment = _tc_experiment(cand, label)
+    plates_m = [
+        _cached_measure(shot.path, shot.plate, level.quant_rows(shot.plate),
+                        cache_dir, layout)
+        for shot in cand_shots(cand)
+    ]
+    # `ref.plate` must be the candidate's plate number for the level's cells to
+    # line up; `_cached_measure` builds the ref from it, so it is.
+    return sb.build_tidy_level(plates_m, strains, control_col, level, ex_list,
+                               experiment=experiment, treatment=experiment,
+                               set_label="TC")
 
-    plates_m = []
-    result_rows = []
-    for shot in (cand["plate1"], cand["plate2"]):
-        pd_ = _cached_measure(shot.path, shot.plate,
-                              tuple(r + 1 for r in rows), cache_dir)
-        plates_m.append(pd_)
-        for rep_idx, row in enumerate(rows, start=1):
-            rep_no = (shot.plate - 1) * 2 + rep_idx
-            for col in range(sq.N_COLS):
-                name = strains[col]
-                if not name:
-                    continue
-                result_rows.append({
-                    "experiment": experiment,
-                    "treatment": experiment,
-                    "set": "TC",
-                    "plate": shot.plate,
-                    "image": shot.path.name,
-                    "replicate": f"rep{rep_no}",
-                    "dilution_row": row + 1,
-                    "dilution": ROW_NAMES[row % 3],
-                    "strain_col": col + 1,
-                    "strain": name,
-                    "raw_growth": float(pd_.net[row, col]),
-                    "artifact": bool(pd_.rim[row, col]),
-                    "excluded": (col + 1) in exclude,
-                    "is_control": (col + 1) == control_col,
-                })
 
-    full = pd.DataFrame(result_rows)
-    if full.empty:
-        return full
+def montage_job(cand, rows, strains, out_path, cache_dir, experiment, layout=None):
+    """A montage job for any number of plates.
 
-    keep = full[~full["excluded"]].copy()
-    if keep.empty or control_col in exclude:
-        return full
+    ((path, plate), ...), rows, strains, out_path, cache_dir, experiment, layout
+    """
+    pairs = tuple((str(s.path), int(s.plate)) for s in cand_shots(cand))
+    level = rows if isinstance(rows, sb.DilutionLevel) else tuple(rows)
+    return (pairs, level, strains, str(out_path), str(cache_dir), experiment,
+            layout if layout is not None and not layout.is_classic() else None)
 
-    # Same noise-aware floor the main pipeline uses: a fixed gray cutoff cannot
-    # work across media whose signal ranges differ by an order of magnitude.
-    noise = max([sq.bg_noise(p.bg_samples) for p in plates_m] or [0.0])
-    min_control = max(sq.MIN_CONTROL_GRAY, sq.CONTROL_NOISE_MULT * noise)
 
-    keep = sq.add_relative_growth(keep, control_col=control_col,
-                                  group_keys=["experiment"],
-                                  min_control=min_control)
-    key_cols = ["experiment", "replicate", "strain_col"]
-    added = [c for c in keep.columns if c not in full.columns]
-    return full.merge(keep[key_cols + added], on=key_cols, how="left")
+def _montage_job_parts(job):
+    """(pairs, rows, strains, out_path, cache_dir, experiment, layout) of a job.
+
+    Also reads the older (p1, pl1, p2, pl2, rows, strains, out, cache,
+    experiment[, layout]) form, which could only ever describe two plates.
+    """
+    if isinstance(job[0], tuple):
+        pairs, rows, strains, out_path, cache_dir, experiment = job[:6]
+        layout = job[6] if len(job) > 6 else None
+        return tuple(pairs), rows, strains, out_path, cache_dir, experiment, layout
+    (p1, pl1, p2, pl2, rows, strains, out_path, cache_dir, experiment) = job[:9]
+    layout = job[9] if len(job) > 9 else None
+    return (((p1, pl1), (p2, pl2)), rows, strains, out_path, cache_dir,
+            experiment, layout)
 
 
 def _draw_montage_job(job):
@@ -1260,46 +1335,42 @@ def _draw_montage_job(job):
 
     Module level so a process pool can pickle it -- Windows has no fork.
 
-    Drawing a montage costs a headless FIJI background subtraction per plate,
+    Drawing a montage requires Python background subtraction per plate,
     measured at ~20 s each against 1.4 s to decode the photo, so a sheet is
     ~40 s of almost entirely idle CPU. Serially that is ~27 min for a 36-slide
     run. The work is per-photo and independent, exactly like `measure_all`, so
     it parallelises the same way.
     """
-    (p1, pl1, p2, pl2, rows, strains, out_path, cache_dir, experiment) = job
+    pairs, rows, strains, out_path, cache_dir, experiment, layout = \
+        _montage_job_parts(job)
     try:
         import spotting_montage as sm
+        level = as_level(rows, layout)
         opts_m = replace(sq.MeasureOptions(),
-                         quant_rows=tuple(r + 1 for r in rows))
-        plates = [_cached_measure(Path(p), pl, tuple(r + 1 for r in rows),
-                                  Path(cache_dir))
-                  for p, pl in ((p1, pl1), (p2, pl2))]
+                         quant_rows=level.quant_rows(pairs[0][1]))
+        if layout is not None and not layout.is_classic():
+            opts_m = replace(opts_m, n_rows=layout.n_rows, n_cols=layout.n_cols)
+        plates = [_cached_measure(Path(p), pl, level.quant_rows(pl),
+                                  Path(cache_dir), layout)
+                  for p, pl in pairs]
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         sm.build_montage(f"TC|{experiment}", plates, strains, opts_m,
-                         Path(out_path), rep_label="Replicant")
+                         Path(out_path), rep_label="Replicant",
+                         layout=layout)
         return (experiment, None)
     except Exception as e:
         return (experiment, f"{type(e).__name__}: {e}")
 
 
-# How many montages share one FIJI batch inside a worker. Each plate's
-# subtracted image is a 96 MB 32-bit TIFF on disk until it is consumed, so this
-# trades temp space against JVM starts: 2 montages = 4 plates = ~380 MB per
-# worker in flight, ~3 GB across 8. Raising it amortises the 4.3 s JVM start
-# further and costs proportionally more temp space.
-MONTAGES_PER_FIJI_BATCH = 2
+# Bound temporary storage: two montages use at most four 96 MB plate TIFFs.
+MONTAGES_PER_BACKGROUND_BATCH = 2
 
 
-def _run_r_job(job):
-    """Worker: draw one tree's figures with plot_spotting.R.
+def _run_plot_job(job):
+    """Worker: draw one tree's figures with PyPrism Plot.
 
-    R is quick per call -- ~1.5 s of startup and library loading plus ~0.6 s a
-    figure -- but it was run once per tree, in line, so twelve trees put 36 s of
-    purely serial wall-clock in the middle of the run. Batching every tree into
-    ONE R call only reaches 1.31x, because the fixed cost being amortised is
-    small; running the calls side by side reaches about 5x instead.
-
-    Output is captured rather than printed, so twelve concurrent R processes do
+    Trees are independent, so their Matplotlib renders run in parallel.
+    Output is captured rather than printed, so concurrent worker processes do
     not interleave their messages; the caller prints each block intact.
     """
     import contextlib
@@ -1309,13 +1380,13 @@ def _run_r_job(job):
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            sb.run_r(Path(csv_path), Path(outdir))
+            sb.run_plots(Path(csv_path), Path(outdir))
         return (label, buf.getvalue(), None)
     except Exception as e:
         return (label, buf.getvalue(), f"{type(e).__name__}: {e}")
 
 
-def run_r_all(jobs, workers: int):
+def run_plots_all(jobs, workers: int):
     """Draw every tree's figures, in parallel. Returns the list of failures."""
     if not jobs:
         return []
@@ -1324,12 +1395,12 @@ def run_r_all(jobs, workers: int):
     errors = []
     t0 = time.perf_counter()
     if workers <= 1 or len(jobs) == 1:
-        out = [_run_r_job(j) for j in jobs]
+        out = [_run_plot_job(j) for j in jobs]
     else:
         out = []
         with ProcessPoolExecutor(max_workers=min(workers, len(jobs)),
                                  initializer=_init_worker) as pool:
-            futs = [pool.submit(_run_r_job, j) for j in jobs]
+            futs = [pool.submit(_run_plot_job, j) for j in jobs]
             for fut in as_completed(futs):
                 out.append(fut.result())
     for label, text, err in sorted(out, key=lambda t: t[0]):
@@ -1340,75 +1411,74 @@ def run_r_all(jobs, workers: int):
                 print("  " + ln)
         if err:
             errors.append((label, err))
-            print(f"  ! R failed for {label}: {err}")
-    print(f"    {len(jobs)} R call(s) in {time.perf_counter() - t0:.1f}s")
+            print(f"  ! plotting failed for {label}: {err}")
+    print(f"    {len(jobs)} plotting job(s) in {time.perf_counter() - t0:.1f}s")
     return errors
 
 
 def _draw_montage_chunk(chunk):
-    """Worker: draw several montages, sharing FIJI runs between them.
+    """Draw montages using shared Python-subtracted plate images.
 
-    Every montage needs two plates background-subtracted, and each subtraction
-    used to be its own headless FIJI. Starting Java is 4.3 s against 6.3 s of
-    real work, so roughly half the montage pass was booting VMs. Here the
-    plates of several montages go through ONE FIJI run and the results are
-    handed to `build_montage` ready-made.
-
-    Falls back to the per-plate path if FIJI is unavailable or a batch comes
-    back short, so a montage is never lost to this optimisation.
+    Resolve plate geometry and radii from the measurement cache, subtract each
+    unique photo/radius once per chunk, then compose the montages. Failed
+    batches retry via the ordinary per-plate Python path.
     """
     import shutil
     import tifffile
     import spotting_montage as sm
 
     results = []
-    for i in range(0, len(chunk), MONTAGES_PER_FIJI_BATCH):
-        group = chunk[i:i + MONTAGES_PER_FIJI_BATCH]
+    for i in range(0, len(chunk), MONTAGES_PER_BACKGROUND_BATCH):
+        group = chunk[i:i + MONTAGES_PER_BACKGROUND_BATCH]
         tmp = Path(tempfile.mkdtemp(prefix="tcbg_"))
         try:
             # Resolve every plate and its display radius from the CACHE, so the
-            # FIJI radii are known before any image is touched.
-            prepared, fiji_jobs = [], []
+            # subtraction radii are known before any image is touched.
+            prepared, background_jobs = [], []
             for job in group:
-                (p1, pl1, p2, pl2, rows, strains, out_path,
-                 cache_dir, experiment) = job
+                (pairs, rows, strains, out_path, cache_dir, experiment,
+                 layout) = _montage_job_parts(job)
                 try:
+                    level = as_level(rows, layout)
                     opts_m = replace(sq.MeasureOptions(),
-                                     quant_rows=tuple(r + 1 for r in rows))
-                    plates = [_cached_measure(Path(p), pl,
-                                              tuple(r + 1 for r in rows),
-                                              Path(cache_dir))
-                              for p, pl in ((p1, pl1), (p2, pl2))]
+                                     quant_rows=level.quant_rows(pairs[0][1]))
+                    if layout is not None and not layout.is_classic():
+                        opts_m = replace(opts_m, n_rows=layout.n_rows,
+                                         n_cols=layout.n_cols)
+                    plates = [_cached_measure(Path(p), pl, level.quant_rows(pl),
+                                              Path(cache_dir), layout)
+                              for p, pl in pairs]
                     balls = [opts_m.resolve_ball_radius(
                         2 * float(pd_.radius) / sq.MEASURE_RADIUS_FRAC)
                         for pd_ in plates]
-                    prepared.append((job, opts_m, plates, balls, strains))
-                    if opts_m.bg_mode == "fiji":
+                    prepared.append((job, opts_m, plates, balls, strains, layout))
+                    if opts_m.bg_mode in ("python", "fiji", "paraboloid"):
                         for pd_, ball in zip(plates, balls):
-                            fiji_jobs.append((pd_.ref.path, ball))
+                            background_jobs.append((pd_.ref.path, ball))
                 except Exception as e:
-                    results.append((job[8], f"{type(e).__name__}: {e}"))
+                    results.append((experiment, f"{type(e).__name__}: {e}"))
 
             done = {}
-            if fiji_jobs:
+            if background_jobs:
                 try:
-                    done = sq.fiji_subtract_background_batch(fiji_jobs, tmp)
+                    done = sq.subtract_background_batch(background_jobs, tmp)
                 except Exception:
                     done = {}
 
-            for job, opts_m, plates, balls, strains in prepared:
-                out_path, experiment = Path(job[6]), job[8]
+            for job, opts_m, plates, balls, strains, layout in prepared:
+                parts = _montage_job_parts(job)
+                out_path, experiment = Path(parts[3]), parts[5]
                 try:
                     procs = []
                     for pd_, ball in zip(plates, balls):
-                        tif = done.get(sq.fiji_batch_key(pd_.ref.path, ball))
+                        tif = done.get(sq.background_batch_key(pd_.ref.path, ball))
                         procs.append(
                             tifffile.imread(str(tif)).astype(np.float64)
                             if tif else None)
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     sm.build_montage(f"TC|{experiment}", plates, strains,
                                      opts_m, out_path, rep_label="Replicant",
-                                     proc=procs)
+                                     proc=procs, layout=layout)
                     results.append((experiment, None))
                 except Exception as e:
                     results.append((experiment, f"{type(e).__name__}: {e}"))
@@ -1426,7 +1496,7 @@ def draw_montages(jobs, workers: int):
     errors, done_n = [], 0
     total = len(jobs)
     t0 = time.perf_counter()
-    # One chunk per worker, so each worker's FIJI runs are shared across the
+    # One chunk per worker, so subtractions can be shared across the
     # montages it owns rather than restarted for every plate.
     n_chunks = max(1, min(workers, total))
     chunks = [jobs[i::n_chunks] for i in range(n_chunks)]
@@ -1456,7 +1526,7 @@ def draw_montages(jobs, workers: int):
     return errors
 
 
-def output_best_candidates(bests, cfg, cache, outdir, label):
+def output_best_candidates(bests, cfg, cache, outdir, label, layout=None):
     """Full pipeline output for the best candidate of EACH medium.
 
     One per medium, not one per set. Each medium is its own experiment -- the
@@ -1465,12 +1535,12 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
     thirds of the work. On this data that dropped K-OAc and glycerol from eight
     of ten sets.
 
-    All media go into ONE tidy CSV and ONE R invocation, exactly as the main
-    pipeline does it: R keys its figures on `treatment` and emits one per
+    All media go into one tidy CSV and one PyPrism invocation, exactly as the main
+    pipeline does it: the renderer keys figures on `treatment` and emits one per
     medium, and the paired t-test table it writes covers them together instead
     of each run overwriting the last.
 
-    Returns (slides, montage_jobs, r_job). The R figures and the montages
+    Returns (slides, montage_jobs, plot_job). The figures and montages
     are both drawn later, each in one parallel pass over the whole run, and
     the deck is assembled once by `build_best_deck` after they land.
     """
@@ -1480,7 +1550,7 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
     frames = []
     for cand, rows in bests:
         try:
-            t = build_tidy_for_candidate(cand, rows, cfg, cache, label)
+            t = build_tidy_for_candidate(cand, rows, cfg, cache, label, layout)
             if not t.empty:
                 frames.append(t)
         except Exception as e:
@@ -1494,32 +1564,28 @@ def output_best_candidates(bests, cfg, cache, outdir, label):
     tidy.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"  wrote {csv_path.name}  ({len(frames)} medium/media)")
 
-    # --- R figures: queued, not drawn here ---
-    # Deferred for the same reason as the montages. R is fast per call but was
-    # run in line once per tree, so a twelve-tree run serialised 36 s of it.
-    r_job = (str(csv_path), str(outdir), label)
+    # --- PyPrism figures: queued, not drawn here ---
+    plot_job = (str(csv_path), str(outdir), label)
 
     # --- queue one montage per medium, and the slide it belongs to ---
-    # The montages are NOT drawn here. Each costs two headless FIJI
+    # The montages are NOT drawn here. Each costs two Python background
     # subtractions (~40 s) and they are independent, so they are collected
     # across every tree in the run and drawn in one parallel pass at the end;
     # doing them inline made a 36-slide run ~27 min of near-idle CPU.
     slides, jobs = [], []
     for cand, rows in bests:
         experiment = _tc_experiment(cand, label)
-        safe = _r_safe(experiment)
+        safe = _plot_safe(experiment)
         mont = outdir / "montages" / f"montage_{safe}.png"
-        # R names its figure from the same treatment string, so the graph path
+        # The renderer names its figure from the treatment string, so the path
         # is derivable rather than searched for.
-        # R has not run yet, so the graph cannot be checked here. `main` drops
+        # Plotting has not run yet, so the graph cannot be checked here. `main` drops
         # any slide whose two pictures did not both land.
         graph = outdir / "figures" / f"spotting_{safe}.png"
-        jobs.append((str(cand["plate1"].path), cand["plate1"].plate,
-                     str(cand["plate2"].path), cand["plate2"].plate,
-                     tuple(rows), cfg["strains"], str(mont), str(cache),
-                     experiment))
+        jobs.append(montage_job(cand, rows, cfg["strains"], mont, cache,
+                                experiment, layout))
         slides.append(((label, experiment), mont, graph))
-    return slides, jobs, r_job
+    return slides, jobs, plot_job
 
 
 def main(argv=None) -> int:
@@ -1546,7 +1612,7 @@ def main(argv=None) -> int:
                          "and add whatever you choose to them.")
     ap.add_argument("--workers", type=int, default=0,
                     help="Parallel measurements (default: one per physical "
-                         "core, max 8 -- each runs its own headless FIJI)")
+                         "core, max 8 -- each processes photos in Python)")
     ap.add_argument("--estimate", action="store_true",
                     help="Report how much work it is, then stop.")
     ap.add_argument("--timing", action="store_true",
@@ -1641,7 +1707,7 @@ def main(argv=None) -> int:
                       file=sys.stderr)
 
     rc = 0
-    slides, mont_jobs, r_jobs = [], [], []
+    slides, mont_jobs, plot_jobs = [], [], []
     for i, r in enumerate(roots, 1):
         if len(roots) > 1:
             print(f"\n{'=' * 62}\n  [{i}/{len(roots)}]  {r.label}\n{'=' * 62}")
@@ -1652,7 +1718,7 @@ def main(argv=None) -> int:
             continue
         try:
             one = run_one(r, args, cfg, multi=len(roots) > 1, slides=slides,
-                          mont_jobs=mont_jobs, r_jobs=r_jobs)
+                          mont_jobs=mont_jobs, plot_jobs=plot_jobs)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -1664,13 +1730,14 @@ def main(argv=None) -> int:
 
     workers_out = args.workers or max(
         1, min(8, (multiprocessing.cpu_count() or 2) // 2))
-    if r_jobs:
-        print(f"\n{'=' * 62}\n  Drawing figures for {len(r_jobs)} tree(s) "
-              f"with R on {min(workers_out, len(r_jobs))} worker(s) ...")
-        run_r_all(r_jobs, workers_out)
+    if plot_jobs:
+        print(f"\n{'=' * 62}\n  Drawing figures for {len(plot_jobs)} tree(s) "
+              f"with PyPrism Plot on "
+              f"{min(workers_out, len(plot_jobs))} worker(s) ...")
+        run_plots_all(plot_jobs, workers_out)
 
     # Every montage in the run, drawn in one parallel pass. Each is two
-    # headless FIJI subtractions and they share nothing, so this is where the
+    # Python background subtractions and they share nothing, so this is where the
     # run's remaining wall-clock actually goes.
     if mont_jobs:
         print(f"\n{'=' * 62}\n  Drawing {len(mont_jobs)} montage(s) on "
@@ -1748,31 +1815,49 @@ def build_best_deck(slides, args) -> "Path | None":
 
 
 def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
-            mont_jobs=None, r_jobs=None) -> int:
+            mont_jobs=None, plot_jobs=None, shots=None, layout=None) -> int:
     """Score one capture tree. `cfg` is its already-resolved strain panel.
 
     `slides` collects this tree's best-candidate (montage, graph) pairs for the
     run-wide PowerPoint and `mont_jobs` the montages still to be drawn; pass
     None to skip either.
+
+    `shots` lets a caller supply the photos instead of having them discovered
+    here. `discover` can only read one folder layout -- timepoint/medium/Plate N
+    -- so the experiment layer, which reads any layout the user has, hands its
+    resolved photos in this way. Passing None keeps the original behaviour
+    exactly, which is what `main` still does.
     """
     root = tree.path
-    shots, bad = discover(root)
-    for b in bad:
-        print(f"  ! {b}")
+    if shots is None:
+        shots, bad = discover(root)
+        for b in bad:
+            print(f"  ! {b}")
     if not shots:
         print("No photos found. Expected timepoint/medium/Plate N/images.",
               file=sys.stderr)
         return 1
 
-    cands = candidates(shots)
+    # Which plates a sitting must have: whatever the design declares. The lab's
+    # two by default; one plate carrying every replicate is just as valid, since
+    # each replicate is normalised to the controls on its own plate.
+    cands = candidates(shots, (layout or sb.classic_layout()).plates())
     if not cands:
-        print("No condition has both a Plate 1 and a Plate 2 folder with "
-              "images -- four replicates need both.", file=sys.stderr)
+        wanted = ", ".join(str(p) for p in (layout or sb.classic_layout()).plates())
+        print(f"No condition has a photo of every plate ({wanted}) at any "
+              f"timepoint -- each plate carries its own replicates, so all are "
+              f"needed.", file=sys.stderr)
         return 1
 
     cache = args.cache_dir or TIMECOURSE_CACHE
-    jobs = build_jobs(cands, cache)
-    # Each measurement is memory-bandwidth heavy and carries its own JVM, so the
+    # The dilution levels to score. A plate template can declare any number, on
+    # any rows; with nothing supplied this is the lab's three, exactly as the
+    # pipeline has always scored them.
+    layout = layout or sb.classic_layout()
+    grid_opts = ({} if layout.is_classic()
+                 else {"n_rows": layout.n_rows, "n_cols": layout.n_cols})
+    jobs = build_jobs(cands, cache, layout)
+    # Each measurement holds full-resolution arrays, so the
     # useful ceiling is PHYSICAL cores, not logical ones -- hence cpu_count()//2
     # on an SMT machine. The old cap of min(4, cpus//4) dated from the
     # oversubscription incident in `_init_worker`, which the BLAS thread pinning
@@ -1792,8 +1877,9 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     print(f"\n  {len(shots)} photo(s), "
           f"{len({c['medium'] for c in cands})} medium/media, "
           f"{n_cond} condition-timepoints")
-    print(f"  {len(cands)} photo pairing(s) x 3 dilutions = "
-          f"{len(cands) * 3} candidates")
+    n_levels = len(layout.levels)
+    print(f"  {len(cands)} photo pairing(s) x {n_levels} dilutions = "
+          f"{len(cands) * n_levels} candidates")
     # One measurement per photo, not per (photo, dilution): every dilution
     # choice comes out of the same pass. SECONDS_PER_MEASUREMENT is a measured
     # figure -- re-check it with --timing after any change to worker count or to
@@ -1801,7 +1887,7 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     # before (see _init_worker).
     n_todo = sum(
         1 for j in jobs
-        if not (cache / f"{sb._cache_key(Path(j[0]), replace(sq.MeasureOptions(), quant_rows=j[1]))}.npz").exists())
+        if not (cache / f"{sb._cache_key(Path(j[0]), replace(sq.MeasureOptions(), quant_rows=j[1], **grid_opts))}.npz").exists())
     print(f"  {len(jobs)} measurement(s) after de-duplication, "
           f"{n_todo} not yet cached; at ~{SECONDS_PER_MEASUREMENT} s each that "
           f"is about {n_todo * SECONDS_PER_MEASUREMENT / 60 / max(workers, 1):.0f} "
@@ -1809,7 +1895,7 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     stubs = cloud_placeholders(shots)
     if stubs:
         # Count how many will actually need downloading (cached ones are free).
-        opts_probe = replace(sq.MeasureOptions())
+        opts_probe = replace(sq.MeasureOptions(), **grid_opts)
         n_download = sum(
             1 for s in stubs
             if not (cache / f"{sb._cache_key(s.path, opts_probe)}.npz").exists()
@@ -1839,7 +1925,8 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
 
     print("\n  Scoring ...")
     recs = []
-    cand_meta = []  # (cand, rows, strain_sigs, control_n) parallel to recs
+    # (cand, level, strain_sigs, control_n, control_expected), parallel to recs
+    cand_meta = []
     for c in cands:
         # The control column and the excluded strains are per MEDIUM: on K-OAc
         # the WT control does not grow, so several sets normalise against a
@@ -1847,19 +1934,25 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
         # significance counts are computed against the same control the figure
         # will use.
         cc_m, ex_m = medium_cfg(cfg, c["medium"])
-        for rows, nm in zip(ROW_SETS, ROW_NAMES):
-            m = score_candidate(c, rows, cache, cfg["strains"], cc_m, ex_m)
+        for level in layout.levels:
+            rows, nm = level, level.name
+            m = score_candidate(c, level, cache, cfg["strains"], cc_m, ex_m,
+                                layout=layout)
             if not m:
                 continue
             sigs = m.pop("_strain_sigs", {})
             ctrl_n = m.pop("control_n", 0)
+            ctrl_expected = m.pop("_control_expected", 4)
+            # One photo column per plate: plate1, plate2, ... -- for the lab's two
+            # plates the same two columns the CSV has always had.
+            photo_cols = {f"plate{k}": s.path.name
+                          for k, s in enumerate(cand_shots(c), start=1)}
             recs.append({"medium": c["medium"],
                          "medium_label": c["medium_label"],
                          "timepoint": c["tp_label"], "hours": c["hours"],
-                         "plate1": c["plate1"].path.name,
-                         "plate2": c["plate2"].path.name,
+                         **photo_cols,
                          "dilution": nm, "control_n": ctrl_n, **m})
-            cand_meta.append((c, rows, sigs, ctrl_n))
+            cand_meta.append((c, rows, sigs, ctrl_n, ctrl_expected))
     if not recs:
         print("  Nothing could be scored -- every candidate had a control at "
               "or below the noise floor.", file=sys.stderr)
@@ -1929,10 +2022,10 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
         pct = (cvs.rank(ascending=False, pct=True) if n_m > 1
                else pd.Series([1.0] * n_m, index=cvs.index))
         for p, pv in zip(pos, pct):
-            _, _, sigs, ctrl_n = cand_meta[int(df["_idx"].iloc[p])]
+            _, _, sigs, ctrl_n, ctrl_exp = cand_meta[int(df["_idx"].iloc[p])]
             off = _off_consensus_penalty(sigs, cons_m, n_m, core_m)
             best_scores[p] = _best_set_score(sigs, ctrl_n, float(pv),
-                                             core_m, off)
+                                             core_m, off, ctrl_exp)
     df["best_set_score"] = best_scores
 
     for medium in sorted(cons_by_medium, key=_medium_rank):
@@ -1989,15 +2082,15 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     print("\n  Best candidate per medium:")
     for medium in sorted(df["medium"].unique(), key=_medium_rank):
         row = ranked[ranked["medium"] == medium].iloc[0]
-        cand, rws, sigs, _ = cand_meta[int(row["_idx"])]
+        cand, rws, sigs, _, ctrl_exp = cand_meta[int(row["_idx"])]
         bests.append((cand, rws))
         print(f"    {medium:>7}  {row['timepoint']:>10}  {row['dilution']:>6} "
               f"dilution   score {row['best_set_score']:.3f}   "
               f"CV {row['median_CV']:.2f}   "
               f"control {row['control_mean']:.1f} "
-              f"({int(row['control_n'])}/4 reps)   "
+              f"({int(row['control_n'])}/{ctrl_exp} reps)   "
               f"{int(row['n_significant'])}/{int(row['n_strains'])} significant")
-        print(f"             {row['plate1']}  +  {row['plate2']}")
+        print(f"             {'  +  '.join(s.path.name for s in cand_shots(cand))}")
         if sigs:
             labels = {1: "increased", -1: "reduced"}
             core_m = core_by_medium.get(medium, {})
@@ -2049,7 +2142,9 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
               f"dilution   CV {b['median_CV']:.2f}   control "
               f"{b['control_mean']:.1f} (CV {b['control_CV']:.2f})   "
               f"{int(b['n_significant'])}/{int(b['n_strains'])} significant")
-        print(f"               {b['plate1']}  +  {b['plate2']}")
+        photos = [str(b[c]) for c in b.index
+                  if c.startswith("plate") and c[5:].isdigit() and pd.notna(b[c])]
+        print(f"               {'  +  '.join(photos)}")
     want = str(args.figures).strip().lower()
     if want != "none":
         n_per = None if want == "all" else max(1, int(want))
@@ -2061,7 +2156,7 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
             import spotting_timecourse_figures as tcf
             made = tcf.build_figures(
                 df, cands, cache, cfg["strains"], cfg["control_col"],
-                outdir / "figures", n_per_medium=n_per,
+                outdir / "figures", n_per_medium=n_per, layout=layout,
                 exclude=cfg.get("exclude"),
                 rank_note=f"ranked by {args.rank_by}",
                 resolve=lambda medium: medium_cfg(cfg, medium),
@@ -2081,13 +2176,13 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     print(f"\n  Building full output for {len(bests)} best candidate(s) ...")
     try:
         got, jobs, rj = output_best_candidates(
-            bests, cfg, cache, outdir / "best", tree.label)
+            bests, cfg, cache, outdir / "best", tree.label, layout)
         if slides is not None:
             slides.extend(got)
         if mont_jobs is not None:
             mont_jobs.extend(jobs)
-        if r_jobs is not None and rj is not None:
-            r_jobs.append(rj)
+        if plot_jobs is not None and rj is not None:
+            plot_jobs.append(rj)
     except Exception as e:
         print(f"  ! best-candidate output failed: {type(e).__name__}: {e}")
 

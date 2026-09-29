@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "kind": "spotting_plate_template",
+  "id": "709a0bac-2642-4898-a7dc-2f59af672f5d",
+  "revision": 2,
+  "name": "Untitled",
+  "created": "2026-09-29",
+  "grid": {
+    "rows": 12,
+    "cols": 8
+  },
+  "sample_slots": 24,
+  "dilution": {
+    "levels": 3
+  },
+  "plate_slots": [
+    {
+      "id": "1",
+      "label": "Plate 1",
+      "control_slot": 1,
+      "cells": [
+        ["s1r1d0",  "s2r1d0",  "s3r1d0",  "s4r1d0",  "s5r1d0",  "s6r1d0",  "s7r1d0",  "s8r1d0"],
+        ["s1r2d0",  "s2r2d0",  "s3r2d0",  "s4r2d0",  "s5r2d0",  "s6r2d0",  "s7r2d0",  "s8r2d0"],
+        ["s1r3d0",  "s2r3d0",  "s3r3d0",  "s4r3d0",  "s5r3d0",  "s6r3d0",  "s7r3d0",  "s8r3d0"],
+        ["s1r4d0",  "s2r4d0",  "s3r4d0",  "s4r4d0",  "s5r4d0",  "s6r4d0",  "s7r4d0",  "s8r4d0"],
+        ["s9r1d0",  "s10r1d0", "s11r1d0", "s12r1d0", "s13r1d0", "s14r1d0", "s15r1d0", "s16r1d0"],
+        ["s9r2d0",  "s10r2d0", "s11r2d0", "s12r2d0", "s13r2d0", "s14r2d0", "s15r2d0", "s16r2d0"],
+        ["s9r3d0",  "s10r3d0", "s11r3d0", "s12r3d0", "s13r3d0", "s14r3d0", "s15r3d0", "s16r3d0"],
+        ["s9r4d0",  "s10r4d0", "s11r4d0", "s12r4d0", "s13r4d0", "s14r4d0", "s15r4d0", "s16r4d0"],
+        ["s17r1d0", "s18r1d0", "s19r1d0", "s20r1d0", "s21r1d0", "s22r1d0", "s23r1d0", "s24r1d0"],
+        ["s17r2d0", "s18r2d0", "s19r2d0", "s20r2d0", "s21r2d0", "s22r2d0", "s23r2d0", "s24r2d0"],
+        ["s17r3d0", "s18r3d0", "s19r3d0", "s20r3d0", "s21r3d0", "s22r3d0", "s23r3d0", "s24r3d0"],
+        ["s17r4d0", "s18r4d0", "s19r4d0", "s20r4d0", "s21r4d0", "s22r4d0", "s23r4d0", "s24r4d0"]
+      ]
+    }
+  ]
+}

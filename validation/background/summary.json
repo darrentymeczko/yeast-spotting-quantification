@@ -1,0 +1,29 @@
+{
+  "images": [
+    {
+      "image": "4.1GLU.JPG",
+      "sha256": "798325ed274e96f48a5e3b78a413f9b67570453ffd4cf4a93b1e556e87fa997c",
+      "shape": [
+        4000,
+        6000
+      ],
+      "radius": 223.64536122701443,
+      "reference": "ImageJ version: 1.54g",
+      "pixel_mae": 0.0,
+      "pixel_max": 0.0,
+      "net_growth_max_abs": 0.0,
+      "reference_seconds": 10.313013499981025,
+      "python_seconds": 10.331600400008028
+    }
+  ],
+  "measured_spots": 48,
+  "relative_growth_max_abs": 0.0,
+  "relative_growth_mae": 0.0,
+  "outlier_flags_changed": 0,
+  "tolerances": {
+    "net_growth_max_abs": 0.01,
+    "relative_growth_max_abs": 0.001,
+    "outlier_flags_changed": 0
+  },
+  "passed": true
+}

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "kind": "spotting_plate_template",
+  "id": "9f2c3a1e-7d44-4b8a-8c31-6e0f5a2b1d90",
+  "revision": 1,
+  "name": "Martin Lab standard 8x6",
+  "description": "Eight sample slots across, three dilutions down, twice per plate. Plate 1 carries biological replicates 1 and 2, plate 2 carries 3 and 4.",
+  "created": "2026-09-11",
+  "grid": {
+    "rows": 6,
+    "cols": 8
+  },
+  "sample_slots": 8,
+  "dilution": {
+    "levels": 3,
+    "fold": 10,
+    "labels": ["least", "middle", "most"]
+  },
+  "plate_slots": [
+    {
+      "id": "1",
+      "label": "Plate 1 (reps 1+2)",
+      "control_slot": 1,
+      "cells": [
+        ["s1r1d0", "s2r1d0", "s3r1d0", "s4r1d0", "s5r1d0", "s6r1d0", "s7r1d0", "s8r1d0"],
+        ["s1r1d1", "s2r1d1", "s3r1d1", "s4r1d1", "s5r1d1", "s6r1d1", "s7r1d1", "s8r1d1"],
+        ["s1r1d2", "s2r1d2", "s3r1d2", "s4r1d2", "s5r1d2", "s6r1d2", "s7r1d2", "s8r1d2"],
+        ["s1r2d0", "s2r2d0", "s3r2d0", "s4r2d0", "s5r2d0", "s6r2d0", "s7r2d0", "s8r2d0"],
+        ["s1r2d1", "s2r2d1", "s3r2d1", "s4r2d1", "s5r2d1", "s6r2d1", "s7r2d1", "s8r2d1"],
+        ["s1r2d2", "s2r2d2", "s3r2d2", "s4r2d2", "s5r2d2", "s6r2d2", "s7r2d2", "s8r2d2"]
+      ]
+    },
+    {
+      "id": "2",
+      "label": "Plate 2 (reps 3+4)",
+      "control_slot": 1,
+      "cells": [
+        ["s1r3d0", "s2r3d0", "s3r3d0", "s4r3d0", "s5r3d0", "s6r3d0", "s7r3d0", "s8r3d0"],
+        ["s1r3d1", "s2r3d1", "s3r3d1", "s4r3d1", "s5r3d1", "s6r3d1", "s7r3d1", "s8r3d1"],
+        ["s1r3d2", "s2r3d2", "s3r3d2", "s4r3d2", "s5r3d2", "s6r3d2", "s7r3d2", "s8r3d2"],
+        ["s1r4d0", "s2r4d0", "s3r4d0", "s4r4d0", "s5r4d0", "s6r4d0", "s7r4d0", "s8r4d0"],
+        ["s1r4d1", "s2r4d1", "s3r4d1", "s4r4d1", "s5r4d1", "s6r4d1", "s7r4d1", "s8r4d1"],
+        ["s1r4d2", "s2r4d2", "s3r4d2", "s4r4d2", "s5r4d2", "s6r4d2", "s7r4d2", "s8r4d2"]
+      ]
+    }
+  ]
+}

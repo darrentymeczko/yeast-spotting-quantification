@@ -12,10 +12,10 @@ would otherwise assemble by hand, side by side in one sheet:
     left  -- the spots themselves, all four replicate blocks, with the dilution
              row that was quantified outlined in amber
     right -- the relative-growth graph for exactly that candidate, drawn by the
-             same plot_spotting.R the real pipeline uses
+             same PyPrism renderer the real pipeline uses
 
 The graph is not an approximation of the real figure. The tidy frame behind it
-goes through `spotting_batch.build_tidy` and then the same R script, with the
+goes through `spotting_batch.build_tidy` and then the same Python renderer, with the
 same per-plate control averaging, the same rim-flag exclusions and the same
 paired test. What you see is what quantifying that candidate would give you --
 which is the only honest basis for choosing between candidates.
@@ -48,7 +48,7 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-PROJECT_ROOT = HERE.parent
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_quant as sq          # noqa: E402
 import spotting_batch as sb          # noqa: E402
 import spotting_montage as sm        # noqa: E402
@@ -62,35 +62,78 @@ MONTAGE_FRAC = 0.46          # share of the sheet width the spot panel gets
 
 
 def safe_name(s: str) -> str:
-    """Filesystem- and R-safe token. Mirrors safe() in plot_spotting.R."""
+    """Filesystem-safe token shared by every figure-producing path."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_")
 
 
-def candidate_id(cand: dict, rows: tuple) -> str:
+def candidate_id(cand: dict, rows, layout=None) -> str:
     """A stable, readable name for one (pairing, dilution) candidate.
 
     Both photo stems are in the name because technical replicates mean several
     pairings share a timepoint and medium, and a sheet that could not be told
     apart from its neighbour would be useless.
     """
-    dil = _dil_choice(rows)
-    return safe_name(f"{cand['medium']}_{cand['tp_label']}_"
-                     f"{cand['plate1'].path.stem}-{cand['plate2'].path.stem}_"
-                     f"{dil}")
+    import spotting_timecourse as tc
+
+    dil = _dil_choice(rows, layout)
+    # Every plate's photo stem, joined -- for two plates exactly the old name.
+    stems = "-".join(s.path.stem for s in tc.cand_shots(cand))
+    return safe_name(f"{cand['medium']}_{cand['tp_label']}_{stems}_{dil}")
 
 
-def _dil_choice(rows: tuple) -> str:
-    """Map a 0-based row pair back to its dilution name ('least'/'middle'/'most')."""
-    want = tuple(int(r) for r in rows)
-    for name, pair in sb.DILUTIONS.items():
-        if tuple(pair) == want:
-            return name
-    raise ValueError(f"{rows} is not one of the three dilution row pairs")
+def _shots(cand) -> tuple:
+    """The candidate's photos, one per plate. See `spotting_timecourse.cand_shots`."""
+    import spotting_timecourse as tc
+
+    return tc.cand_shots(cand)
 
 
-def build_tidy_for_candidate(cand: dict, rows: tuple, cache_dir: Path,
+def _photo_names(row) -> list:
+    """plate1, plate2, ... photo names from a scored candidates-CSV row, in order."""
+    out, k = [], 1
+    while True:
+        v = row.get(f"plate{k}")
+        if v is None or (isinstance(v, float) and v != v) or v == "":
+            return out
+        out.append(str(v))
+        k += 1
+
+
+def _level(rows, layout=None) -> "sb.DilutionLevel":
+    """The candidate's dilution level, from a level or a legacy row tuple."""
+    if isinstance(rows, sb.DilutionLevel):
+        return rows
+    try:
+        return (layout or sb.classic_layout()).by_rows(rows)
+    except KeyError:
+        raise ValueError(f"{tuple(rows)} is not one of the dilution row sets "
+                         f"of this design") from None
+
+
+def _dil_choice(rows, layout=None) -> str:
+    """The dilution level's name ('least', 'middle', 'most', or 'level 4')."""
+    return _level(rows, layout).name
+
+
+def _mark_row(rows, layout=None, plate: int = 1) -> int:
+    """Which row, within a montage replicate block, to outline for this level.
+
+    The montage stacks each plate as replicate blocks. For a layout of regular
+    blocks the row's position within its block IS the level index -- that is
+    how the lab's (lo, hi) pairs work, row % 3. A design that is not regular
+    blocks is drawn a whole plate per block, and the level's first row on the
+    plate is what gets outlined.
+    """
+    level = _level(rows, layout)
+    if layout is None or layout.is_classic():
+        return int(level.rows(plate)[0]) % (sq.N_ROWS // 2)
+    k = layout.block_rows()
+    return level.index if k else int(level.rows(plate)[0])
+
+
+def build_tidy_for_candidate(cand: dict, rows, cache_dir: Path,
                              strains: list, control_col: int,
-                             exclude=None, resolve=None):
+                             exclude=None, resolve=None, layout=None):
     """The tidy frame for one candidate, normalized exactly as the pipeline does.
 
     Returns (tidy, plates), or None if either plate is missing from the cache or
@@ -109,25 +152,34 @@ def build_tidy_for_candidate(cand: dict, rows: tuple, cache_dir: Path,
     if resolve is not None:
         control_col, exclude = resolve(cand["medium"])
 
+    level = _level(rows, layout)
     plates = []
-    for shot in (cand["plate1"], cand["plate2"]):
+    for shot in tc.cand_shots(cand):
         try:
             plates.append(tc._cached_measure(shot.path, shot.plate,
-                                             tuple(r + 1 for r in rows),
-                                             cache_dir))
+                                             level.quant_rows(shot.plate),
+                                             cache_dir, layout))
         except Exception:
             return None
 
-    combo = f"{cand.get('set_id', 'TC')}|{candidate_id(cand, rows)}"
-    dil = {"mode": "combo", "choice": _dil_choice(rows)}
-    tidy = sb.build_tidy(combo, plates, strains, control_col, dil, exclude)
+    # Named exactly as `sb.build_tidy` named it from the combo "<set>|<cid>",
+    # so a sheet's graph keys and labels are unchanged.
+    set_id = str(cand.get("set_id", "TC"))
+    cid = candidate_id(cand, level, layout)
+    try:
+        tidy = sb.build_tidy_level(plates, strains, control_col, level, exclude,
+                                   experiment=f"Set {set_id} {cid}",
+                                   treatment=cid, set_label=set_id)
+    except KeyError:
+        return None
     if tidy is None or tidy.empty:
         return None
     return tidy, plates
 
 
 @lru_cache(maxsize=None)
-def _display_radius(path: Path, plate: int, cache_dir: Path) -> "float | None":
+def _display_radius(path: Path, plate: int, cache_dir: Path,
+                    layout=None) -> "float | None":
     """The largest ROI radius this photo takes across the three dilution choices.
 
     Used as ONE display background-subtraction radius for all of a photo's
@@ -144,26 +196,25 @@ def _display_radius(path: Path, plate: int, cache_dir: Path) -> "float | None":
     import spotting_timecourse as tc
 
     radii = []
-    for name in sb.DILUTION_ORDER:
-        rows = sb.DILUTIONS[name]
+    for level in (layout or sb.classic_layout()).levels:
         try:
-            pd_ = tc._cached_measure(path, plate, tuple(r + 1 for r in rows),
-                                     cache_dir)
+            pd_ = tc._cached_measure(path, plate, level.quant_rows(plate),
+                                     cache_dir, layout)
         except Exception:
             continue
         radii.append(float(pd_.radius))
     return max(radii) if radii else None
 
 
-PHOTOS_PER_FIJI_BATCH = 4
+PHOTOS_PER_BACKGROUND_BATCH = 4
 
 
-def _fiji_batch_worker(job):
-    """Worker: one FIJI run over several (path, ball_radius) pairs."""
+def _background_batch_worker(job):
+    """Worker: Python subtraction for several (path, ball_radius) pairs."""
     import spotting_quant as _sq
     jobs, out_dir = job
     try:
-        got = _sq.fiji_subtract_background_batch(
+        got = _sq.subtract_background_batch(
             [(Path(p), r) for p, r in jobs], Path(out_dir))
         return {k: str(v) for k, v in got.items()}
     except Exception:
@@ -171,49 +222,41 @@ def _fiji_batch_worker(job):
 
 
 def prepare_subtractions(keep, cache_dir: Path, opts: "sq.MeasureOptions",
-                         work: Path, workers: int = 1) -> dict:
-    """Background-subtract every photo the sheets need, once, in parallel.
+                         work: Path, workers: int = 1, layout=None) -> dict:
+    """Background-subtract the photos needed by comparison sheets in Python.
 
-    The sheets need ONE subtraction per photo -- `_display_radius` is keyed on
-    the photo, not the pairing or the dilution, so the same photo re-used across
-    pairings shares a result. That was already true, but the subtractions were
-    run one at a time from inside the compose loop, each starting its own
-    headless FIJI: on Set04 that is 36 JVM launches and roughly eight minutes
-    for a tree with 96 sheets.
-
-    Here every photo's radius is resolved first (all of it comes off the
-    measurement cache), then the subtractions run as batched FIJI jobs spread
-    across a process pool. Returns {(path, ball_radius) key: tif path}; a photo
-    missing from the result simply falls back to being subtracted in place.
+    Resolve each display radius from the measurement cache, then process each
+    unique photo/radius once across a process pool. Returns keys mapped to TIFF
+    paths. Missing entries are processed by the per-photo composition path.
     """
     import spotting_quant as _sq
 
     wanted = {}
     for _medium, cand, _rows, _metrics, _plates in keep:
-        for s in (cand["plate1"], cand["plate2"]):
-            r_disp = _display_radius(s.path, s.plate, cache_dir)
+        for s in _shots(cand):
+            r_disp = _display_radius(s.path, s.plate, cache_dir, layout)
             if r_disp is None:
                 continue
             ball = opts.resolve_ball_radius(2 * float(r_disp)
                                             / sq.MEASURE_RADIUS_FRAC)
-            wanted[_sq.fiji_batch_key(s.path, ball)] = (str(s.path), ball)
-    if not wanted or opts.bg_mode != "fiji":
+            wanted[_sq.background_batch_key(s.path, ball)] = (str(s.path), ball)
+    if not wanted or opts.bg_mode not in ("python", "fiji", "paraboloid"):
         return {}
 
     jobs = list(wanted.values())
-    groups = [jobs[i:i + PHOTOS_PER_FIJI_BATCH]
-              for i in range(0, len(jobs), PHOTOS_PER_FIJI_BATCH)]
-    print(f"    subtracting {len(jobs)} photo(s) in {len(groups)} FIJI "
+    groups = [jobs[i:i + PHOTOS_PER_BACKGROUND_BATCH]
+              for i in range(0, len(jobs), PHOTOS_PER_BACKGROUND_BATCH)]
+    print(f"    subtracting {len(jobs)} photo(s) in {len(groups)} Python "
           f"batch(es) on {min(workers, len(groups))} worker(s) ...")
     t0 = time.perf_counter()
     out = {}
     if workers <= 1 or len(groups) == 1:
         for gi, g in enumerate(groups):
-            out.update(_fiji_batch_worker((g, str(work / f"bg{gi}"))))
+            out.update(_background_batch_worker((g, str(work / f"bg{gi}"))))
     else:
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=min(workers, len(groups))) as pool:
-            futs = [pool.submit(_fiji_batch_worker,
+            futs = [pool.submit(_background_batch_worker,
                                 (g, str(work / f"bg{gi}")))
                     for gi, g in enumerate(groups)]
             for fut in as_completed(futs):
@@ -222,8 +265,8 @@ def prepare_subtractions(keep, cache_dir: Path, opts: "sq.MeasureOptions",
     return out
 
 
-def _r_chunk_worker(job):
-    """Worker: one R call over a slice of the candidates."""
+def _plot_chunk_worker(job):
+    """Worker: draw one slice of candidates with PyPrism Plot."""
     import pandas as _pd
     import spotting_batch as _sb
     frames, out_dir = job
@@ -236,7 +279,7 @@ def _r_chunk_worker(job):
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):
-            _sb.run_r(csv_path, out_dir)
+            _sb.run_plots(csv_path, out_dir)
     except Exception:
         return {}
     return {p.stem[len("spotting_"):]: str(p)
@@ -244,17 +287,15 @@ def _r_chunk_worker(job):
 
 
 def draw_graphs(frames, work: Path, workers: int = 1) -> dict:
-    """Draw every candidate's graph, splitting the work across R processes.
+    """Draw every candidate's graph across Python worker processes.
 
-    plot_spotting.R loops over the distinct values of `treatment` and writes a
-    figure per value, so one call already served every candidate -- but one call
-    means one core, and at ~0.9 s a graph a tree of 47 sheets spent 45 s here
-    with fifteen cores idle. Each candidate is independent (its own
+    The renderer loops over distinct `treatment` values and writes a figure per
+    value, so one call already serves every candidate. Each candidate is independent (its own
     `experiment`, its own normalisation, its own paired test), so the frames
     split cleanly across several calls.
 
     Every chunk writes into its own directory, which is what keeps this safe:
-    R also emits spotting_paired_ttests.csv per run, and concurrent calls
+    Each worker also emits spotting_paired_ttests.csv, and concurrent calls
     sharing an outdir would overwrite each other's copy. That file is not used
     here -- only the PNGs are -- and `work` is discarded at the end.
 
@@ -265,20 +306,20 @@ def draw_graphs(frames, work: Path, workers: int = 1) -> dict:
     n_chunks = max(1, min(workers, len(frames)))
     chunks = [frames[i::n_chunks] for i in range(n_chunks)]
     chunks = [c for c in chunks if c]
-    print(f"    drawing {len(frames)} graph(s) in {len(chunks)} R call(s) "
+    print(f"    drawing {len(frames)} graph(s) on {len(chunks)} worker(s) "
           f"...")
     t0 = time.perf_counter()
     graphs = {}
     if len(chunks) == 1:
-        graphs.update(_r_chunk_worker((chunks[0], str(work / "r0"))))
+        graphs.update(_plot_chunk_worker((chunks[0], str(work / "plot0"))))
     else:
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
-            futs = [pool.submit(_r_chunk_worker, (c, str(work / f"r{i}")))
+            futs = [pool.submit(_plot_chunk_worker, (c, str(work / f"plot{i}")))
                     for i, c in enumerate(chunks)]
             for fut in as_completed(futs):
                 graphs.update(fut.result())
-    print(f"    R finished in {time.perf_counter() - t0:.0f}s "
+    print(f"    plotting finished in {time.perf_counter() - t0:.0f}s "
           f"({len(graphs)} graph(s))")
     return {k: Path(v) for k, v in graphs.items()}
 
@@ -294,13 +335,14 @@ def _compose_chunk_worker(job):
     import spotting_montage as _sm
     import spotting_quant as _sq
 
-    items, strains, opts, outdir, rank_note, work = job
+    items, strains, opts, outdir, rank_note, work = job[:6]
+    layout = job[6] if len(job) > 6 else None
     made, errs = [], []
     cur_key, cur_proc = None, [None, None]
     for (medium, cand, rows, metrics, plates, bg_r, sub_keys) in items:
-        cid = candidate_id(cand, rows)
+        cid = candidate_id(cand, rows, layout)
         try:
-            pair_key = (str(cand["plate1"].path), str(cand["plate2"].path))
+            pair_key = tuple(str(s.path) for s in _shots(cand))
             if sub_keys and pair_key != cur_key:
                 cur_proc = [tifffile.imread(t).astype(np.float64) if t else None
                             for t in sub_keys]
@@ -308,49 +350,51 @@ def _compose_chunk_worker(job):
             montage_png = Path(work) / f"{cid}_montage.png"
             _sm.build_montage(f"TC|{cid}", plates, strains, opts, montage_png,
                               rep_label="Replicate",
-                              mark_row=int(rows[0]) % (_sq.N_ROWS // 2),
+                              mark_row=_mark_row(rows, layout),
                               mark_label="quantified", bg_radius=bg_r,
-                              proc=(cur_proc if sub_keys else None))
+                              proc=(cur_proc if sub_keys else None),
+                              layout=layout)
             sheet = (Path(outdir) / safe_name(medium)
-                     / f"{_sort_prefix(cand, rows)}{cid}.png")
+                     / f"{_sort_prefix(cand, rows, layout)}{cid}.png")
             gp = metrics.pop("_graph", None)
             _compose(sheet, montage_png, Path(gp) if gp else None,
-                     cand, rows, metrics, rank_note, bg_radius=bg_r)
+                     cand, rows, metrics, rank_note, bg_radius=bg_r,
+                     layout=layout)
             made.append(str(sheet))
         except Exception as e:
             errs.append((cid, f"{type(e).__name__}: {e}"))
     return made, errs
 
 
-def _run_r(csv_path: Path, outdir: Path) -> "Path | None":
-    """Draw the graph with plot_spotting.R and return the PNG it wrote."""
-    sb.run_r(csv_path, outdir)
+def _run_plot(csv_path: Path, outdir: Path) -> "Path | None":
+    """Draw the graph with PyPrism Plot and return the PNG it wrote."""
+    sb.run_plots(csv_path, outdir)
     figs = sorted((outdir / "figures").glob("spotting_*.png"))
     return figs[0] if figs else None
 
 
-def build_candidate_figure(cand: dict, rows: tuple, cache_dir: Path,
+def build_candidate_figure(cand: dict, rows, cache_dir: Path,
                            strains: list, control_col: int, outdir: Path,
                            opts: "sq.MeasureOptions | None" = None,
                            exclude=None, rank_note: str = "",
                            metrics: "dict | None" = None,
-                           resolve=None) -> "Path | None":
-    """One sheet: marked spot montage on the left, its own R graph on the right.
+                           resolve=None, layout=None) -> "Path | None":
+    """One sheet: marked spot montage left, its PyPrism graph right.
 
     Returns the sheet path, or None if the candidate could not be drawn (a
-    missing cache entry, or R unavailable -- in which case the montage is still
+    missing cache entry or plotting failure -- in which case the montage is still
     written on its own so the run is not wasted).
     """
     opts = opts or sq.MeasureOptions()
-    cid = candidate_id(cand, rows)
+    cid = candidate_id(cand, rows, layout)
     got = build_tidy_for_candidate(cand, rows, cache_dir, strains,
-                                   control_col, exclude, resolve)
+                                   control_col, exclude, resolve, layout)
     if got is None:
         return None
     tidy, plates = got
 
     outdir.mkdir(parents=True, exist_ok=True)
-    # The per-candidate CSV and the R figure are intermediates. They go to a
+    # The per-candidate CSV and graph are intermediates. They go to a
     # temp folder so a Results tree holds sheets, not three files per candidate;
     # the numbers behind every sheet are already in timecourse_candidates.csv
     # and can be regenerated from the cache in seconds.
@@ -358,26 +402,27 @@ def build_candidate_figure(cand: dict, rows: tuple, cache_dir: Path,
     try:
         csv_path = work / f"{cid}_normalized.csv"
         tidy.to_csv(csv_path, index=False, encoding="utf-8-sig")
-        graph_png = _run_r(csv_path, work)
+        graph_png = _run_plot(csv_path, work)
 
         montage_png = work / f"{cid}_montage.png"
-        # `rows` is a (lo, hi) pair one row apart in each replicate block, so
-        # its position WITHIN a block is what the montage needs.
-        mark = int(rows[0]) % (sq.N_ROWS // 2)
+        # The level's position WITHIN a replicate block is what the montage
+        # outlines -- see `_mark_row`.
+        mark = _mark_row(rows, layout)
         sm.build_montage(f"TC|{cid}", plates, strains, opts, montage_png,
                          rep_label="Replicate", mark_row=mark,
-                         mark_label="quantified")
+                         mark_label="quantified", layout=layout)
 
         sheet = outdir / f"{cid}.png"
-        _compose(sheet, montage_png, graph_png, cand, rows, metrics, rank_note)
+        _compose(sheet, montage_png, graph_png, cand, rows, metrics, rank_note,
+                 layout=layout)
         return sheet
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def _compose(out_path: Path, montage_png: Path, graph_png: "Path | None",
-             cand: dict, rows: tuple, metrics: "dict | None",
-             rank_note: str, bg_radius=None) -> Path:
+             cand: dict, rows, metrics: "dict | None",
+             rank_note: str, bg_radius=None, layout=None) -> Path:
     """Lay the two panels on one sheet with a header naming the candidate."""
     import matplotlib
     matplotlib.use("Agg")
@@ -397,16 +442,26 @@ def _compose(out_path: Path, montage_png: Path, graph_png: "Path | None",
     if graph_png is not None and Path(graph_png).exists():
         ax.imshow(mpimg.imread(str(graph_png)))
     else:
-        ax.text(0.5, 0.5, "no graph -- R unavailable\n(the spot panel is still "
+        ax.text(0.5, 0.5, "no graph -- plotting failed\n(the spot panel is still "
                           "valid)", ha="center", va="center", fontsize=13,
                 color="#a00000", transform=ax.transAxes)
     ax.axis("off")
 
-    dil = _dil_choice(rows)
+    level = _level(rows, layout)
+    shots = _shots(cand)
+    shown_rows = [r + 1 for r in level.rows(shots[0].plate)]
+    rows_text = " & ".join(str(r) for r in shown_rows)
+    for shot in shots[1:]:
+        try:
+            other = [r + 1 for r in level.rows(shot.plate)]
+        except KeyError:
+            continue
+        if other != shown_rows:
+            rows_text += (f"; plate {shot.plate} rows "
+                          f"{' & '.join(str(r) for r in other)}")
     title = (f"{cand['medium_label']}  |  {cand['tp_label']}  |  "
-             f"{dil} dilution (rows {rows[0] + 1} & {rows[1] + 1})")
-    sub = (f"plate 1: {cand['plate1'].path.name}     "
-           f"plate 2: {cand['plate2'].path.name}")
+             f"{level.name} dilution (rows {rows_text})")
+    sub = "     ".join(f"plate {s.plate}: {s.path.name}" for s in shots)
     if metrics:
         bits = []
         if metrics.get("median_CV") is not None:
@@ -461,7 +516,7 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
                   n_per_medium: "int | None" = None,
                   opts: "sq.MeasureOptions | None" = None,
                   exclude=None, rank_note: str = "",
-                  resolve=None, workers: int = 1) -> list:
+                  resolve=None, workers: int = 1, layout=None) -> list:
     """Draw a sheet per candidate -- every one by default, so they can be compared.
 
     `n_per_medium=None` means all; an integer keeps only that many per medium,
@@ -472,13 +527,12 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
     work, and both matter because the cost is dominated by things that do NOT
     vary per sheet:
 
-    * ONE Rscript call for the whole run. plot_spotting.R already loops over the
+    * one PyPrism rendering pass for the whole run; the renderer loops over the
       distinct values of `treatment` and writes a figure per value, so every
       candidate's tidy frame is stacked into a single CSV with the candidate id
       as its `treatment`. Each candidate keeps its own `experiment`, so the
-      normalisation and the paired tests stay exactly as separate as they were
-      when this ran R once per candidate. What is saved is ~50 interpreter
-      start-ups and ~50 library loads.
+      normalisation and paired tests stay separate. What is saved is repeated
+      interpreter start-up and library loading.
     * Candidates are drawn grouped by photo pairing, so the montage block cache
       in spotting_montage hits: the three dilution choices of one pairing differ
       only in which row is outlined, and now share one background subtraction.
@@ -499,31 +553,39 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
             cand = _match_candidate(cands, row)
             if cand is None:
                 print(f"  ! no candidate matches {row.get('medium')} "
-                      f"{row.get('timepoint')} {row.get('plate1')}+"
-                      f"{row.get('plate2')}; skipped")
+                      f"{row.get('timepoint')} "
+                      f"{'+'.join(_photo_names(row))}; skipped")
                 continue
-            picked.append((medium, cand, _rows_from_row(row), row.to_dict()))
+            try:
+                level = _rows_from_row(row, layout)
+            except ValueError as e:
+                print(f"  ! {e}; skipped")
+                continue
+            picked.append((medium, cand, level, row.to_dict()))
     # Sort on the FULL PATH, not the file name. A capture tree routinely names
     # every photo the same thing (`_9.JPG` in each timepoint/plate folder), so
     # keying on the name collapses this to (medium, dilution) -- which visits
     # every pairing at one dilution before returning to the first pairing, and
     # misses the block cache on literally every sheet. Measured: ~25 s a sheet
     # that way against ~2 s once the three dilutions of a pairing are adjacent.
-    picked.sort(key=lambda t: (t[0], str(t[1]["plate1"].path),
-                               str(t[1]["plate2"].path), t[2][0]))
+    # Level index, not rows[0]: identical ordering for the classic layout, where
+    # the least dilute pair starts on row 0, and still defined when a level's
+    # rows differ between plates.
+    picked.sort(key=lambda t: (t[0], tuple(str(s.path) for s in _shots(t[1])),
+                               t[2].index))
     if not picked:
         return made
 
-    # --- one tidy frame for everything, one R call ---------------------------
+    # --- one tidy frame for everything, one plotting pass --------------------
     work = Path(tempfile.mkdtemp(prefix="tcfigs_"))
     try:
         frames, keep = [], []
         for medium, cand, rows, metrics in picked:
             got = build_tidy_for_candidate(cand, rows, cache_dir, strains,
-                                           control_col, exclude, resolve)
+                                           control_col, exclude, resolve, layout)
             if got is None:
-                print(f"  ! no measurement for {candidate_id(cand, rows)}; "
-                      f"skipped")
+                print(f"  ! no measurement for "
+                      f"{candidate_id(cand, rows, layout)}; skipped")
                 continue
             tidy, plates = got
             frames.append(tidy)
@@ -534,7 +596,7 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
         graphs = draw_graphs(frames, work, workers)
 
         # --- every subtraction the sheets need, once, in parallel -------------
-        subs = prepare_subtractions(keep, cache_dir, opts, work, workers)
+        subs = prepare_subtractions(keep, cache_dir, opts, work, workers, layout)
 
         # --- compose the sheets, in parallel by PAIRING -----------------------
         # Grouped by pairing rather than sliced arbitrarily, so each worker
@@ -548,21 +610,21 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
             # value would make plate 1's cache entry depend on which plate 2 it
             # happened to be paired with, and the same photo would be
             # subtracted again for every pairing it appears in.
-            bg_r = [_display_radius(s.path, s.plate, cache_dir)
-                    for s in (cand["plate1"], cand["plate2"])]
+            bg_r = [_display_radius(s.path, s.plate, cache_dir, layout)
+                    for s in _shots(cand)]
             tifs = []
-            for s, r_disp in zip((cand["plate1"], cand["plate2"]), bg_r):
+            for s, r_disp in zip(_shots(cand), bg_r):
                 t = None
                 if subs and r_disp is not None:
                     ball = opts.resolve_ball_radius(
                         2 * float(r_disp) / sq.MEASURE_RADIUS_FRAC)
-                    got = subs.get(sq.fiji_batch_key(s.path, ball))
+                    got = subs.get(sq.background_batch_key(s.path, ball))
                     t = str(got) if got else None
                 tifs.append(t)
             m = dict(metrics)
-            g = graphs.get(candidate_id(cand, rows))
+            g = graphs.get(candidate_id(cand, rows, layout))
             m["_graph"] = str(g) if g else None
-            key = (str(cand["plate1"].path), str(cand["plate2"].path))
+            key = tuple(str(s.path) for s in _shots(cand))
             by_pair.setdefault(key, []).append(
                 (medium, cand, rows, m, plates, bg_r,
                  tifs if any(tifs) else None))
@@ -577,13 +639,14 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
         results = []
         if len(chunks) == 1:
             results.append(_compose_chunk_worker(
-                (chunks[0], strains, opts, str(outdir), rank_note, str(work))))
+                (chunks[0], strains, opts, str(outdir), rank_note, str(work),
+                 layout)))
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
             with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
                 futs = [pool.submit(_compose_chunk_worker,
                                     (c, strains, opts, str(outdir), rank_note,
-                                     str(work)))
+                                     str(work), layout))
                         for c in chunks]
                 for fut in as_completed(futs):
                     results.append(fut.result())
@@ -599,17 +662,23 @@ def build_figures(df: "pd.DataFrame", cands: list, cache_dir: Path,
     return made
 
 
-def _sort_prefix(cand: dict, rows: tuple) -> str:
+def _sort_prefix(cand: dict, rows, layout=None) -> str:
     """Filename prefix that sorts the sheets the way you compare them.
 
     Timepoint ascending, then dilution least->most. Sorting by name in a file
     browser then walks the time course in order, which is the comparison the
     figures exist for; the candidate id alone sorts alphabetically and puts
     '19 Hours' before '9 Hours'.
+
+    The level index is zero-padded to two digits once a design has more than
+    ten levels, so d10 does not sort between d1 and d2. For ten or fewer it is
+    a single digit, exactly the names every existing sheet already has.
     """
     hours = cand.get("hours")
     h = f"{float(hours):06.1f}" if hours is not None else "______"
-    d = sb.DILUTION_ORDER.index(_dil_choice(rows))
+    level = _level(rows, layout)
+    n = len((layout or sb.classic_layout()).levels)
+    d = f"{level.index:02d}" if n > 10 else f"{level.index}"
     return f"{h}h_d{d}_"
 
 
@@ -619,18 +688,18 @@ build_top_figures = build_figures
 
 def _match_candidate(cands: list, row) -> "dict | None":
     """Find the candidate dict a scored row came from."""
+    want = _photo_names(row)
     for c in cands:
         if (c["medium"] == row.get("medium")
                 and c["tp_label"] == row.get("timepoint")
-                and c["plate1"].path.name == row.get("plate1")
-                and c["plate2"].path.name == row.get("plate2")):
+                and [s.path.name for s in _shots(c)] == want):
             return c
     return None
 
 
-def _rows_from_row(row) -> tuple:
-    """The 0-based dilution row pair a scored row used."""
-    name = str(row.get("dilution", "")).strip().lower()
-    if name in sb.DILUTIONS:
-        return tuple(sb.DILUTIONS[name])
-    raise ValueError(f"unrecognised dilution {row.get('dilution')!r}")
+def _rows_from_row(row, layout=None) -> "sb.DilutionLevel":
+    """The dilution level a scored candidate row used, looked up by name."""
+    try:
+        return (layout or sb.classic_layout()).by_name(row.get("dilution", ""))
+    except KeyError:
+        raise ValueError(f"unrecognised dilution {row.get('dilution')!r}") from None
