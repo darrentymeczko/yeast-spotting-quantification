@@ -9,8 +9,8 @@ Implements the manual ImageJ + Excel + R workflow from:
 
 Pipeline (protocol steps 12-30):
   8-bit grayscale (ImageJ-compatible RGB conversion)              [step 13]
-    -> rolling-ball background subtraction, single pass, float,
-       no clipping; ImageJ's block-minimum shrink schedule        [steps 15-18]
+    -> Python sliding-paraboloid background subtraction,
+       ImageJ-compatible float32 arithmetic, no clipping         [steps 15-18]
     -> automatic 8x6 spot-grid detection, or hand-recorded ROIs   [implicit]
     -> per-spot mean gray over a fixed ImageJ-oval ROI            [steps 21-23]
     -> subtract mean background (may go negative -- kept)         [step 24]
@@ -248,194 +248,50 @@ def _rolling_ball_background(work: np.ndarray, radius: float,
 # Sliding paraboloid  (what protocol step 15 actually specifies)
 # ---------------------------------------------------------------------------
 
-def _fh_lower_envelope(f: np.ndarray, coeff2: float) -> np.ndarray:
-    """D[q] = min over p of ( f[p] + coeff2*(q-p)^2 ), independently for every
-    column, down axis 0.
-
-    This is the Felzenszwalb & Huttenlocher (2012) lower-envelope-of-parabolas
-    scan: O(n) per column rather than O(n*radius), which is what makes a
-    full-resolution paraboloid affordable on a 24 MP plate photo. The scan is
-    sequential in q but identical in form for every column, so it is vectorised
-    ACROSS columns -- the inner "pop a parabola" loop runs until no column still
-    needs popping instead of per column.
-    """
-    n, m = f.shape
-    if n == 1:
-        return f.copy()
-
-    cols = np.arange(m)
-    v = np.zeros((n, m), dtype=np.intp)          # vertex index of each parabola
-    z = np.empty((n + 1, m), dtype=np.float64)   # breakpoints between parabolas
-    z[0] = -np.inf
-    z[1] = np.inf
-    k = np.zeros(m, dtype=np.intp)               # index of the current parabola
-
-    for q in range(1, n):
-        fq = f[q]
-        cq = coeff2 * q * q
-        while True:
-            vk = v[k, cols]
-            s = (((fq + cq) - (f[vk, cols] + coeff2 * vk * vk))
-                 / (2.0 * coeff2 * (q - vk)))
-            bad = s <= z[k, cols]                # z[0] is -inf, so k never < 0
-            if not bad.any():
-                break
-            k[bad] -= 1
-        k += 1
-        v[k, cols] = q
-        z[k, cols] = s
-        z[k + 1, cols] = np.inf
-
-    out = np.empty_like(f)
-    k[:] = 0
-    for q in range(n):
-        while True:
-            adv = z[k + 1, cols] < q
-            if not adv.any():
-                break
-            k[adv] += 1
-        vk = v[k, cols]
-        out[q] = coeff2 * (q - vk) ** 2 + f[vk, cols]
-    return out
-
-
-def _para_erode(a: np.ndarray, c: float) -> np.ndarray:
-    """Greyscale erosion by the parabolic structuring function -c*y^2."""
-    return _fh_lower_envelope(a, c)
-
-
-def _para_dilate(a: np.ndarray, c: float) -> np.ndarray:
-    """Greyscale dilation by the same parabolic structuring function."""
-    return -_fh_lower_envelope(-a, c)
-
-
 def paraboloid_background(work: np.ndarray, radius: float,
                           presmooth: bool = True) -> np.ndarray:
-    """Background under `work` traced by a paraboloid of curvature 0.5/radius
-    sliding beneath the surface -- ImageJ's "sliding paraboloid" option, which
-    is what the protocol (step 15) actually specifies.
+    """ImageJ-compatible background estimate, calculated entirely in Python."""
+    from spotting_background import subtract_background as subtract
+    src = np.asarray(work, dtype=np.float32)
+    return src.astype(np.float64) - subtract(src, radius, presmooth=presmooth)
 
-    Sliding a shape under a surface and taking the envelope of its positions IS
-    the morphological OPENING by that shape, and the paraboloid
-    c*(x^2 + y^2) is separable, so the exact 2-D result is
 
-        open = dilate_x( dilate_y( erode_y( erode_x(f) ) ) )
+def background_batch_key(path, radius: float) -> tuple:
+    """Identity of a photo and the whole-pixel subtraction radius."""
+    return (str(Path(path).resolve()), f"{max(1.0, float(radius)):.0f}")
 
-    with each 1-D step an O(n) lower-envelope scan. ImageJ approximates this by
-    sliding along x, y and both diagonals repeatedly; the separable form is the
-    thing that approximation converges to, so this is at least as faithful and
-    needs no shrink schedule -- which removes the block-MIN / block-MEAN
-    dilemma that made the rolling-ball path either fail to flatten (MIN) or eat
-    ~2x of the spot signal (MEAN).
 
-    presmooth mirrors ImageJ: estimate on a 3x3-mean-smoothed copy so single-
-    pixel noise cannot pin the paraboloid down, then clamp the background to
-    never exceed the true pixel value.
+def subtract_background_batch(jobs, out_dir: Path,
+                              debug: bool = False) -> dict:
+    """Subtract each unique image/radius in Python and return float TIFF paths.
+
+    Used to share processed images across montage and comparison-sheet jobs.
+    Errors propagate to the worker, which can report or retry individual jobs.
+    No external image-processing application is launched.
     """
-    coeff2 = 0.5 / max(1.0, float(radius))
+    import hashlib
+    import tifffile
+    from spotting_background import subtract_background as subtract
 
-    src = work
-    if presmooth:
-        from scipy import ndimage as ndi
-        src = ndi.uniform_filter(work, size=3, mode="nearest")
-
-    e = _para_erode(np.ascontiguousarray(src), coeff2)
-    e = _para_erode(np.ascontiguousarray(e.T), coeff2).T
-    d = _para_dilate(np.ascontiguousarray(e), coeff2)
-    d = _para_dilate(np.ascontiguousarray(d.T), coeff2).T
-
-    bg = np.ascontiguousarray(d)
-    if presmooth:
-        bg = np.minimum(bg, work)     # background can never exceed the data
-    return bg
-
-
-# ---------------------------------------------------------------------------
-# FIJI backend  (the reference implementation, driven headlessly)
-# ---------------------------------------------------------------------------
-
-# Where to look for FIJI. First hit wins; None disables the backend.
-FIJI_CANDIDATES = [
-    r"C:/Program Files/Fiji.app/ImageJ-win64.exe",
-    r"C:/Program Files/Fiji.app/fiji-windows-x64.exe",
-    r"C:/Program Files/Fiji.app/ImageJ-win32.exe",
-]
-
-_FIJI_MACRO = """
-args = getArgument();
-p = split(args, "|");
-open(p[0]);
-run("8-bit");
-run("32-bit");
-run("Subtract Background...", "rolling=" + p[2] + " sliding");
-saveAs("Tiff", p[1]);
-close();
-"""
-
-
-def find_fiji() -> str | None:
-    """Path to a FIJI executable, or None."""
-    import shutil
-    for c in FIJI_CANDIDATES:
-        if Path(c).is_file():
-            return c
-    return shutil.which("ImageJ-win64") or shutil.which("fiji")
-
-
-def fiji_subtract_background(image_path: Path, radius: float,
-                             debug: bool = False) -> np.ndarray | None:
-    """Run FIJI's own Subtract Background (sliding paraboloid) on a file.
-
-    This is the reference implementation of the operation the protocol calls
-    for, and on this corpus it flattens slightly better than the local one:
-    background spread 0.08 gray against 0.32 on 2.1K-OAc, measured through the
-    identical ROIs. It is also the tool the lab's earlier quantifications were
-    done in, so results stay comparable with them.
-
-    The macro converts to 8-bit (matching ImageJ's own RGB conversion) and then
-    to 32-bit BEFORE subtracting, because an 8-bit result is clipped at zero.
-    Clipping rectifies the noise around the agar, biasing the background upward
-    and pushing faint spots negative once that inflated value is subtracted.
-
-    Returns the subtracted image as float64, or None if FIJI is unavailable or
-    fails -- the caller then falls back to the local implementation.
-    """
-    import subprocess
-    import tempfile
-
-    exe = find_fiji()
-    if not exe:
-        return None
-    try:
-        import tifffile
-    except ImportError:
-        return None
-
-    with tempfile.TemporaryDirectory(prefix="spotfiji_") as td:
-        macro = Path(td) / "bg.ijm"
-        macro.write_text(_FIJI_MACRO, encoding="utf-8")
-        out = Path(td) / "out.tif"
-        arg = f"{Path(image_path).resolve()}|{out}|{radius:.0f}"
-        try:
-            r = subprocess.run([exe, "--headless", "--console", "-macro",
-                                str(macro), arg],
-                               capture_output=True, text=True, timeout=600,
-                               encoding="utf-8", errors="replace")
-        except Exception as e:
-            if debug:
-                print(f"    (FIJI failed to launch: {e})")
-            return None
-        if not out.exists():
-            if debug:
-                print(f"    (FIJI produced no output; rc={r.returncode})")
-            return None
-        return tifffile.imread(str(out)).astype(np.float64)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {}
+    for path, radius in jobs:
+        key = background_batch_key(path, radius)
+        if key in outputs:
+            continue
+        name = hashlib.sha256(repr(key).encode()).hexdigest()[:20]
+        out = out_dir / f"bg_{name}.tif"
+        result = subtract(load_gray8(Path(path)), float(key[1]))
+        tifffile.imwrite(out, result)
+        outputs[key] = out
+    return outputs
 
 
 def subtract_background(img8: np.ndarray, *, ball_radius: float,
                         bg_centers: list[tuple[float, float]], bg_radius: float,
                         iters: int = BG_ITERS, shrink: int | None = None,
-                        mode: str = "paraboloid", fiji_path: Path | None = None,
+                        mode: str = "python",
                         debug: bool = False) -> tuple[np.ndarray, int, float]:
     """Subtract the rolling-ball background (protocol steps 15-18).
 
@@ -468,19 +324,11 @@ def subtract_background(img8: np.ndarray, *, ball_radius: float,
     spread = 0.0
     n = max(1, int(iters))
     for it in range(1, n + 1):
-        if mode == "fiji":
-            # FIJI returns the SUBTRACTED image, not the background, so it
-            # replaces `work` outright rather than being subtracted from it.
-            res = fiji_subtract_background(fiji_path, radius, debug=debug)
-            if res is None:
-                if debug:
-                    print("    (FIJI unavailable; using the local paraboloid)")
-                bg = paraboloid_background(work, radius)
-            else:
-                work = res
-                bg = None
-        elif mode == "paraboloid":
-            bg = paraboloid_background(work, radius)
+        if mode in ("python", "fiji", "paraboloid"):
+            # Legacy mode names remain aliases, but never launch FIJI.
+            from spotting_background import subtract_background as subtract
+            work = subtract(work, radius).astype(np.float64)
+            bg = None
         elif mode == "rollingball":
             bg = _rolling_ball_background(work, radius, shrink=shrink)
         else:
@@ -490,8 +338,8 @@ def subtract_background(img8: np.ndarray, *, ball_radius: float,
         samples = [_disk_mean(work, cy, cx, bg_radius) for cy, cx in bg_centers]
         spread = (max(samples) - min(samples)) if samples else 0.0
         if debug:
-            extra = ("" if mode == "paraboloid" else
-                     f", shrink={_shrink_factor(radius) if shrink is None else shrink}")
+            extra = (f", shrink={_shrink_factor(radius) if shrink is None else shrink}"
+                     if mode == "rollingball" else "")
             print(f"    {mode} iter {it} (r={radius:.0f}{extra}): "
                   f"background spread = {spread:.2f}")
 
@@ -554,6 +402,35 @@ RIM_ERODE_FRAC = 0.12     # erode plate radius inward by this to drop the bright
 SPOT_RADIUS_FRAC = 0.05   # spot radius as a fraction of plate radius (initial guess)
 SPACING_FRAC = 0.197      # spot-to-spot spacing as a fraction of plate radius
                           # (frogger geometry; near-constant across the lab's plates)
+                          # -- for the DEFAULT 8-column grid. See expected_pitch.
+
+# How wide the printed grid is across the plate, in plate radii, measured along
+# whichever axis carries the most positions. The expected spot pitch follows
+# from this and the grid size, which is what lets a 12x8 or a 16x24 layout be
+# found on the same dish: a frogger prints its grid centred and filling roughly
+# the same area whatever its pin count, so the PITCH scales with the number of
+# positions while the SPAN does not.
+#
+# Derived from the calibrated 8-column value so the default grid is unchanged:
+#     0.197 * (8 - 1) = 1.379
+GRID_SPAN_FRAC = SPACING_FRAC * (N_COLS - 1)
+
+# Spot radius as a fraction of the PITCH rather than of the plate. A denser grid
+# has proportionally smaller spots, and it is this ratio that stays put.
+# Equals the calibrated 0.05 / 0.197 for the default grid.
+SPOT_RADIUS_PER_PITCH = SPOT_RADIUS_FRAC / SPACING_FRAC
+
+
+def expected_pitch(r_eq: float, n_rows: int = N_ROWS, n_cols: int = N_COLS) -> float:
+    """Initial guess at the spot-to-spot spacing, in the units of `r_eq`.
+
+    Only a seed -- `_fit_1d` fits the real spacing from the detected centroids
+    -- but it has to be close enough that the top-hat isolates single spots and
+    that the neighbour search in `_lattice_angle` finds true neighbours, so it
+    must track the grid size rather than assume eight columns.
+    """
+    steps = max(int(n_rows) - 1, int(n_cols) - 1, 1)
+    return GRID_SPAN_FRAC * r_eq / steps
 
 # An ROI whose far edge reaches past this fraction of the plate radius can pick
 # up the bright rim / meniscus glare. Measured case: plate2 row 6 ΔTRR2 is empty
@@ -581,7 +458,7 @@ RIM_BRIGHT_MARGIN = 12.0
 
 @dataclass
 class Grid:
-    centers: np.ndarray          # shape (N_ROWS, N_COLS, 2) -> full-res (y, x)
+    centers: np.ndarray          # shape (n_rows, n_cols, 2) -> full-res (y, x)
     spot_radius: float           # full-res
     measure_radius: float        # full-res disk used for spot + background reads
     largest_diameter: float      # full-res
@@ -601,6 +478,16 @@ class Grid:
                                  # is what lets every dilution be precomputed:
                                  # detection is 41s, the shrink is 0.9s.
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        """(n_rows, n_cols) of this grid, read off the centres it holds.
+
+        The grid carries its own size rather than every consumer consulting the
+        module defaults, which is what lets one process measure an 8x6 plate and
+        a 12x8 one without anything global changing underneath it.
+        """
+        return (int(self.centers.shape[0]), int(self.centers.shape[1]))
+
 
 def _remove_small(mask, n_px):
     """remove_small_objects across skimage versions.
@@ -614,6 +501,33 @@ def _remove_small(mask, n_px):
         return remove_small_objects(mask, max_size=int(n_px))
     except TypeError:                        # skimage < 0.26
         return remove_small_objects(mask, int(n_px))
+
+
+def _white_tophat(g: np.ndarray, footprint: np.ndarray) -> np.ndarray:
+    """`skimage.morphology.white_tophat`, via OpenCV when it is installed.
+
+    The disc here is ~80 px across on the detection image, and scipy's greyscale
+    opening costs 14.6 s at that size -- on its own the second-largest slice of
+    a measurement. OpenCV runs the identical morphology with SIMD kernels in
+    4.2 s.
+
+    Verified bit-for-bit (`np.array_equal`) against the skimage result on real
+    plates, which is the only reason this is safe to swap in: the tophat feeds
+    spot detection, so any numerical difference would move every centre, change
+    every measurement, and invalidate every cached .npz. Border handling is the
+    one place the two could disagree, so it is pinned to REFLECT to match
+    scipy's default rather than left at OpenCV's constant border.
+
+    Falls back to skimage if OpenCV is missing or refuses the input.
+    """
+    try:
+        import cv2
+        return cv2.morphologyEx(g, cv2.MORPH_TOPHAT,
+                                np.asarray(footprint, dtype=np.uint8),
+                                borderType=cv2.BORDER_REFLECT)
+    except Exception:
+        from skimage.morphology import white_tophat
+        return white_tophat(g, footprint)
 
 
 def _closing(mask, footprint):
@@ -640,9 +554,15 @@ def _dilation(mask, footprint):
 
 def detect_grid(img8: np.ndarray, debug: bool = False,
                 nudge: dict | None = None,
-                quant_rows: tuple | None = None) -> Grid:
-    """Locate the N_ROWS x N_COLS spot lattice fully automatically on a real
+                quant_rows: tuple | None = None,
+                n_rows: int | None = None, n_cols: int | None = None) -> Grid:
+    """Locate the n_rows x n_cols spot lattice fully automatically on a real
     plate photographed on a dark background.
+
+    `n_rows`/`n_cols` default to the module's N_ROWS/N_COLS, so every existing
+    caller is unchanged. Pass them to read a denser layout -- the algorithm
+    treats them as counts throughout, and the expected pitch and spot size are
+    derived from them by `expected_pitch`.
 
     Pipeline: downscale -> find the agar disc as the largest INSCRIBED circle
     (distance-transform peak, immune to the bright bracket/bolts touching the
@@ -655,8 +575,11 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
     from skimage.transform import resize
     from skimage.filters import threshold_otsu
     from skimage.measure import label, regionprops
-    from skimage.morphology import disk, white_tophat
+    from skimage.morphology import disk
     from scipy import ndimage as ndi
+
+    n_rows = N_ROWS if n_rows is None else int(n_rows)
+    n_cols = N_COLS if n_cols is None else int(n_cols)
 
     ds = max(1, round(max(img8.shape) / DETECT_LONG_SIDE))
     g = resize(img8.astype(float), (img8.shape[0] // ds, img8.shape[1] // ds),
@@ -676,9 +599,12 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
     Y, X = np.ogrid[:g.shape[0], :g.shape[1]]
     agar = (X - cx) ** 2 + (Y - cy) ** 2 < ((1 - RIM_ERODE_FRAC) * r_eq) ** 2
 
-    # 3) white top-hat isolates spot-sized bright features
-    sr = max(6, int(r_eq * SPOT_RADIUS_FRAC))
-    th = white_tophat(g, disk(int(sr * 1.6)))
+    # 3) white top-hat isolates spot-sized bright features.
+    # Sized from the expected PITCH rather than from the plate, so a denser grid
+    # looks for proportionally smaller spots instead of merging neighbours into
+    # one blob. Identical to r_eq * SPOT_RADIUS_FRAC for the default grid.
+    sr = max(6, int(expected_pitch(r_eq, n_rows, n_cols) * SPOT_RADIUS_PER_PITCH))
+    th = _white_tophat(g, disk(int(sr * 1.6)))
     th_in = np.where(agar, th, 0.0)
 
     # 3b) spot centroids + size estimate
@@ -700,7 +626,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
         cen = cen[np.hypot(cen[:, 0] - cx, cen[:, 1] - cy) < 0.9 * r_eq]
 
     # 4) rigid lattice fit (near-constant spacing, tilt-aware)
-    s, lattice, tilt = _fit_lattice(cen, cx, cy, r_eq)
+    s, lattice, tilt = _fit_lattice(cen, cx, cy, r_eq, n_rows, n_cols)
 
     # 4b) mask non-spot bright structures so ROI centring cannot chase them
     spot_radius = spot_diam_ds / 2.0 * ds
@@ -779,7 +705,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
     # Only spots with real signal AND an unresolvable edge are flagged.
     radii = measure_spot_outlines(img8, centers, measure_radius, plate_c, plate_r)
     net = np.array([[_spot_net(img8, centers[i, j], measure_radius)
-                     for j in range(N_COLS)] for i in range(N_ROWS)])
+                     for j in range(n_cols)] for i in range(n_rows)])
     ref = float(np.nanmax(net)) if np.isfinite(net).any() else 0.0
     strong = np.isfinite(radii) & (net > OUTLINE_STRONG * ref) if ref > 0         else np.zeros(radii.shape, bool)
     good_r = radii[strong]
@@ -790,7 +716,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
         bad = ~np.isfinite(radii) | (np.abs(radii - med_r) > OUTLINE_TOL * med_r)
         unverified = bad & has_signal
         if debug and unverified.any():
-            spots = [(i + 1, j + 1) for i in range(N_ROWS) for j in range(N_COLS)
+            spots = [(i + 1, j + 1) for i in range(n_rows) for j in range(n_cols)
                      if unverified[i, j]]
             print(f"    outline check: median radius {med_r:.0f}px; "
                   f"unverifiable placement at {spots}")
@@ -801,7 +727,7 @@ def detect_grid(img8: np.ndarray, debug: bool = False,
     art_flag = art_flag | unverified | undersized
     if debug and art_flag.any():
         print(f"    artifact-adjacent ROIs: "
-              f"{[(i+1, j+1) for i in range(N_ROWS) for j in range(N_COLS) if art_flag[i, j]]}")
+              f"{[(i+1, j+1) for i in range(n_rows) for j in range(n_cols) if art_flag[i, j]]}")
     # 4e) re-measure the spot diameter at FULL resolution now that the centres
     # are known. Only `largest_diameter` -- which sizes the sliding paraboloid --
     # is taken from this. spot_radius/measure_radius keep the detection-pass
@@ -845,7 +771,7 @@ DIAM_STRENGTH_PCT = 60.0
 
 
 def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
-                         C: np.ndarray) -> np.ndarray:
+                         C: np.ndarray, grid_like: bool = False) -> np.ndarray:
     """Distance from every pixel of a patch to the nearest of the 48 centres.
 
     The same field is needed by every full-resolution pass -- centring, the
@@ -864,6 +790,16 @@ def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
     In practice it leaves 1-9 of the 48. Verified against the cKDTree result,
     bit-for-bit, for all 48 spots at each patch size the callers use.
 
+    `grid_like` promises that `ys` and `xs` came from `np.mgrid` -- ys constant
+    along each row, xs constant down each column. That lets the squares be
+    formed on the two 1-D axes and broadcast, so no (H, W, n) array is built at
+    all: one H*W pass per surviving centre instead of one H*W*n pass through
+    temporaries several times the size of the patch. Measured 6-13x faster
+    across the patch sizes the callers use, bit-for-bit identical to the general
+    path. It is a parameter rather than something sniffed from the arrays
+    because a wrong guess would silently corrupt every measurement; a caller
+    that does not pass it just gets the general path.
+
     Chunked over rows so the (H, W, n) intermediate never lands in memory whole.
     """
     C = np.asarray(C, dtype=float)
@@ -876,6 +812,15 @@ def _nearest_center_dist(ys: np.ndarray, xs: np.ndarray,
                                      xs[-1, -1] - xs[0, 0]))
     d = np.hypot(C[:, 0] - pcy, C[:, 1] - pcx)
     C = C[d <= d.min() + 2.0 * half_diag]
+
+    if grid_like and C.shape[0] and ys.ndim == 2:
+        yv = ys[:, 0]
+        xv = xs[0, :]
+        best = None
+        for cy, cx in C:
+            d2 = ((yv - cy) ** 2)[:, None] + ((xv - cx) ** 2)[None, :]
+            best = d2 if best is None else np.minimum(best, d2, out=best)
+        return np.sqrt(best, out=best)
 
     out = np.empty(ys.shape, dtype=float)
     rows = max(1, int(4_000_000 // max(ys.shape[1] * C.shape[0], 1)))
@@ -967,7 +912,7 @@ def measure_spot_diameter(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         patch = img8[y0:y1, x0:x1].astype(float)
-        dmin = _nearest_center_dist(ys, xs, C)
+        dmin = _nearest_center_dist(ys, xs, C, grid_like=True)
         clear = dmin > 0.42 * pitch
         if clear.sum() < 500:
             continue
@@ -1113,7 +1058,7 @@ def refine_centers_fullres(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y1, x0:x1]
         P = img8[y0:y1, x0:x1].astype(np.float32)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         # Agar only -- for the baseline fit AND for the correlation.
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
@@ -1259,7 +1204,7 @@ def measure_spot_footprint(img8: np.ndarray, centers: np.ndarray,
         ys, xs = np.mgrid[y0:y1, x0:x1]
         rr = np.hypot(ys - cy, xs - cx)
         P = img8[y0:y1, x0:x1].astype(float)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         own = dmin >= rr - 1e-6
         sd = np.sqrt(np.maximum(uniform_filter(P * P, 7) - uniform_filter(P, 7) ** 2, 0))
         t = _radial_bin_mean(rr, sd, own, bins, step)
@@ -1350,7 +1295,7 @@ def measure_spot_outlines(img8: np.ndarray, centers: np.ndarray,
             continue
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
         Q = img8[y0:y0 + 2 * W, x0:x0 + 2 * W].astype(float)
-        dmin = _nearest_center_dist(ys, xs, flat_c)
+        dmin = _nearest_center_dist(ys, xs, flat_c, grid_like=True)
         if plate_center is not None and plate_radius:
             valid = (np.hypot(ys - plate_center[0], xs - plate_center[1])
                      <= FULLRES_AGAR_FRAC * plate_radius)
@@ -1471,7 +1416,7 @@ def roi_radius_for_rows(spot_radii, spot_exists, quant_rows, base_radius,
     """
     if spot_radii is None or not quant_rows:
         return base_radius, 0, float("nan")
-    sel = [r - 1 for r in quant_rows if 1 <= r <= N_ROWS]
+    sel = [r - 1 for r in quant_rows if 1 <= r <= spot_radii.shape[0]]
     cand = spot_radii[sel] if sel else spot_radii
     have = spot_exists[sel] if sel else spot_exists
     resolved = np.isfinite(cand) & have
@@ -1542,7 +1487,8 @@ def measure_spot_radii(img8: np.ndarray, centers: np.ndarray,
             continue
         sd, y0, x0 = got
         ys, xs = np.mgrid[y0:y0 + 2 * W, x0:x0 + 2 * W]
-        m = _nearest_center_dist(ys, xs, flat_c)             > 0.40 * pitch
+        m = _nearest_center_dist(ys, xs, flat_c,
+                                 grid_like=True) > 0.40 * pitch
         if plate_center is not None and plate_radius:
             m &= np.hypot(ys - plate_center[0], xs - plate_center[1])                 <= FULLRES_AGAR_FRAC * plate_radius
         if m.sum():
@@ -1871,12 +1817,30 @@ def _refine_centers(th_in: np.ndarray, lattice: np.ndarray,
 
 def _fit_1d(coords: np.ndarray, s: float) -> tuple[float, float, np.ndarray]:
     """Fit a regular 1-D lattice (offset o, spacing s) to `coords` by
-    alternating index assignment and least-squares."""
+    alternating index assignment and least-squares.
+
+    The seed `s` only has to be close enough that each coordinate rounds to its
+    own lattice index. When it is far too large every coordinate rounds to index
+    0, the design matrix loses rank, and the least-squares step returns a
+    spacing of zero -- after which the next `(coords - o) / s` divides by zero
+    and numpy raises. That cannot happen for a plate whose spots really are at
+    the expected pitch, but it is reachable from a mis-declared grid size, so
+    the iteration stops on a degenerate step and keeps the last good spacing
+    rather than failing. A caller with a hopeless seed then gets the fallback
+    grid, which is visibly wrong, instead of a traceback.
+    """
     o = float(np.min(coords))
     for _ in range(12):
+        if not np.isfinite(s) or s <= 0:
+            break
         idx = np.round((coords - o) / s)
+        if np.unique(idx).size < 2:
+            break                       # every point on one node: nothing to fit
         A = np.column_stack([np.ones_like(idx), idx])
-        (o, s), *_ = np.linalg.lstsq(A, coords, rcond=None)
+        (o2, s2), *_ = np.linalg.lstsq(A, coords, rcond=None)
+        if not (np.isfinite(o2) and np.isfinite(s2)) or s2 <= 0:
+            break
+        o, s = float(o2), float(s2)
     return o, s, np.round((coords - o) / s).astype(int)
 
 
@@ -1983,8 +1947,9 @@ def _rot(pts: np.ndarray, cx: float, cy: float, deg: float) -> np.ndarray:
                             s * d[:, 0] + c * d[:, 1]]) + np.array([cx, cy])
 
 
-def _fit_lattice(cen: np.ndarray, cx: float, cy: float, r_eq: float):
-    """Return (spacing, centers[N_ROWS, N_COLS, (y, x)], tilt_deg) in downscaled
+def _fit_lattice(cen: np.ndarray, cx: float, cy: float, r_eq: float,
+                 n_rows: int = N_ROWS, n_cols: int = N_COLS):
+    """Return (spacing, centers[n_rows, n_cols, (y, x)], tilt_deg) in downscaled
     coords. Falls back to a plate-centred grid at the expected spacing if too
     few spots are detected to fit reliably.
 
@@ -1995,20 +1960,20 @@ def _fit_lattice(cen: np.ndarray, cx: float, cy: float, r_eq: float):
     tilt is estimated first, the lattice is fitted in the straightened frame,
     and the resulting nodes are rotated back.
     """
-    s0 = SPACING_FRAC * r_eq
+    s0 = expected_pitch(r_eq, n_rows, n_cols)
 
     def grid_from(rows_y, cols_x, theta):
         pts = np.array([[x, y] for y in rows_y for x in cols_x], float)
         if theta:
             pts = _rot(pts, cx, cy, theta)
-        out = np.zeros((N_ROWS, N_COLS, 2))
+        out = np.zeros((n_rows, n_cols, 2))
         for k, (x, y) in enumerate(pts):
-            out[k // N_COLS, k % N_COLS] = (y, x)
+            out[k // n_cols, k % n_cols] = (y, x)
         return out
 
     if len(cen) < 4:
-        rows_y = cy - (N_ROWS - 1) / 2 * s0 + np.arange(N_ROWS) * s0
-        cols_x = cx - (N_COLS - 1) / 2 * s0 + np.arange(N_COLS) * s0
+        rows_y = cy - (n_rows - 1) / 2 * s0 + np.arange(n_rows) * s0
+        cols_x = cx - (n_cols - 1) / 2 * s0 + np.arange(n_cols) * s0
         return s0, grid_from(rows_y, cols_x, 0.0), 0.0
 
     theta = _lattice_angle(cen, s0)
@@ -2018,10 +1983,10 @@ def _fit_lattice(cen: np.ndarray, cx: float, cy: float, r_eq: float):
 
     ox, sx, cix = _fit_1d(cen_r[:, 0], s0)
     oy, sy, ciy = _fit_1d(cen_r[:, 1], s0)
-    base_j = _best_base(cix, N_COLS, ox, sx, cx)
-    base_i = _best_base(ciy, N_ROWS, oy, sy, cy)
-    cols_x = ox + (base_j + np.arange(N_COLS)) * sx
-    rows_y = oy + (base_i + np.arange(N_ROWS)) * sy
+    base_j = _best_base(cix, n_cols, ox, sx, cx)
+    base_i = _best_base(ciy, n_rows, oy, sy, cy)
+    cols_x = ox + (base_j + np.arange(n_cols)) * sx
+    rows_y = oy + (base_i + np.arange(n_rows)) * sy
     return (sx + sy) / 2, grid_from(rows_y, cols_x, theta), theta
 
 
@@ -2036,7 +2001,7 @@ def rim_flags(grid: Grid) -> np.ndarray:
     artefact rather than mistaken for growth.
     """
     if grid.artifact_flag is None:      # hand ROIs: nothing was measured off
-        return np.zeros((N_ROWS, N_COLS), dtype=bool)   # the image to test
+        return np.zeros(grid.shape, dtype=bool)         # the image to test
     return grid.artifact_flag.copy()
 
 
@@ -2049,10 +2014,17 @@ def background_gap_centers(grid: Grid) -> list[tuple[float, float]]:
         y = (c[i1, j1, 0] + c[i2, j2, 0]) / 2
         x = (c[i1, j1, 1] + c[i2, j2, 1]) / 2
         return (y, x)
-    R, C = N_ROWS - 1, N_COLS - 1
+    n_rows, n_cols = grid.shape
+    if n_rows < 2 or n_cols < 2:
+        # Every sample is a midpoint BETWEEN two diagonally adjacent spots, so
+        # a single row or column has no gap to read. Better to return nothing
+        # and let the caller see a background of zero than to invent a position
+        # that may land on a spot.
+        return []
+    R, C = n_rows - 1, n_cols - 1
     return [mid(0, 0, 1, 1), mid(0, C - 1, 1, C), mid(R - 1, 0, R, 1),
             mid(R - 1, C - 1, R, C),
-            mid(N_ROWS // 2 - 1, N_COLS // 2 - 1, N_ROWS // 2, N_COLS // 2)]
+            mid(n_rows // 2 - 1, n_cols // 2 - 1, n_rows // 2, n_cols // 2)]
 
 
 # ---------------------------------------------------------------------------
@@ -2072,7 +2044,7 @@ class MeasureOptions:
     rois: Path | None = None              # measure at these ROIs, skip detection
     measure_diameter: float | None = None  # force ROI diameter (px)
     ball_radius: float | None = None      # force rolling-ball radius (px)
-    bg_mode: str = "fiji"                 # fiji | paraboloid | rollingball | none
+    bg_mode: str = "python"               # python | rollingball | none
     bg_iters: int = BG_ITERS
     shrink: int | None = None             # None = ImageJ's 1/2/4/8 schedule
     rgb_mode: str = DEFAULT_RGB_MODE
@@ -2080,6 +2052,17 @@ class MeasureOptions:
                                           # 1-based, in full-resolution pixels
     quant_rows: tuple | None = None       # 1-based dilution rows being scored; the
                                           # ROI is shrunk to fit inside their spots
+    # The spot lattice to look for. None means the module default (8 x 6), so
+    # every existing caller is unchanged. These change the measured numbers, so
+    # `spotting_batch._cache_key` includes them: a plate read as 8x6 must never
+    # be served for a 12x8 request.
+    n_rows: int | None = None
+    n_cols: int | None = None
+
+    @property
+    def grid_shape(self) -> tuple[int, int]:
+        return (N_ROWS if self.n_rows is None else int(self.n_rows),
+                N_COLS if self.n_cols is None else int(self.n_cols))
 
     def resolve_ball_radius(self, largest_diameter: float) -> float:
         """--ball-radius wins; otherwise derive from the detected spot size.
@@ -2269,10 +2252,11 @@ def measure_plate(img: np.ndarray, grid: Grid,
     bg_samples = [m for m, _ in bg_reads]
     bg_mean = float(np.mean(bg_samples)) if bg_samples else 0.0
 
-    raw = np.zeros((N_ROWS, N_COLS))
-    n_px = np.zeros((N_ROWS, N_COLS), dtype=int)
-    for i in range(N_ROWS):
-        for j in range(N_COLS):
+    n_rows, n_cols = grid.shape
+    raw = np.zeros((n_rows, n_cols))
+    n_px = np.zeros((n_rows, n_cols), dtype=int)
+    for i in range(n_rows):
+        for j in range(n_cols):
             cy, cx = grid.centers[i, j]
             raw[i, j], n_px[i, j] = read(cy, cx)
 
@@ -2887,47 +2871,76 @@ def _pick_image(imgs: list[Path], treatment: str, plate: str) -> Path:
 # Driver
 # ---------------------------------------------------------------------------
 
-def analyze_image_multi(path: Path, opts: MeasureOptions, row_sets: list,
-                        label: str = "", debug: bool = False) -> dict:
-    """Measure ONE plate for SEVERAL dilution-row choices in one pass.
+def detect_for_measure(path: Path, opts: MeasureOptions,
+                       debug: bool = False) -> dict:
+    """Detect plate geometry and resolve the background radius before subtraction.
 
-    Detection (41s, dominated by the iterated full-resolution centring) and the
-    FIJI background subtraction (10s) do not depend on which rows are scored --
-    only the ROI radius does, and re-deriving that is under a second. So all
-    three dilution choices can be produced for about +8s over a single one,
-    instead of ~52s each. That is what lets the dilution be chosen at review
-    time without waiting for a re-measure.
-
-    Returns {row_set: (grid_copy, measurement)} plus a shared "_shared" entry
-    holding (bg_centers, n_iter, spread, ball_radius).
+    Returns the grayscale image and detection state so measurement workers can
+    reuse them for all dilution choices without re-reading the photograph.
     """
-    import copy
+    from skimage.transform import resize
 
     img8 = load_gray8(path, rgb_mode=opts.rgb_mode)
     if opts.rois is not None:
         grid, bg_centers = load_roi_csv(opts.rois)
     else:
-        grid = detect_grid(img8, debug=debug, nudge=opts.nudge, quant_rows=None)
+        rows, cols = opts.grid_shape
+        grid = detect_grid(img8, debug=debug, nudge=opts.nudge, quant_rows=None,
+                           n_rows=rows, n_cols=cols)
         bg_centers = background_gap_centers(grid)
-
-    ball_radius = opts.resolve_ball_radius(grid.largest_diameter)
-    if opts.bg_mode == "none":
-        proc, n_iter, spread = img8.astype(np.float64), 0, 0.0
-    else:
-        proc, n_iter, spread = subtract_background(
-            img8, ball_radius=ball_radius, bg_centers=bg_centers,
-            bg_radius=grid.base_radius or grid.measure_radius,
-            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
-            fiji_path=path, debug=debug)
 
     small, ds = None, 1
     if opts.rois is None:
-        from skimage.transform import resize
         ds = max(1, round(max(img8.shape) / DETECT_LONG_SIDE))
         small = (resize(img8.astype(float),
                         (img8.shape[0] // ds, img8.shape[1] // ds),
                         order=1, preserve_range=True) if ds > 1
                  else img8.astype(float))
+
+    return {"img8": img8, "grid": grid, "bg_centers": bg_centers,
+            "small": small, "ds": ds,
+            "ball_radius": opts.resolve_ball_radius(grid.largest_diameter)}
+
+
+def analyze_image_multi(path: Path, opts: MeasureOptions, row_sets: list,
+                        label: str = "", debug: bool = False,
+                        proc: "np.ndarray | None" = None,
+                        detection: "dict | None" = None) -> dict:
+    """Measure one plate for several dilution choices using one subtraction.
+
+    Detection and background subtraction are shared; each choice retains its
+    own ROI radius and artifact flags. Optional proc/detection inputs allow
+    batch workers and reference comparisons to supply these shared results.
+    """
+    import copy
+
+    if detection is None:
+        detection = detect_for_measure(path, opts, debug=debug)
+    grid = detection["grid"]
+    bg_centers = detection["bg_centers"]
+    ball_radius = detection["ball_radius"]
+    small, ds = detection["small"], detection["ds"]
+
+    if proc is not None:
+        # Subtraction supplied by the caller: the same array this function
+        # would have produced, obtained from a Python batch. `spread` is a
+        # property of that image, so it is recomputed here rather than passed
+        # in -- max minus min of the agar disc means, exactly as
+        # subtract_background does.
+        n_iter = opts.bg_iters
+        samples = [_disk_mean(proc, cy, cx,
+                              grid.base_radius or grid.measure_radius)
+                   for cy, cx in bg_centers]
+        spread = (max(samples) - min(samples)) if samples else 0.0
+    elif opts.bg_mode == "none":
+        proc, n_iter, spread = detection["img8"].astype(np.float64), 0, 0.0
+    else:
+        proc, n_iter, spread = subtract_background(
+            detection["img8"], ball_radius=ball_radius,
+            bg_centers=bg_centers,
+            bg_radius=grid.base_radius or grid.measure_radius,
+            iters=opts.bg_iters, shrink=opts.shrink, mode=opts.bg_mode,
+            debug=debug)
 
     out = {"_shared": (bg_centers, n_iter, spread, ball_radius)}
     for rows in row_sets:
@@ -2965,8 +2978,10 @@ def analyze_image(path: Path, opts: MeasureOptions, label: str = "",
     if opts.rois is not None:
         grid, bg_centers = load_roi_csv(opts.rois)
     else:
+        rows, cols = opts.grid_shape
         grid = detect_grid(img8, debug=debug, nudge=opts.nudge,
-                           quant_rows=opts.quant_rows)
+                           quant_rows=opts.quant_rows,
+                           n_rows=rows, n_cols=cols)
         bg_centers = background_gap_centers(grid)
 
     if opts.measure_diameter is not None:
@@ -2980,7 +2995,7 @@ def analyze_image(path: Path, opts: MeasureOptions, label: str = "",
         proc, n_iter, spread = subtract_background(
             img8, ball_radius=ball_radius, bg_centers=bg_centers,
             bg_radius=grid.measure_radius, iters=opts.bg_iters,
-            shrink=opts.shrink, mode=opts.bg_mode, fiji_path=path, debug=debug)
+            shrink=opts.shrink, mode=opts.bg_mode, debug=debug)
 
     meas = measure_plate(proc, grid, bg_centers)
     return proc, grid, bg_centers, meas, n_iter, spread, ball_radius
@@ -3153,7 +3168,7 @@ def _paired_ttests(sub: pd.DataFrame, control_col: int,
     into every comparison -- on Set 2 K-OAc it made a strain with no growth at
     all and near-zero scatter come out "not significant".
 
-    Mirrors src/plot_spotting.R so the table and the figure cannot disagree.
+    Kept compatible with src/spotting_plots.py so tables and figures agree.
     """
     from scipy import stats as st
 
@@ -3236,17 +3251,12 @@ def main(argv=None):
                    help="Rolling-ball radius (px), verbatim as typed into ImageJ's "
                         "Subtract Background dialog. Overrides the derived value.")
     g.add_argument("--bg-mode",
-                   choices=("fiji", "paraboloid", "rollingball", "none"),
-                   default="fiji",
-                   help="'fiji' drives FIJI's own Subtract Background (sliding "
-                        "paraboloid) headlessly and is the default, falling back "
-                        "to the local implementation if FIJI is not installed. "
-                        "'paraboloid' is the protocol's own choice (step 15, "
-                        "'sliding paraboloid') and the default. 'rollingball' is "
-                        "ImageJ's ball with its shrink schedule, kept for "
-                        "comparison. 'none' skips background subtraction entirely, "
-                        "so raw gray values can be compared with no background "
-                        "code in the path.")
+                   choices=("python", "paraboloid", "fiji", "rollingball", "none"),
+                   default="python",
+                   help="Python ImageJ-compatible sliding paraboloid (default). "
+                        "'paraboloid' and 'fiji' are compatibility aliases that "
+                        "also run in Python. 'rollingball' retains the alternative "
+                        "ball algorithm; 'none' skips subtraction.")
     g.add_argument("--bg-iters", type=int, default=BG_ITERS,
                    help=f"Rolling-ball passes (default {BG_ITERS}). See "
                         f"subtract_background on why more than one is wrong.")

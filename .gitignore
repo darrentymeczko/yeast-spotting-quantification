@@ -16,11 +16,24 @@ Old/
 spotting_config.json
 timecourse_config.json
 
+# Experiment files. They name real strains and record an ABSOLUTE path to the
+# photo folder on the machine that made them, which is exactly what commit
+# 6931a62 ("Remove hardcoded local paths from tracked files") set out to keep
+# out of the repository. Plate templates stay tracked: those are strain-free
+# geometry and are meant to be shared.
+Experiment Designs/
+
 # Everything a run produces
 Results/
 timecourse_candidates.csv
 *.pptx
 *.xlsx
+
+# The packaged program is ~150 MB and reproducible with build_exe.py. Publish
+# it as a release download, not a commit. spotting_error.log is what a crashed
+# window leaves behind.
+*.exe
+spotting_error.log
 
 # ---------------------------------------------------------------------------
 # Python
@@ -53,3 +66,21 @@ desktop.ini
 # Local tooling config: machine-specific paths, of no use to anyone else.
 # ---------------------------------------------------------------------------
 .claude/
+
+# Where the review window found each set's photographs on THIS machine. The
+# reviews themselves live in Results/ (already ignored) and record their own
+# capture folder, so nothing is lost by leaving this out.
+.results_review_links.json
+review_error.log
+
+# The workbench's own memory: recent files, window size, what was open. Per
+# person, per machine -- and workbench_error.log is what a failed callback
+# leaves behind.
+.workbench.json
+.workbench.json.tmp
+.workbench/
+workbench_error.log
+
+# Scratch output from test and verification runs: rendered previews, temp
+# experiments and logs. Reproducible, and not source.
+validation/

@@ -28,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
 # everything a run writes live beside it, not inside it.
-PROJECT_ROOT = HERE.parent
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_batch as sb        # noqa: E402  (for the shared results root)
 
 # The supplied deck: 13.33 x 7.50 in, montage at x=0.00 w=6.47, graph at
@@ -89,7 +89,7 @@ def find_pairs(results: Path) -> list:
     for p in sorted(fig_dir.glob("spotting_Set_*.png")):
         m = re.match(r"spotting_Set_([^_]+)_(.+)\.png$", p.name)
         if m:
-            # R's safe() turns every run of non-alphanumerics into "_", so
+            # The plotter's safe-name rule turns non-alphanumerics into "_", so
             # "K-OAc" survives but a treatment with a space would not.
             graphs[(m.group(1), m.group(2))] = p
 
@@ -106,7 +106,14 @@ def find_pairs(results: Path) -> list:
     return pairs
 
 
-def build(pairs: list, out_path: Path) -> Path:
+def build(pairs: list, out_path: Path, note=None) -> Path:
+    """Assemble one slide per (montage, graph) pair.
+
+    `note` optionally overrides the speaker-note text: a callable taking the
+    two key fields. The time-course pipeline uses it because its slides are
+    keyed on a capture-tree label rather than a set number, and the default
+    "Set <id> <treatment>" wording does not fit them.
+    """
     from pptx import Presentation
     from pptx.util import Inches
     from PIL import Image
@@ -127,7 +134,42 @@ def build(pairs: list, out_path: Path) -> Path:
                                      Inches(w), Inches(h))
         # Not shown on the slide -- the example carries no text -- but it makes
         # the deck navigable and searchable.
-        slide.notes_slide.notes_text_frame.text = f"Set {set_id} {treatment}"
+        slide.notes_slide.notes_text_frame.text = (
+            note(set_id, treatment) if note else f"Set {set_id} {treatment}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pres.save(str(out_path))
+    return out_path
+
+
+def build_slides(slides: list, out_path: Path) -> Path:
+    """One slide per `(pictures, note)`, in the same widescreen deck.
+
+    Two pictures are the montage and the graph, placed as `build` places them.
+    One picture is already laid out whole -- the review's view of a sheet, its
+    montage and graph arranged together -- and is run as large as the slide
+    allows, centred.
+    """
+    from pptx import Presentation
+    from pptx.util import Inches
+    from PIL import Image
+
+    pres = Presentation()
+    pres.slide_width = Inches(SLIDE_W_IN)
+    pres.slide_height = Inches(SLIDE_H_IN)
+    blank = pres.slide_layouts[6]        # "Blank" -- no placeholders
+
+    for pictures, note in slides:
+        slide = pres.slides.add_slide(blank)
+        boxes = (((0.0, SLIDE_W_IN),) if len(pictures) == 1
+                 else ((0.0, LEFT_W_IN), (RIGHT_X_IN, RIGHT_W_IN)))
+        for path, (box_x, box_w) in zip(pictures, boxes):
+            with Image.open(path) as im:
+                iw, ih = im.size
+            x, y, w, h = _fit(iw, ih, box_x, box_w)
+            slide.shapes.add_picture(str(path), Inches(x), Inches(y),
+                                     Inches(w), Inches(h))
+        slide.notes_slide.notes_text_frame.text = note
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pres.save(str(out_path))
@@ -175,7 +217,7 @@ def main(argv=None) -> int:
     if not pairs:
         print("Nothing to build: no combination has both a montage and a graph.\n"
               "  Draw the montages (say yes at the prompt, or run "
-              "spotting_montage.py) and make sure the R figures were written.",
+              "spotting_montage.py) and make sure the PyPrism figures were written.",
               file=sys.stderr)
         return 1
 

@@ -47,8 +47,9 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 # The repository root: source lives in src/, but the photo folder and
-# everything a run writes live beside it, not inside it.
-PROJECT_ROOT = HERE.parent
+# everything a run writes live beside it, not inside it. (Beside the .exe when
+# packaged -- see spotting_paths.)
+from spotting_paths import PROJECT_ROOT   # noqa: E402
 # Results live beside the code, not inside the photo folder. Two reasons: the
 # photos sit on OneDrive and everything written next to them gets synced back
 # up, and a Results folder buried in the image tree is easy to miss and easy to
@@ -66,8 +67,261 @@ NAME_RE = re.compile(r"^\s*(\d+)\s*\.\s*(\d+)\s*(.+?)\s*$")
 
 # The lab spots three dilutions per replicate, twice down the plate:
 #   rows 1,4 = least dilute   rows 2,5 = middle   rows 3,6 = most dilute
+#
+# This table is the CLASSIC layout and is still what the interactive console
+# pipeline (`main` below) uses. Everything that can be driven by a plate
+# template instead takes a `DilutionLayout`, which describes any number of
+# levels; `classic_layout()` reproduces this table exactly.
 DILUTIONS = {"least": (0, 3), "middle": (1, 4), "most": (2, 5)}
 DILUTION_ORDER = ["least", "middle", "most"]
+
+
+# ---------------------------------------------------------------------------
+# Dilution layouts -- which spots belong to which dilution level
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LevelCell:
+    """One spot of one dilution level on one plate."""
+    row: int          # 0-based grid row
+    col: int          # 0-based grid column
+    slot: int         # 1-based sample slot -- the strain's position in the panel
+    replicate: int    # 1-based biological replicate, numbered across plates
+
+
+@dataclass(frozen=True)
+class DilutionLevel:
+    """Every spot scored when this dilution level is chosen, plate by plate.
+
+    Frozen and built from tuples so it is hashable (it keys memoised reads)
+    and picklable (it crosses into measurement worker processes).
+    """
+    index: int
+    name: str
+    plates: tuple = ()        # ((plate_no, (LevelCell, ...)), ...)
+
+    def cells(self, plate: int) -> tuple:
+        for no, cells in self.plates:
+            if int(no) == int(plate):
+                return cells
+        raise KeyError(f"dilution level {self.name!r} has no spots on plate {plate}")
+
+    def rows(self, plate: int) -> tuple:
+        """0-based grid rows this level occupies on one plate."""
+        return tuple(sorted({c.row for c in self.cells(plate)}))
+
+    def quant_rows(self, plate: int) -> tuple:
+        """1-based rows, the form `MeasureOptions.quant_rows` takes."""
+        return tuple(r + 1 for r in self.rows(plate))
+
+
+@dataclass(frozen=True)
+class DilutionLayout:
+    """The dilution levels of a design, in order from least to most dilute.
+
+    The arithmetic in DILUTIONS -- three levels, spotted twice down six rows --
+    is one valid layout. A plate template can declare six levels spotted once,
+    two spotted three times, or a grid of another size altogether; this carries
+    whichever it is, so scoring, tidy output, montages and comparison sheets
+    all read the design rather than assume one.
+    """
+    levels: tuple = ()
+    n_rows: int = sq.N_ROWS
+    n_cols: int = sq.N_COLS
+
+    @property
+    def names(self) -> list:
+        return [lv.name for lv in self.levels]
+
+    def by_name(self, name: str) -> DilutionLevel:
+        want = str(name).strip().lower()
+        for lv in self.levels:
+            if lv.name.strip().lower() == want:
+                return lv
+        raise KeyError(f"no dilution level named {name!r}; this design has "
+                       f"{', '.join(self.names) or 'none'}")
+
+    def by_rows(self, rows, plate: int = 1) -> DilutionLevel:
+        """The level occupying these 0-based rows on a plate (legacy row tuples)."""
+        want = tuple(sorted(int(r) for r in rows))
+        for lv in self.levels:
+            try:
+                if lv.rows(plate) == want:
+                    return lv
+            except KeyError:
+                continue
+        raise KeyError(f"rows {tuple(rows)} are not a dilution level of this design")
+
+    def plates(self) -> list:
+        return sorted({int(no) for lv in self.levels for no, _ in lv.plates})
+
+    def populated_levels(self) -> list:
+        """The levels that place at least one spot.
+
+        A template can declare more levels than it spots -- a 96-well design
+        spotted at a single dilution still says "levels: 3" -- and a level with
+        no cells is not a choice anyone made, so figures that ask "was there a
+        dilution choice to show?" count these, not `levels`.
+        """
+        return [lv for lv in self.levels if any(cells for _, cells in lv.plates)]
+
+    def slot_at(self, plate: int) -> dict:
+        """{(row, col): sample slot} for every spot any level places on a plate."""
+        return {rc: c.slot for rc, c in self.cell_at(plate).items()}
+
+    def cell_at(self, plate: int) -> dict:
+        """{(row, col): LevelCell} for every spot any level places on a plate."""
+        out = {}
+        for lv in self.levels:
+            try:
+                cells = lv.cells(plate)
+            except KeyError:
+                continue
+            for c in cells:
+                out.setdefault((c.row, c.col), c)
+        return out
+
+    def row_sets(self, plate: int) -> list:
+        """Every level's 1-based rows on one plate, in level order, de-duplicated.
+
+        Passed to `measure` so all of a photo's dilution choices are measured
+        and cached in the one pass -- detection is the expensive part and does
+        not depend on the rows.
+        """
+        out = []
+        for lv in self.levels:
+            try:
+                rs = lv.quant_rows(plate)
+            except KeyError:
+                continue
+            if rs and rs not in out:
+                out.append(rs)
+        return out
+
+    def block_rows(self) -> "int | None":
+        """Rows per replicate block, when every plate is regular blocks.
+
+        The montage draws a plate as stacked replicate blocks. That is only
+        meaningful when the rows divide into equal consecutive blocks that each
+        hold every level exactly once -- true of the lab design (blocks of 3)
+        and of any design drawn the same way. Returns None otherwise, and the
+        montage then draws each plate as a single block.
+        """
+        k = len(self.levels)
+        if k == 0 or self.n_rows % k:
+            return None
+        for plate in self.plates():
+            for lv in self.levels:
+                try:
+                    rows = lv.rows(plate)
+                except KeyError:
+                    return None
+                blocks = [r // k for r in rows]
+                if len(set(blocks)) != len(rows) or any(r % k != lv.index for r in rows):
+                    return None
+        return k
+
+    def is_classic(self) -> bool:
+        return self == classic_layout()
+
+    # -- serialisation: rides in timecourse config and experiment.json --------
+
+    def to_dict(self) -> dict:
+        return {
+            "n_rows": self.n_rows, "n_cols": self.n_cols,
+            "levels": [
+                {"name": lv.name,
+                 "plates": {str(no): [[c.row, c.col, c.slot, c.replicate]
+                                      for c in cells]
+                            for no, cells in lv.plates}}
+                for lv in self.levels
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DilutionLayout":
+        levels = []
+        for i, raw in enumerate(d.get("levels") or []):
+            plates = tuple(
+                (int(no), tuple(LevelCell(int(r), int(c), int(s), int(rep))
+                                for r, c, s, rep in cells))
+                for no, cells in sorted((raw.get("plates") or {}).items(),
+                                        key=lambda kv: int(kv[0])))
+            levels.append(DilutionLevel(i, str(raw.get("name") or f"level {i + 1}"),
+                                        plates))
+        return cls(tuple(levels), int(d.get("n_rows", sq.N_ROWS)),
+                   int(d.get("n_cols", sq.N_COLS)))
+
+
+def classic_layout(plates=(1, 2)) -> DilutionLayout:
+    """DILUTIONS as a layout: exactly the arithmetic the pipeline always used.
+
+    Level d on plate p occupies rows d and d + 3; the replicate is
+    (p - 1) * 2 + 1 + row // 3; the sample slot is the column.
+    """
+    levels = []
+    for d, name in enumerate(DILUTION_ORDER):
+        per_plate = []
+        for p in plates:
+            cells = tuple(LevelCell(r, c, c + 1, (int(p) - 1) * 2 + 1 + r // 3)
+                          for r in DILUTIONS[name] for c in range(sq.N_COLS))
+            per_plate.append((int(p), cells))
+        levels.append(DilutionLevel(d, name, tuple(per_plate)))
+    return DilutionLayout(tuple(levels), sq.N_ROWS, sq.N_COLS)
+
+
+def build_tidy_level(plates, strains, control_col: int, level: DilutionLevel,
+                     exclude=None, *, experiment: str, treatment: str,
+                     set_label: str) -> pd.DataFrame:
+    """One tidy frame for one condition at one dilution level, from a layout.
+
+    The layout-driven twin of `build_tidy`: which spots are read, and which
+    replicate and strain each belongs to, come from `level` rather than from
+    `DILUTIONS` arithmetic. For the classic layout the two produce identical
+    frames (tests/test_dilution_layout.py asserts it).
+
+    `plates` is [PlateData]; each is matched to its level cells by
+    `ref.plate`. `strains[slot - 1]` names a sample slot.
+    """
+    drop = set(exclude or ())
+    rows = []
+    for pd_ in plates:
+        for cell in level.cells(pd_.ref.plate):
+            name = strains[cell.slot - 1] if cell.slot - 1 < len(strains) else None
+            if not name:
+                continue          # slot holds no strain
+            rows.append({
+                "experiment": experiment, "treatment": treatment,
+                "set": set_label, "plate": pd_.ref.plate,
+                "image": pd_.ref.path.name,
+                "replicate": f"rep{cell.replicate}",
+                "dilution_row": cell.row + 1,
+                "dilution": level.name,
+                "strain_col": cell.slot, "strain": name,
+                "raw_growth": float(pd_.net[cell.row, cell.col]),
+                "artifact": bool(pd_.rim[cell.row, cell.col]),
+                "excluded": cell.slot in drop,
+                "is_control": cell.slot == control_col,
+            })
+    full = pd.DataFrame(rows)
+    if full.empty:
+        return full
+
+    keep = full[~full["excluded"]].copy()
+    if control_col in drop or keep.empty:
+        print(f"    ! {experiment}: the control was excluded; "
+              f"skipping normalization for this condition.")
+        return full
+
+    # Same noise-aware floor as `build_tidy`; see the comment there.
+    noise = max([sq.bg_noise(p.bg_samples) for p in plates] or [0.0])
+    min_control = max(sq.MIN_CONTROL_GRAY, sq.CONTROL_NOISE_MULT * noise)
+    keep = sq.add_relative_growth(keep, control_col=control_col,
+                                  group_keys=["experiment"],
+                                  min_control=min_control)
+    key = ["experiment", "replicate", "strain_col"]
+    added = [c for c in keep.columns if c not in full.columns]
+    return full.merge(keep[key + added], on=key, how="left")
 
 CONFIG_NAME = "spotting_config.json"
 CACHE_DIR = ".spotting_cache"
@@ -486,9 +740,17 @@ def _cache_key(path: Path, opts: sq.MeasureOptions) -> str:
     #   v8: background subtraction now runs through FIJI itself by default, and
     #       it flattens better than the local paraboloid (spread 0.08 vs 0.32),
     #       so every cached measurement differs.
+    # v23: Python ImageJ-compatible subtraction replaces FIJI/fallback.
     nudges = sorted((k, tuple(v)) for k, v in (opts.nudge or {}).items())
+    # The spot lattice changes every measured number, so it has to be in the key
+    # -- otherwise a plate read as 8x6 would be served for a 12x8 request. It is
+    # appended ONLY when it differs from the default, so the signature of an
+    # ordinary plate is byte-identical to what it has always been and the
+    # existing cache (450 entries at ~70 s each to rebuild) stays valid.
+    rows, cols = opts.grid_shape
+    grid = "" if (rows, cols) == (sq.N_ROWS, sq.N_COLS) else f"|{rows}x{cols}"
     sig = (f"{path.name}|{st.st_size}|{int(st.st_mtime)}|{opts.bg_mode}|"
-           f"{opts.ball_radius}|{opts.bg_iters}|{opts.rgb_mode}|{nudges}|v22")
+           f"{opts.ball_radius}|{opts.bg_iters}|{opts.rgb_mode}|{nudges}|v23{grid}")
     return hashlib.sha1(sig.encode()).hexdigest()[:16]
 
 
@@ -544,7 +806,8 @@ ALL_ROW_SETS = [(lo + 1, hi + 1) for lo, hi in DILUTIONS.values()]
 
 def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
             debug: bool = False, precompute: bool = True,
-            read_path: "Path | None" = None) -> PlateData:
+            read_path: "Path | None" = None,
+            proc=None, detection=None, row_sets=None) -> PlateData:
     """Measure one plate, returning the result for `opts.quant_rows`.
 
     Every dilution choice is measured and cached in the same pass. Detection --
@@ -558,9 +821,20 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
     The cache entry is still keyed on ref.path, so the caller can copy a
     cloud-only stub to a local temp file and pass that here; re-runs will hit
     the cache without touching the photo at all.
+
+    row_sets: every 1-based row choice to measure in this pass, when the design
+    is not the classic one (`DilutionLayout.row_sets(plate)`). Defaults to the
+    three classic pairs.
+
+    An existing cache file is MERGED into, never replaced. Before, a request for
+    a row choice the file lacked rewrote it holding only the new pass, silently
+    dropping every choice cached earlier -- harmless while only three choices
+    existed and all were always computed together, but with layouts of any size
+    two designs over the same photo would evict each other's entries forever.
     """
     cf = cache_dir / f"{_cache_key(ref.path, opts)}.npz"
     want = tuple(opts.quant_rows or ())
+    previous: dict = {}
     if cf.exists():
         try:
             z = np.load(cf)
@@ -572,18 +846,35 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
                     z["centers"], float(z[f"{key}_radius"]),
                     z[f"{key}_bg_samples"], want,
                     tuple(z["plate_center"]), float(z["plate_radius"]))
+            # Readable but missing this choice: keep what it does hold.
+            previous = {k: z[k] for k in z.files
+                        if k not in ("centers", "plate_center", "plate_radius")}
         except Exception:
+            previous = {}
             try:
                 cf.unlink()                 # corrupt cache: just re-measure
             except OSError:
                 pass
 
-    row_sets = list(dict.fromkeys(ALL_ROW_SETS + ([want] if want else [])))
-    if not precompute:
+    if row_sets is not None:
+        # The design says what its row choices are: measure exactly those.
+        row_sets = list(dict.fromkeys([tuple(r) for r in row_sets]
+                                      + ([want] if want else []))) or [()]
+    elif not precompute:
         row_sets = [want] if want else [ALL_ROW_SETS[1]]
+    elif opts.grid_shape != (sq.N_ROWS, sq.N_COLS):
+        # ALL_ROW_SETS is the lab's three dilution pairs on a six-row plate.
+        # On any other lattice those row numbers mean nothing, so precomputing
+        # them would cost time sizing ROIs for row choices nobody can ask for.
+        row_sets = [want] if want else [()]
+    else:
+        row_sets = list(dict.fromkeys(ALL_ROW_SETS + ([want] if want else [])))
 
+    # proc/detection let a caller supply the background subtraction and the
+    # detection it already has, so batch workers can share processed images.
     res = sq.analyze_image_multi(read_path or ref.path, opts, row_sets,
-                                 label=ref.label, debug=debug)
+                                 label=ref.label, debug=debug,
+                                 proc=proc, detection=detection)
     _, _, spread, _ = res["_shared"]
 
     # Only geometry and per-choice measurements are cached, at full resolution.
@@ -615,9 +906,12 @@ def measure(ref: PhotoRef, opts: sq.MeasureOptions, cache_dir: Path,
     # worse, silently drop the plate from the analysis.
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # Earlier row choices first, so this pass wins wherever both hold one.
+        # Geometry is re-detected identically each pass, so it is taken fresh.
+        merged = {**previous, **store}
         np.savez_compressed(cf, centers=geom.centers,
                             plate_center=np.asarray(geom.plate_center, float),
-                            plate_radius=float(geom.plate_radius), **store)
+                            plate_radius=float(geom.plate_radius), **merged)
     except Exception as e:
         if not measure._warned:
             print(f"\n    (note: measurements could not be cached -- {e}. "
@@ -672,13 +966,16 @@ def make_preview(plates: list[PlateData], combo: str, strains: list[str | None],
                                  anti_aliasing=True).astype(np.uint8)
                 cen, rad = pd_.centers * s, pd_.radius * s
                 ax.imshow(img, cmap="gray")
-                for i in range(sq.N_ROWS):
-                    for j in range(sq.N_COLS):
+                # Shape from the measured centres, not the module default, so
+                # this preview cannot index off the end of a denser grid.
+                n_rows, n_cols = cen.shape[0], cen.shape[1]
+                for i in range(n_rows):
+                    for j in range(n_cols):
                         cy, cx = cen[i, j]
                         col = "red" if pd_.rim[i, j] else "lime"
                         ax.add_patch(plt.Circle((cx, cy), rad, fill=False,
                                                 color=col, lw=1.0))
-                    tag = DILUTION_ORDER[i % 3]
+                    tag = DILUTION_ORDER[i % len(DILUTION_ORDER)]
                     ax.text(cen[i, 0][1] - rad * 2.3, cen[i, 0][0],
                             f"{i+1}\n{tag}", color="yellow", fontsize=9,
                             ha="center", va="center", fontweight="bold")
@@ -730,7 +1027,7 @@ def build_tidy(combo: str, plates: list[PlateData], strains: list[str | None],
                exclude: list[int] | None = None) -> pd.DataFrame:
     """One tidy frame for one treatment-set combination.
 
-    `experiment` is what the downstream normalizer and the R script treat as one
+    `experiment` is what the downstream normalizer and plotter treat as one
     graph, so it carries both the set and the treatment: different sets hold
     different strain panels and must never share a control.
 
@@ -762,7 +1059,7 @@ def build_tidy(combo: str, plates: list[PlateData], strains: list[str | None],
                     "raw_growth": float(pd_.net[row, col]),
                     "artifact": bool(pd_.rim[row, col]),
                     "excluded": (col + 1) in drop,
-                    # Carried into the CSV so the R script normalizes against
+                    # Carried into the CSV so the plotter tests against
                     # the control that was actually chosen, rather than
                     # guessing it from the column order.
                     "is_control": (col + 1) == control_col,
@@ -821,7 +1118,7 @@ def main(argv=None) -> int:
                          "per-combination questions (exclusions, positive "
                          "control, dilution).")
     ap.add_argument("--no-graphs", action="store_true",
-                    help="Skip the R figures; still writes all CSVs.")
+                    help="Skip the PyPrism figures; still writes all CSVs.")
     ap.add_argument("--no-precompute", action="store_true",
                     help="Measure only the configured dilution instead of all "
                          "three. Saves nothing on a first run (the shared "
@@ -998,13 +1295,13 @@ def main(argv=None) -> int:
 
     # --- step 5: export -----------------------------------------------------
     outdir.mkdir(parents=True, exist_ok=True)
-    # The R script keys its figures on `treatment`; each set-treatment pair is
+    # The plotter keys its figures on `treatment`; each set-treatment pair is
     # its own experiment here, so that column carries the combined label.
     out = tidy.copy()
     out["treatment_medium"] = out["treatment"]
     out["treatment"] = out["experiment"]
 
-    # Flag outliers BEFORE writing the CSV. The R script reads that file, so a
+    # Flag outliers BEFORE writing the CSV. The plotter reads that file, so a
     # column added afterwards reaches neither the figures nor the stats -- the
     # flagging silently did nothing but change the summary table.
     if not args.keep_outliers:
@@ -1037,14 +1334,14 @@ def main(argv=None) -> int:
             print(f"      {exp}: {strains_}")
     print(f"  config: {cfg_path}")
 
-    # The R graphs take about a minute, so they always run (--no-graphs
-    # skips them). The montages are the slow step -- they re-run the FIJI
+    # Graphs always run unless --no-graphs is passed. The montages are the slow
+    # step because they re-run the Python
     # background subtraction on every original 24 MP photo -- so only those
     # are asked about. CSVs and graphs are on disk by then, so saying no
     # costs only the spot pictures.
     n_plates = sum(len(v) for v in data.values())
     if not args.no_graphs:
-        run_r(norm_path, outdir)
+        run_plots(norm_path, outdir)
 
     if args.no_montages:
         want_mont = False
@@ -1073,7 +1370,7 @@ CONDITION_ORDER = ["GLU", "GLY", "K-OAc"]
 
 
 def _stars(p) -> str:
-    """Significance marks, matching src/plot_spotting.R exactly."""
+    """Significance marks, matching src/spotting_plots.py exactly."""
     if p is None or not np.isfinite(p):
         return ""
     if p < 1e-4:
@@ -1094,7 +1391,7 @@ def write_condition_matrix(outdir: Path) -> None:
     mean ratio, its Holm-adjusted p, n, and a display cell combining the ratio
     with the significance mark ("0.77 *").
 
-    Built from the R script's own output rather than recomputed here. The
+    Built from the plotting path's own output rather than recomputed here. The
     figures come from that file, so a strain can never be starred in the table
     and unstarred in the plot -- and spotting_quant's Python t-test is NOT the
     same test (raw-scale, uncensored), so recomputing would have produced a
@@ -1102,7 +1399,7 @@ def write_condition_matrix(outdir: Path) -> None:
     """
     src = outdir / "figures" / "spotting_paired_ttests.csv"
     if not src.exists():
-        return                      # no R run, nothing to summarise -- stay silent
+        return                 # no plotting run, nothing to summarise -- stay silent
 
     try:
         t = pd.read_csv(src)
@@ -1205,7 +1502,7 @@ def make_montages(data: dict, cfg: dict, opts: "sq.MeasureOptions",
 
     These used to live only in spotting_montage.py and had to be run by hand,
     which meant a finished run silently left the previous run's montages in
-    place, looking current. Same trap as the Rscript working-directory bug.
+    place, looking current.
     A failure here must not lose the run: the CSVs and figures are already
     written by this point.
     """
@@ -1234,49 +1531,29 @@ def make_montages(data: dict, cfg: dict, opts: "sq.MeasureOptions",
         print(f"  wrote {made} montage(s) to {outdir}")
 
 
-def run_r(csv_path: Path, outdir: Path) -> None:
-    """Draw the figures with src/plot_spotting.R if R is available."""
-    import shutil
-    import subprocess
-
-    # Absolute paths, always. Rscript does not necessarily start in the working
-    # directory it was launched from -- an Rprofile that calls setwd() moves it
-    # -- and a relative path then resolves against somewhere else entirely. That
-    # happened here: R reported the CSV missing from an unrelated home folder
-    # and silently drew no figures, leaving the previous run's figures in place
-    # and looking current.
+def run_plots(csv_path: Path, outdir: Path, *, statistical_test: str = "t_test",
+              p_adjust: str = "none", alpha: float = 0.05,
+              posthoc: str = "none", extra_references=(),
+              all_pairs: bool = False) -> None:
+    """Draw figures and the selected statistical test with PyPrism Plot."""
     csv_path = Path(csv_path).resolve()
     outdir = Path(outdir).resolve()
-
-    rscript = shutil.which("Rscript")
-    if not rscript:
-        cands = sorted(Path("C:/Program Files/R").glob("R-*/bin/Rscript.exe"),
-                       reverse=True) if Path("C:/Program Files/R").exists() else []
-        rscript = str(cands[0]) if cands else None
-    script = HERE / "plot_spotting.R"
-    if not rscript or not script.exists():
-        print("\n  (R not found — CSVs written; run src/plot_spotting.R yourself "
-              "to draw the figures.)")
-        return
-
-    print(f"\nDrawing figures with {rscript} ...")
-    try:
-        # R prints UTF-8; without saying so the strain names come back as
-        # mojibake on a cp1252 console.
-        r = subprocess.run([rscript, str(script), str(csv_path),
-                            "--outdir", str(outdir / "figures")],
-                           capture_output=True, text=True, timeout=1800,
-                           encoding="utf-8", errors="replace")
-        tail = [ln for ln in (r.stdout or "").splitlines()
-                if ln.strip() and "S3 guide" not in ln]
-        for ln in tail[-25:]:
-            print("  " + ln)
-        if r.returncode != 0:
-            print("  ! R exited non-zero; stderr tail:")
-            for ln in (r.stderr or "").splitlines()[-12:]:
-                print("    " + ln)
-    except Exception as e:
-        print(f"  ! could not run R: {e}")
+    print("\nDrawing figures with PyPrism Plot ...")
+    figures = outdir / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    # Never leave an earlier run looking current when drawing fails or when a
+    # treatment has disappeared from the new input.
+    for pattern in ("spotting_*.png", "spotting_*.pdf",
+                    "spotting_paired_ttests.csv", "spotting_anova.csv"):
+        for old in figures.glob(pattern):
+            old.unlink()
+    for old in (figures / "horizontal").glob("spotting_*.png"):
+        old.unlink()               # the sideways twins of those graphs
+    import spotting_plots
+    spotting_plots.draw(csv_path, figures, statistical_test=statistical_test,
+                        p_adjust=p_adjust, alpha=alpha, posthoc=posthoc,
+                        extra_references=extra_references,
+                        all_pairs=all_pairs)
 
 
 if __name__ == "__main__":

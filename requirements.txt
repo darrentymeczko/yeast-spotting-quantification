@@ -5,7 +5,8 @@
 
 numpy>=1.24
 pandas>=2.0
-scipy>=1.10
+scipy>=1.11             # stats.dunnett for the ANOVA post-hoc test
+numba>=0.61             # compiles the Python background-subtraction loops; no FIJI/Java
 
 # Image handling. scikit-image 0.26 renamed several morphology parameters;
 # the code handles both spellings, so older versions also work.
@@ -14,7 +15,8 @@ Pillow>=10.0
 tifffile>=2023.7.10
 
 matplotlib>=3.7          # previews, montages, diagnostics
-statsmodels>=0.14        # multiple-comparison correction
+statsmodels>=0.14        # multiple-comparison correction and hierarchical models
+pyprism-plot @ https://github.com/darrentymeczko/PyPrism_Plots/archive/refs/heads/main.zip
 
 # Export formats
 python-pptx>=0.6.21      # slide deck of montages + graphs
