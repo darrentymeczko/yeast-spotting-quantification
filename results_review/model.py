@@ -23,6 +23,9 @@ from dataclasses import dataclass, field, replace
 #: Mirrors `spotting_batch.DILUTION_ORDER`: least -> most dilute. The index is
 #: the `d0/d1/d2` token in a sheet filename, and the order spots are compared in.
 DILUTION_ORDER = ["least", "middle", "most"]
+# The keys of `spotting_plots.POSTHOC_METHODS`, repeated so this module stays
+# free of the plotting stack's imports.
+POSTHOC_METHODS = ("dunnett", "tukey", "holm", "bonferroni", "sidak", "none")
 
 #: Identifies one spot within a medium's frame. Stable across a re-measure --
 #: which is the point: re-running the pipeline must not silently strand a
@@ -271,6 +274,12 @@ class Review:
     statistical_test: str = "t_test"
     p_adjust: str = "none"
     alpha: float = 0.05
+    # The test that follows an ANOVA to say which pairs differ.
+    posthoc: str = "dunnett"
+    # Strains every other strain is ALSO compared with, besides each medium's
+    # control (which is always a reference). Ignored when `all_pairs`.
+    extra_references: list[str] = field(default_factory=list)
+    all_pairs: bool = False
     picks: dict[str, Pick] = field(default_factory=dict)
     edits: dict[str, dict[SpotKey, SpotEdit]] = field(default_factory=dict)
 
@@ -321,6 +330,25 @@ class Review:
     def n_edits(self) -> int:
         return sum(len(v) for v in self.edits.values())
 
+    # -- statistics ----------------------------------------------------------
+
+    def statistics_kwargs(self) -> dict:
+        """The keyword arguments `spotting_batch.run_plots` takes, as chosen."""
+        return {"statistical_test": self.statistical_test,
+                "p_adjust": self.p_adjust, "alpha": self.alpha,
+                "posthoc": (self.posthoc if self.statistical_test == "anova"
+                            else "none"),
+                "extra_references": tuple(self.extra_references),
+                "all_pairs": self.all_pairs}
+
+    def comparisons_text(self) -> str:
+        """The comparison set in a few words, for a button or a summary row."""
+        if self.all_pairs:
+            return "all pairs"
+        if not self.extra_references:
+            return "vs control"
+        return "vs control + " + ", ".join(self.extra_references)
+
     # -- serialisation -------------------------------------------------------
 
     def to_dict(self) -> dict:
@@ -329,7 +357,10 @@ class Review:
             "capture_root": self.capture_root,
             "statistics": {"test": self.statistical_test,
                            "p_adjust": self.p_adjust,
-                           "alpha": self.alpha},
+                           "alpha": self.alpha,
+                           "posthoc": self.posthoc,
+                           "extra_references": list(self.extra_references),
+                           "all_pairs": self.all_pairs},
             "chosen": {m: p.to_dict() for m, p in sorted(self.picks.items())},
             "edits": {
                 m: [e.to_dict() for e in sorted(b.values(),
@@ -351,6 +382,15 @@ class Review:
         alpha = _f(statistics.get("alpha"), 0.05)
         if not math.isfinite(alpha) or not 0 < alpha < 1:
             alpha = 0.05
+        posthoc = str(statistics.get("posthoc", "dunnett"))
+        if posthoc not in POSTHOC_METHODS:
+            posthoc = "dunnett"
+        refs = statistics.get("extra_references") or []
+        extra_references = (list(dict.fromkeys(str(r) for r in refs if str(r)))
+                            if isinstance(refs, list) else [])
+        all_pairs = statistics.get("all_pairs") is True
+        if all_pairs and posthoc == "dunnett":
+            posthoc = "tukey"
         picks = {str(m): Pick.from_dict(v)
                  for m, v in (d.get("chosen") or {}).items()}
         edits: dict[str, dict[SpotKey, SpotEdit]] = {}
@@ -367,4 +407,7 @@ class Review:
                    statistical_test=statistical_test,
                    p_adjust=p_adjust,
                    alpha=alpha,
+                   posthoc=posthoc,
+                   extra_references=extra_references,
+                   all_pairs=all_pairs,
                    picks=picks, edits=edits)

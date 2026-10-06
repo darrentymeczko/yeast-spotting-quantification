@@ -22,6 +22,8 @@ from datetime import date
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from uikit import tokens
+
 from .. import BUNDLE, REPO
 from ..model import TIMECOURSE, Condition, Experiment
 from ..profiles import capture_tree
@@ -70,7 +72,7 @@ class BulkCreateDialog(tk.Toplevel):
         ttk.Label(master,
                   text="One experiment is created per photo folder. They share "
                        "a plate template and a set of conditions.",
-                  foreground="#555").pack(anchor="w")
+                  foreground=tokens.TEXT_MUTED).pack(anchor="w")
 
         row = ttk.Frame(master)
         row.pack(fill="x", pady=(8, 0))
@@ -96,12 +98,12 @@ class BulkCreateDialog(tk.Toplevel):
         ttk.Button(row2, text="Plate template...",
                    command=self._choose_template).pack(side="left")
         self.template_label = ttk.Label(row2, text="none chosen",
-                                        foreground="#555")
+                                        foreground=tokens.TEXT_MUTED)
         self.template_label.pack(side="left", padx=(8, 0))
 
         ttk.Button(row2, text="Conditions...",
                    command=self._edit_conditions).pack(side="left", padx=(20, 0))
-        self.conditions_label = ttk.Label(row2, text="none", foreground="#555")
+        self.conditions_label = ttk.Label(row2, text="none", foreground=tokens.TEXT_MUTED)
         self.conditions_label.pack(side="left", padx=(8, 0))
 
     def _build_panel(self, master) -> None:
@@ -113,7 +115,7 @@ class BulkCreateDialog(tk.Toplevel):
                  "spotted there, so panels may differ in size.\n"
                  "The radio button under each column marks that panel's "
                  "positive control.",
-            foreground="#555", justify="left",
+            foreground=tokens.TEXT_MUTED, justify="left",
         ).pack(anchor="w", pady=(0, 6))
 
         # A canvas so a wide grid of folders scrolls rather than forcing the
@@ -140,7 +142,7 @@ class BulkCreateDialog(tk.Toplevel):
     def _build_buttons(self, master) -> None:
         row = ttk.Frame(master)
         row.pack(fill="x", pady=(10, 0))
-        self.status = ttk.Label(row, text="", foreground="#555")
+        self.status = ttk.Label(row, text="", foreground=tokens.TEXT_MUTED)
         self.status.pack(side="left")
         ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right")
         self.create_button = ttk.Button(row, text="Create", command=self._create)
@@ -212,22 +214,25 @@ class BulkCreateDialog(tk.Toplevel):
         self.template_path = _relative_to_repo(path)
 
     def _edit_conditions(self) -> None:
-        current = ", ".join(c.code for c in self.conditions)
+        from .controller import ExperimentController
+
+        current = ", ".join(c.display() for c in self.conditions)
         raw = _ask_line(
             self, "Conditions",
             "Every medium or treatment these panels were spotted on,\n"
-            "separated by commas (e.g. GLU, GLY, K-OAc):",
+            "separated by commas (e.g. Glucose, Glycerol, Potassium Acetate):",
             current,
         )
         if raw is None:
             return
-        codes = [t.strip() for t in raw.split(",") if t.strip()]
-        seen, unique = set(), []
-        for code in codes:
-            if code not in seen:
-                seen.add(code)
-                unique.append(code)
-        self.conditions = [Condition(code, code) for code in unique]
+        names = [t.strip() for t in raw.split(",") if t.strip()]
+        ctl = ExperimentController(Experiment(conditions=list(self.conditions)))
+        try:
+            codes = list(dict.fromkeys(ctl.add_named_condition(name) for name in names))
+        except ValueError as exc:
+            messagebox.showerror("Conditions", str(exc), parent=self)
+            return
+        self.conditions = [ctl.experiment.condition(code) for code in codes]
         self._refresh()
 
     # -- the grid ------------------------------------------------------------
@@ -241,7 +246,7 @@ class BulkCreateDialog(tk.Toplevel):
             text=(f"{self.template.name} ({self.template.sample_slots()} slots)"
                   if self.template is not None else "none chosen"))
         self.conditions_label.configure(
-            text=", ".join(c.code for c in self.conditions) or "none")
+            text=", ".join(c.display() for c in self.conditions) or "none")
 
         self._rebuild_grid()
         self._sync_create()
@@ -257,7 +262,7 @@ class BulkCreateDialog(tk.Toplevel):
         if self.template is None or not self.folders:
             ttk.Label(self.grid_frame,
                       text="Choose a plate template and at least one folder.",
-                      foreground="#777").grid(row=0, column=0, padx=6, pady=6)
+                      foreground=tokens.TEXT_MUTED).grid(row=0, column=0, padx=6, pady=6)
             return
 
         slots = self.template.sample_slots()

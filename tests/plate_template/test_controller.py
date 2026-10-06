@@ -5,6 +5,7 @@ from plate_template.gui.controller import EditorController, UndoStack
 from plate_template.model import EMPTY, UNASSIGNED, Cell, DilutionSpec, Template
 from plate_template.presets import blank
 from plate_template.schema import to_dict
+import pytest
 
 
 def controller() -> EditorController:
@@ -160,3 +161,31 @@ def test_on_change_fires_for_every_committed_edit():
     c.undo()
     c.redo()
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("action", [
+    lambda c: c.apply("1", Plan([(1, 1, EMPTY)], []), "Paint empty"),
+    lambda c: c.apply("1", Plan([(0, 0, UNASSIGNED)], []), "Erase"),
+    lambda c: c.set_control("1", 2),
+    lambda c: c.resize(2, 2),
+    lambda c: c.set_dilution_levels(3),
+    lambda c: c.add_plate("3"),
+    lambda c: c.remove_plate("2"),
+    lambda c: c.rename_plate("1", "Changed"),
+    lambda c: c.set_name("Changed"),
+    lambda c: c.duplicate_plate("1", "3", 2),
+])
+def test_all_plate_mutations_roundtrip_in_one_step(action):
+    ctl = controller()
+    place_row(ctl)
+    ctl.add_plate("2")
+    ctl.undo_stack.clear()
+    before = ctl.snapshot()
+    assert action(ctl)
+    after = ctl.snapshot()
+    assert before != after
+    ctl.undo()
+    assert ctl.snapshot() == before
+    assert not ctl.undo_stack.can_undo
+    ctl.redo()
+    assert ctl.snapshot() == after

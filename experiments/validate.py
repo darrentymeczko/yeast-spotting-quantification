@@ -542,6 +542,30 @@ def _check_photos(e: Experiment, out: list[Issue]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Statistics
+# ---------------------------------------------------------------------------
+
+
+def _check_statistics(e: Experiment, out: list[Issue]) -> None:
+    stats = e.statistics
+    if stats.all_pairs:
+        return
+    names = {e.strain(s) for s in e.filled_slots()}
+    stale = [r for r in stats.extra_references if r not in names]
+    if stale:
+        out.append(
+            Issue(
+                Severity.WARNING,
+                "unknown_reference",
+                f"{', '.join(repr(r) for r in stale)} "
+                f"{_plural(len(stale), 'is', 'are')} chosen as a comparison "
+                f"strain but not named in the panel; "
+                f"{_plural(len(stale), 'it', 'they')} will be skipped",
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 
 
 def _summary(e: Experiment) -> Issue:
@@ -565,6 +589,12 @@ def validate(e: Experiment, template=None) -> list[Issue]:
     to, or None when it could not be loaded. It is passed in rather than read
     from disk so this stays pure and testable.
     """
+    if e.strain_groups:
+        from dataclasses import replace
+        return sorted((replace(i, message=f"Strain group {key!r}: {i.message}")
+                       for key in e.strain_groups
+                       for i in validate(e.for_group(key), template)),
+                      key=lambda i: (_RANK[i.severity], i.condition or "", i.code))
     issues: list[Issue] = []
     _check_panel(e, issues)
     _check_controls(e, issues)
@@ -572,6 +602,10 @@ def validate(e: Experiment, template=None) -> list[Issue]:
     _check_template(e, template, issues)
     _check_photos(e, issues)
     _check_picks(e, template, issues)
+    _check_statistics(e, issues)
+    from .multistep import design_errors
+    issues.extend(Issue(Severity.ERROR, "multi_step_design", message)
+                  for message in design_errors(e, template))
     issues.append(_summary(e))
     issues.sort(key=lambda i: (_RANK[i.severity], i.condition or "", i.code))
     return issues

@@ -68,13 +68,135 @@ def build(root, experiment) -> ExperimentApp:
     return app
 
 
+def test_template_undo_clears_preview_and_redo_restores_it(root):
+    app = build(root, Experiment())
+    root.deiconify()
+    root.geometry("1200x800")
+    root.update()
+    app.controller.bind_template(Path(__file__).resolve().parents[2] / "plate_template/templates/lab_standard_8x6.json")
+    root.update()
+    assert app.panel.template_preview.find_withtag("plate")
+    app.undo()
+    root.update()
+    assert not app.panel.template_preview.find_withtag("plate")
+    assert app.panel.template_label.cget("text") == "none chosen"
+    app.redo()
+    root.update()
+    assert app.panel.template_preview.find_withtag("plate")
+
+
+def test_undo_shortcut_works_from_data_dropdown(root, tree, monkeypatch):
+    app = build(root, complete(tree))
+    control = app.data.simple_rules["plate"]["choice_box"]
+    monkeypatch.setattr(root, "focus_get", lambda: control)
+    app.controller.override_many([r.relpath for r in app.controller.files], "plate", 9)
+    assert app._shortcut(app.undo) == "break"
+    assert all(r.plate != 9 for r in app.controller.resolution.rows)
+    app._shortcut(app.redo)
+    assert all(r.plate == 9 for r in app.controller.resolution.rows)
+
+
 # --- it comes up ------------------------------------------------------------
+
+
+def findings(app) -> str:
+    """What the pre-run prompt would list."""
+    return "\n".join(app.findings_lines(app.controller.issues()))
 
 
 def test_a_blank_experiment_opens(root):
     app = build(root, Experiment())
     assert app.controller.experiment.name == "Untitled"
-    assert "Error:" in app.run_findings.get("1.0", "end")
+    assert "Error:" in findings(app)
+
+
+def test_folder_selection_suggests_conditions_and_opens_data_review(root, tmp_path, monkeypatch):
+    from experiments import app as app_module
+    for temp in (30, 37):
+        folder = tmp_path / str(temp) / "glucose"
+        folder.mkdir(parents=True)
+        (folder / "H2O2 - 17h.JPG").write_bytes(b"x")
+    app = ExperimentApp(root, Experiment())
+    assert app.notebook.select() == str(app.panel)
+    monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda **kw: str(tmp_path))
+    app.choose_photos()
+    assert app.notebook.select() == str(app.data)
+    assert len(app.controller.experiment.conditions) == 2
+    assert len(app.data.table.get_children()) == 2
+    assert app.conditions.adopt.instate(["disabled"])
+    assert {app.conditions.tree.set(i, "photos") for i in app.conditions.tree.get_children()} == {"1"}
+    assert all("needs plate" in app.data.table.set(i, "status") for i in app.data.table.get_children())
+
+
+def test_data_rules_and_photo_corrections_survive_reread(root, tmp_path, monkeypatch):
+    from experiments.gui import data as data_gui
+    for rep in (1, 2):
+        folder = tmp_path / "Glucose" / "17 hours" / f"R{rep}"
+        folder.mkdir(parents=True)
+        (folder / "_9.JPG").write_bytes(b"x")
+    app = build(root, Experiment())
+    app.controller.set_photo_root(tmp_path)
+    app.refresh()
+    source, depth, pattern = app.data.rules["plate"]
+    source.set("Folder / path level")
+    depth.set("-2")
+    pattern.set(r"R(\d+)")
+    app.data._apply()
+    assert len(app.controller.resolution.usable()) == 2
+    paths = app.data.table.get_children()
+    app.data.table.selection_set(paths)
+    monkeypatch.setattr(data_gui, "_ask_text", lambda *a, **kw: "19")
+    app.data._correct("timepoint")
+    app.reread_photos()
+    assert all(r.timepoint == 19 for r in app.controller.resolution.rows)
+    assert app.controller.experiment.profile.rule_for("plate").patterns == (r"R(\d+)",)
+    app.controller.undo()
+    assert all(r.timepoint == 17 for r in app.controller.resolution.rows)
+
+
+def test_plain_language_choices_preview_and_apply_without_patterns(root, tmp_path):
+    for plate in (1, 2):
+        folder = tmp_path / "Glucose" / "17 hours" / f"R{plate}"
+        folder.mkdir(parents=True)
+        (folder / "_9.JPG").write_bytes(b"x")
+    app = build(root, Experiment())
+    app.controller.set_photo_root(tmp_path)
+    app.refresh()
+    assert not app.data.advanced.winfo_manager()
+    fields = app.data.simple_rules["plate"]
+    folder_choice = next(label for label, rule in fields["choices"].items()
+                         if rule and rule.source == "segment" and rule.depth == -2
+                         and label.startswith("Use R1, R2"))
+    assert "R1" in folder_choice and "-2" not in folder_choice
+    fields["selected"].set(folder_choice)
+    app.data._preview_choice("plate")
+    assert "Reads: 1, 2" in fields["example"].cget("text")
+    assert all(r.plate is None for r in app.controller.resolution.rows)
+    app.data._apply_choices()
+    assert {r.plate for r in app.controller.resolution.usable()} == {1, 2}
+    app.controller.undo()
+    assert all(r.plate is None for r in app.controller.resolution.rows)
+
+
+def test_simple_choices_preserve_saved_custom_readings(root, tree):
+    from experiments.profiles import FacetRule
+    e = complete(tree)
+    e.profile.rules += (FacetRule("set", "segment", -2, (r"^(.+)$",), "raw"),)
+    app = build(root, e)
+    before = app.controller.resolution.rows
+    app.data._apply_choices()
+    assert app.controller.resolution.rows == before
+    app.notebook.select(app.data)
+    root.deiconify()
+    root.geometry("1200x800")
+    root.update()
+    simple = app.data.simple_rules["plate"]["choice_box"].master
+    assert sum(isinstance(w, ttk.Combobox) for w in simple.winfo_children()) == 4
+    assert app.data.table.winfo_height() > 100
+    app.data._toggle_advanced()
+    assert app.data.advanced.winfo_manager() == "pack"
+    app.data._toggle_advanced()
+    assert not app.data.advanced.winfo_manager()
 
 
 def test_a_complete_experiment_opens_and_reads_its_photos(root, tree):
@@ -183,15 +305,15 @@ def visible_tabs(app) -> list[str]:
 def test_a_timecourse_has_no_plate_picker(root, tree):
     """It chooses its own photographs; picking them by hand would contradict it."""
     app = build(root, complete(tree))
-    assert visible_tabs(app) == ["1. Panel", "2. Conditions", "3. Run"]
+    assert visible_tabs(app) == ["1. Panel", "2. Data", "3. Conditions", "4. Run"]
 
 
 def test_handpicked_mode_adds_the_plate_picker(root, tree):
     e = complete(tree)
     e.mode = QUANTIFY
     app = build(root, e)
-    assert visible_tabs(app) == ["1. Panel", "2. Conditions", "3. Plates",
-                                 "4. Run"]
+    assert visible_tabs(app) == ["1. Panel", "2. Data", "3. Conditions", "4. Plates",
+                                 "5. Run"]
 
 
 def test_the_picker_comes_and_goes_with_the_mode(root, tree):
@@ -200,10 +322,10 @@ def test_the_picker_comes_and_goes_with_the_mode(root, tree):
     for _ in range(2):
         app.controller.set_mode(QUANTIFY)
         app.refresh()
-        assert "3. Plates" in visible_tabs(app)
+        assert "4. Plates" in visible_tabs(app)
         app.controller.set_mode(TIMECOURSE)
         app.refresh()
-        assert "3. Plates" not in visible_tabs(app)
+        assert "4. Plates" not in visible_tabs(app)
 
 
 def test_the_photo_folder_lives_in_the_header(root, tree):
@@ -233,7 +355,7 @@ def test_it_still_opens_when_something_is_missing(root, tree, mutate, why):
     e = complete(tree)
     mutate(e)
     app = build(root, e)
-    assert app.run_findings.get("1.0", "end").strip(), f"{why}: nothing reported"
+    assert findings(app).strip(), f"{why}: nothing reported"
 
 
 def test_a_missing_photo_folder_is_reported_in_the_header(root, tree):
@@ -258,7 +380,7 @@ def test_the_picker_lists_one_row_per_condition_and_plate(root, tree):
     # One condition in the fixture, two plates in the lab standard template.
     assert len(rows) == 2
     assert [app.plates.slots.set(r, "plate") for r in rows] == ["1", "2"]
-    assert {app.plates.slots.set(r, "condition") for r in rows} == {"GLU"}
+    assert {app.plates.slots.set(r, "condition") for r in rows} == {"Glucose"}
 
 
 def test_the_picker_lists_every_photograph_in_the_folder(root, tree):
@@ -358,7 +480,7 @@ def test_the_caption_says_when_a_photograph_is_already_in_use(root, tree):
     app.controller.set_pick("GLU", "1", target)
     app.plates._showing = target
     app.refresh()
-    assert "already used for GLU plate 1" in app.plates.caption.cget("text")
+    assert "already used for Glucose plate 1" in app.plates.caption.cget("text")
 
 
 def test_the_conditions_tab_counts_photos_per_condition(root, tree):
@@ -403,10 +525,10 @@ def test_the_condition_inspector_edits_control_and_exclusions(root, tree):
     assert app.controller.experiment.exclude_for("GLU") == (3,)
 
 
-def test_adding_a_condition_prefills_the_focused_name_prompt(
+def test_adding_a_condition_only_asks_for_its_name(
         root, tree, monkeypatch):
     app = build(root, complete(tree))
-    replies = iter(["K-OAc", "Potassium Acetate"])
+    replies = iter(["Potassium Acetate"])
     prompts = []
 
     def answer(_parent, _title, prompt, initial=""):
@@ -416,16 +538,238 @@ def test_adding_a_condition_prefills_the_focused_name_prompt(
     monkeypatch.setattr(conditions_gui, "_ask_text", answer)
     app.conditions._add()
 
-    assert prompts[1][1] == "K-OAc"
-    assert app.controller.experiment.condition("K-OAc").label == "Potassium Acetate"
+    assert len(prompts) == 1
+    assert "Treatment name" in prompts[0][0]
+    assert app.controller.experiment.conditions[-1].label == "Potassium Acetate"
+    assert "code" not in app.conditions.tree.cget("columns")
 
 
-def test_findings_appear_only_in_the_experiment_summary(root):
+def test_names_are_used_for_renaming_and_photo_assignment(root, tree, monkeypatch):
+    from experiments.gui import data as data_gui
+
+    app = build(root, handpicked(tree))
+    app.conditions.tree.selection_set("GLU")
+    prompts = []
+
+    def rename(_parent, _title, prompt, initial=""):
+        prompts.append(prompt)
+        assert initial == "Glucose"
+        return "Glucose control"
+
+    monkeypatch.setattr(conditions_gui, "_ask_text", rename)
+    app.conditions._rename()
+    assert len(prompts) == 1
+    assert app.controller.experiment.condition_codes() == ["GLU"]
+    assert app.conditions.tree.set("GLU", "label") == "Glucose control"
+    assert app.conditions.condition_name.cget("text") == "Glucose control"
+    assert "condition" not in app.data.table.cget("columns")
+    assert {app.data.table.set(p, "label") for p in app.data.table.get_children()} == {"Glucose control"}
+
+    def choose(_parent, _title, prompt, **kw):
+        assert "code" not in prompt.lower()
+        assert kw["choices"] == ("Glucose control",)
+        return "Glucose control"
+
+    monkeypatch.setattr(data_gui, "_ask_text", choose)
+    path = app.data.table.get_children()[0]
+    app.data.table.selection_set(path)
+    app.data._correct("condition")
+    assert app.controller.experiment.overrides[path]["condition"] == "GLU"
+
+
+def test_findings_are_listed_by_the_run_prompt_not_a_checks_box(root):
     app = build(root, Experiment())
-    assert not hasattr(app, "findings")
-    checks = app.run_findings.get("1.0", "end")
+    assert not hasattr(app, "run_findings")
+    checks = findings(app)
     assert "Error:" in checks
     assert "sample slot" in checks
+
+
+# --- statistics ---------------------------------------------------------------
+
+
+def test_the_statistics_box_starts_on_the_pipeline_defaults(root, tree):
+    app = build(root, complete(tree))
+    assert app.stats_test.get() == "Ratio paired t-tests"
+    assert app.stats_correction.get() == "None"
+    assert app.stats_alpha.get() == "0.05"
+    assert app.stats_compare.get() == "Each strain vs the control"
+
+
+def test_choosing_anova_turns_the_correction_into_a_post_hoc_test(root, tree):
+    app = build(root, complete(tree))
+    app.stats_test.set("One-way ANOVA")
+    app._test_changed()
+    assert app.controller.experiment.statistics.test == "anova"
+    assert app.correction_label.cget("text") == "Post-hoc:"
+    assert app.stats_correction.get() == "Dunnett"
+
+    app.stats_correction.set("Tukey HSD")
+    app._correction_changed()
+    assert app.controller.experiment.statistics.posthoc == "tukey"
+
+
+def test_every_pair_moves_dunnett_to_tukey_and_hides_it(root, tree):
+    app = build(root, complete(tree))
+    app.controller.set_statistics(test="anova")
+    app.stats_compare.set("Every pair of strains")
+    app._compare_changed()
+    stats = app.controller.experiment.statistics
+    assert stats.all_pairs and stats.posthoc == "tukey"
+    assert "Dunnett" not in app.correction_picker.cget("values")
+
+
+def test_a_bad_p_cutoff_is_refused(root, tree):
+    app = build(root, complete(tree))
+    app.stats_alpha.set("2")
+    app._alpha_changed()
+    assert app.controller.experiment.statistics.alpha == 0.05
+    app.stats_alpha.set("0.01")
+    app._alpha_changed()
+    assert app.controller.experiment.statistics.alpha == 0.01
+
+
+def test_comparison_strains_are_chosen_from_the_panel(root, tree, monkeypatch):
+    app = build(root, complete(tree))
+    shown = {}
+
+    def choose(_parent, _title, _prompt, options, *, selected):
+        shown["options"] = options
+        return ["s3"]
+
+    monkeypatch.setattr(conditions_gui, "_ask_choices", choose)
+    app.stats_compare.set("Vs the control and chosen strains")
+    app._compare_changed()
+    assert "s1" not in shown["options"]           # the control
+    assert app.controller.experiment.statistics.extra_references == ("s3",)
+    assert app.references_button.cget("text") == "Strains (1)..."
+
+
+def test_data_only_output_locks_the_statistics(root, tree):
+    app = build(root, complete(tree))
+    app.output.set("data")
+    app._output_changed()
+    assert app.controller.experiment.output == "data"
+    assert app.test_picker.instate(["disabled"])
+    assert app.alpha_entry.instate(["disabled"])
+    assert "Not used" in app.stats_note.cget("text")
+
+    app.output.set("full")
+    app._output_changed()
+    assert app.test_picker.instate(["!disabled"])
+
+
+def test_a_statistics_change_can_be_undone(root, tree):
+    app = build(root, complete(tree))
+    app.controller.set_statistics(test="anova")
+    app.undo()
+    assert app.controller.experiment.statistics.test == "t_test"
+
+
+# --- running with findings ----------------------------------------------------
+
+
+def test_save_as_preserves_an_explicit_experiment_name(root, tmp_path, monkeypatch):
+    from experiments import app as app_module, schema
+
+    app = build(root, Experiment(name="Heat stress"))
+    path = tmp_path / "backup.spotexp.json"
+    monkeypatch.setattr(app_module, "default_experiment_dir", lambda: tmp_path)
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename",
+                        lambda **kw: str(path))
+    assert app.save_file_as()
+    assert schema.load(path).name == "Heat stress"
+    assert app.controller.experiment.name == "Heat stress"
+    assert not app.controller.dirty
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_unsuccessful_save_as_preserves_name_path_and_revision(
+        root, tmp_path, monkeypatch, cancelled):
+    from experiments import app as app_module
+
+    app = build(root, Experiment())
+    revision = app.controller.experiment.revision
+    original_path = tmp_path / "original.spotexp.json"
+    app.path = original_path
+    monkeypatch.setattr(app_module, "default_experiment_dir", lambda: tmp_path)
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename",
+                        lambda **kw: "" if cancelled else str(tmp_path / "new.json"))
+    errors = []
+    monkeypatch.setattr(app_module.messagebox, "showerror",
+                        lambda *a, **kw: errors.append(a))
+
+    def fail_save(*args):
+        raise OSError("Cannot write experiment")
+
+    monkeypatch.setattr(app_module, "save", fail_save)
+    assert not app.save_file_as()
+    assert app.path == original_path
+    assert app.controller.experiment.name == "Untitled"
+    assert app.controller.experiment.revision == revision
+    assert not app.controller.dirty
+    assert bool(errors) is not cancelled
+
+
+@pytest.fixture
+def launch(monkeypatch):
+    """Stub everything Run would do outside the window; record the command."""
+    import subprocess
+
+    from experiments import app as app_module
+
+    started = []
+
+    class Process:
+        def poll(self):
+            return None
+
+    def popen(command, **_kwargs):
+        started.append(command)
+        return Process()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(app_module.ExperimentApp, "_pipeline_python",
+                        staticmethod(lambda _env: Path("python")))
+    monkeypatch.setattr(app_module.ExperimentApp, "save_file",
+                        lambda self: setattr(self, "path", Path("e.json")) or True)
+    monkeypatch.setattr(app_module.messagebox, "askokcancel",
+                        lambda *a, **k: True)
+    # The stub never exits; don't leave a poll scheduled on a dead window.
+    monkeypatch.setattr(app_module.ExperimentApp, "_check_run_process",
+                        lambda self: None)
+    return started
+
+
+def test_run_is_offered_even_when_there_are_errors(root):
+    app = build(root, Experiment())
+    assert app.run_button.instate(["!disabled"])
+
+
+def test_errors_are_listed_and_declining_does_not_run(root, monkeypatch, launch):
+    from experiments import app as app_module
+
+    asked = {}
+
+    def ask(title, message, **_kwargs):
+        asked["message"] = message
+        return False
+
+    monkeypatch.setattr(app_module.messagebox, "askyesno", ask)
+    app = build(root, Experiment())
+    app._run_quantification()
+    assert "Error:" in asked["message"]
+    assert "Are you sure" in asked["message"]
+    assert launch == []
+
+
+def test_confirming_errors_runs_with_force(root, monkeypatch, launch):
+    from experiments import app as app_module
+
+    monkeypatch.setattr(app_module.messagebox, "askyesno", lambda *a, **k: True)
+    app = build(root, Experiment())
+    app._run_quantification()
+    assert len(launch) == 1 and launch[0][-1] == "--force"
 
 
 def test_the_panel_shows_the_strain_names(root, tree):
@@ -462,7 +806,7 @@ def test_arrow_navigation_moves_up_and_down_between_strain_slots(
     assert focused == [1, 3]
 
 
-@pytest.mark.parametrize("column, editor", [("#3", "control"), ("#4", "exclude")])
+@pytest.mark.parametrize("column, editor", [("#2", "control"), ("#3", "exclude")])
 def test_double_click_edits_the_clicked_condition_cell(
         root, tree, monkeypatch, column, editor):
     app = build(root, complete(tree))

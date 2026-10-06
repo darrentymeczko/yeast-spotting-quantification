@@ -55,6 +55,9 @@ def run_one(results_dir: Path, *, figures: bool = True, montages: bool = True,
         print(f"  ! {run.label}: {e}", file=sys.stderr)
         return 1
 
+    from .datareview import load_flags
+
+    flags = load_flags(run)
     frames, problems = [], []
     for medium in run.media:
         cand = rv.chosen_candidate(run, review, medium)
@@ -63,7 +66,7 @@ def run_one(results_dir: Path, *, figures: bool = True, montages: bool = True,
             continue
         try:
             frames.append(rebuild(root, run.label, cfg, cand,
-                                  review.edits_for(medium)))
+                                  review.edits_for(medium), data_flags=flags))
         except RebuildError as e:
             problems.append(f"{medium}: {e}")
 

@@ -25,9 +25,19 @@ MIN_ZOOM = 1.0
 MAX_ZOOM = 5.0
 ZOOM_STEP = 1.25
 
+#: How a sheet can be shown (see `spotting_sheet.view`), in the order V steps
+#: through them. Fit is the default: the two panels and nothing else, side by
+#: side or stacked and the plate turned if that helps, whichever fills the
+#: pane best. Aligned sets each strain's replicate spots beside its name on
+#: the graph. Either can also be rotated: the graph turned on its side, with
+#: its strain names still upright.
+VIEWS = (("fit", "Fit"), ("aligned", "Aligned"))
+
 
 class SheetView(ttk.Frame):
-    def __init__(self, master, on_redraw=None, on_toggle=None, **kw) -> None:
+    def __init__(self, master, on_redraw=None, on_toggle=None, *,
+                 view: str = VIEWS[0][0], rotate: bool = False,
+                 on_view=None, **kw) -> None:
         super().__init__(master, **kw)
         self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
@@ -43,6 +53,27 @@ class SheetView(ttk.Frame):
         self.caption = ttk.Label(top, text="", font=theme.FONT_SMALL,
                                  foreground=theme.MUTED, anchor="w", width=1)
         self.caption.grid(row=0, column=0, sticky="ew", pady=4)
+
+        #: Called with (view, rotated) whenever either changes.
+        self._on_view = on_view
+        self._view = tk.StringVar(
+            value=view if view in (v for v, _ in VIEWS) else VIEWS[0][0])
+        views = ttk.Frame(top)
+        views.grid(row=0, column=1, sticky="e", padx=(theme.GAP, 0))
+        ttk.Label(views, text="View (V):", font=theme.FONT_SMALL,
+                  foreground=theme.MUTED).grid(row=0, column=0,
+                                               padx=(0, theme.GAP))
+        for i, (value, label) in enumerate(VIEWS, start=1):
+            ttk.Radiobutton(views, text=label, value=value,
+                            variable=self._view, style="Toolbutton",
+                            command=self._view_changed).grid(
+                row=0, column=i, padx=(0, 2), ipadx=theme.GAP)
+        self._rotate = tk.BooleanVar(value=bool(rotate))
+        # An arrow, no text: it stays pressed while the graph is on its side.
+        # The R key does the same.
+        ttk.Checkbutton(views, text="↻", width=3, variable=self._rotate,
+                        style="Toolbutton", command=self._view_changed).grid(
+            row=0, column=len(VIEWS) + 1, padx=(theme.GAP * 2, 0))
 
         self.btn_toggle = ttk.Button(top, text="Original sheet (G)", width=17,
                                      command=on_toggle or (lambda: None))
@@ -187,6 +218,35 @@ class SheetView(ttk.Frame):
         self._caption()
         self._draw()
         return True
+
+    @property
+    def view(self) -> str:
+        return self._view.get()
+
+    @property
+    def rotated(self) -> bool:
+        return bool(self._rotate.get())
+
+    def toggle_rotate(self) -> None:
+        """Turn the graph on its side, or back (the R key)."""
+        self._rotate.set(not self._rotate.get())
+        self._view_changed()
+
+    def set_view(self, mode: str) -> None:
+        if mode in (v for v, _ in VIEWS) and mode != self._view.get():
+            self._view.set(mode)
+            self._view_changed()
+
+    def cycle_view(self) -> None:
+        """Step to the next way of showing the sheet (the V key)."""
+        order = [v for v, _ in VIEWS]
+        self.set_view(order[(order.index(self._view.get()) + 1) % len(order)])
+
+    def _view_changed(self) -> None:
+        self._reset_position()
+        self._draw()
+        if self._on_view is not None:
+            self._on_view(self.view, self.rotated)
 
     @property
     def has_updated(self) -> bool:
@@ -366,8 +426,15 @@ class SheetView(ttk.Frame):
         canvas_h = max(self.canvas.winfo_height() - 2, 64)
         box = (int(canvas_w * self._zoom), int(canvas_h * self._zoom))
         img = self.cache.get(path, box, self._brightness_var.get(),
-                             self._contrast_var.get())
+                             self._contrast_var.get(), mode=self.view,
+                             rotate=self.rotated)
         if img is None:
+            if self.cache.last_error:
+                return self._message(
+                    f"{dict(VIEWS)[self.view]}{' (rotated)' if self.rotated else ''} "
+                    f"view isn't available for this "
+                    f"sheet: {self.cache.last_error}.\n\nPress V for another "
+                    f"view.", theme.WARNING)
             return self._message(f"Could not read {Path(path).name}.",
                                  theme.ERROR)
         self._image = img

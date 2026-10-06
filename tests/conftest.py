@@ -15,6 +15,7 @@ real failure and both are silent, which is exactly why the root lives at the top
 of the tree instead of being solved once per package.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,20 +27,33 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# The tools hand their heavy work to worker processes (`uikit.tasks.worker`).
+# Here it runs on the calling thread instead, so a test can stub what the
+# work calls and no test pays for starting a process. The worker processes
+# themselves are tested in tests/uikit/test_uikit_tasks.py.
+os.environ.setdefault("SPOTTING_WORKERS", "thread")
+
 
 @pytest.fixture(scope="session")
 def tk_root():
     """THE Tk root, for the whole test session.
 
     Every GUI test takes a `Toplevel` off this rather than making its own root.
+
+    It wears the shared theme from the start, as every real window does. The
+    theme is process-wide, so applying it only once some test happened to ask
+    would make every GUI test's result depend on the order they ran in.
     """
     import tkinter as tk
+
+    from uikit.theme import apply_theme
 
     try:
         root = tk.Tk()
     except tk.TclError:                      # pragma: no cover - headless CI
         pytest.skip("no display available")
     root.withdraw()
+    apply_theme(root)
     yield root
     try:
         root.destroy()

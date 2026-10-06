@@ -225,21 +225,44 @@ def cmd_run(args) -> int:
         return EXIT_UNREADABLE
 
     template = _load_template(e, path.parent)
+    # The data review saved beside the experiment, if there is one. A
+    # stdlib-only module: reading it costs nothing on a machine without numpy.
+    from data_review import flags as review_flags
+
+    review_path = review_flags.sidecar_for(path)
+    try:
+        review = review_flags.load(review_path) if review_path.exists() else None
+    except (OSError, ValueError) as exc:
+        print(f"  ! data review not read, so nothing it flags is left out: {exc}")
+        review = None
+    if review is not None:
+        print(f"  data review: {review.n_plates} plate(s) and {review.n_spots} "
+              f"spot(s) flagged ({review_path.name})")
     issues = list(validate.validate(e, template))
-    issues += intake.check_resolution(e, res)
+    issues += intake.check_resolution(e, res, flagged_plates=runner.review_plates(review))
     errors = _print_issues(issues)
     if errors and not args.force:
         print(f"  {errors} error(s); not running. Fix them, or pass --force.")
         return EXIT_ISSUES
 
     try:
+        outdir = Path(args.out) if args.out else runner.default_results_dir(e)
+        if not args.estimate:
+            # Said up front, in a fixed form, so whatever started this run --
+            # the workbench's Jobs panel -- can offer to open the results
+            # without having to import the pipeline to work it out.
+            print(f"  results folder: {outdir}")
         code = runner.run(
             e,
-            outdir=Path(args.out) if args.out else None,
+            outdir=outdir,
             estimate=args.estimate,
             workers=args.workers,
             res=res,
             template=template,
+            review=review,
+            # Recorded even when there is no review yet, so one made after
+            # this run still shows in the results review.
+            review_path=review_path.resolve(),
         )
     except runner.RunError as exc:
         print(f"! {exc}")
@@ -298,8 +321,13 @@ def main(argv=None) -> int:
     # unexpected startup failure. The packaged launcher already provides the
     # equivalent exception handling and pause for its own console.
     pause = os.environ.pop("EXPERIMENT_GUI_RUN_PAUSE", "") == "1"
-    if not pause:
+    # The GUI also names a file to receive the exit code as soon as the run
+    # ends, so it can report the result without waiting for this window (or
+    # the packaged launcher's own pause) to be dismissed.
+    status_file = os.environ.pop("EXPERIMENT_GUI_RUN_STATUS", "")
+    if not pause and not status_file:
         return args.func(args)
+    code = 1          # reported if the run is interrupted (Ctrl+C, SystemExit)
     try:
         try:
             code = args.func(args)
@@ -308,11 +336,18 @@ def main(argv=None) -> int:
 
             traceback.print_exc()
             code = 1
+        code = int(code or 0)
     finally:
-        try:
-            input("\n  Press Enter to close this progress window ... ")
-        except (EOFError, KeyboardInterrupt, OSError):
-            pass
+        if status_file:
+            try:
+                Path(status_file).write_text(str(code), encoding="utf-8")
+            except OSError:
+                pass
+        if pause:
+            try:
+                input("\n  Press Enter to close this progress window ... ")
+            except (EOFError, KeyboardInterrupt, OSError):
+                pass
     return code
 
 

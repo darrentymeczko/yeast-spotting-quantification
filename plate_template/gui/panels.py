@@ -87,9 +87,8 @@ class ValidationPanel(ttk.Frame):
         )
         # Column widths are pixels, but the text in them scales with the
         # display, so fixed values clip their own headers on a scaled monitor.
-        # ttk's default row height does not scale either, so rows overlap.
+        # (Row height is the shared theme's, which scales with the font.)
         scale = max(1.0, self.winfo_fpixels("1i") / 96)
-        ttk.Style().configure("Treeview", rowheight=int(24 * scale))
         self.tree.heading("severity", text="")
         self.tree.heading("plate", text="Plate")
         self.tree.heading("message", text="Finding")

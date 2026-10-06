@@ -241,3 +241,19 @@ def test_pipeline_best_survives_a_missing_score():
                                        cand("real", 1.0, 1)])
     assert run.pipeline_best("GLU").timepoint == "real"
 
+
+def test_media_are_shown_by_the_experiments_name_not_the_code():
+    """GLUCOSE3 is a generated key; the person wrote "Glucose + 37C"."""
+    def cand(medium, label):
+        return Candidate(medium=medium, medium_label=label, timepoint="13 Hours",
+                         hours=13.0, plate1="a.JPG", plate2="b.JPG",
+                         dilution="least")
+
+    run = discovery.SetRun(results_dir=Path("."), label="x",
+                           candidates=[cand("GLUCOSE3", "Glucose + 37C"),
+                                       cand("GLU", "")])
+    assert run.medium_label("GLUCOSE3") == "Glucose + 37C"
+    # A console-pipeline run has no labels: its codes are all there is.
+    assert run.medium_label("GLU") == "GLU"
+    assert run.medium_label("NOT-RUN") == "NOT-RUN"
+

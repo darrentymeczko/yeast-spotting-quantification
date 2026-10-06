@@ -11,6 +11,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
+from uikit import tokens
+
 from .. import theme
 
 #: key, symbol, title, one-line instruction
@@ -80,7 +82,7 @@ class Tooltip:
         window.wm_attributes("-topmost", True)
         label = tk.Label(
             window, text=self.text, justify="left", wraplength=320,
-            background="#2f2f2f", foreground="#ffffff",
+            background=tokens.TEXT, foreground=tokens.TEXT_ON_ACCENT,
             padx=9, pady=5, borderwidth=0,
         )
         label.pack()
@@ -138,13 +140,13 @@ class Toolbar(ttk.Frame):
             Tooltip(button, f"{title}\n{hint}")
 
         self._separator()
-        tokens = ttk.Checkbutton(
+        token_view = ttk.Checkbutton(
             self, text="T", variable=show_tokens, command=on_tokens,
             style="Tool.Toolbutton",
         )
-        tokens.pack(side="left", padx=1)
+        token_view.pack(side="left", padx=1)
         Tooltip(
-            tokens,
+            token_view,
             "Show tokens  (Ctrl+T)\nReplace the drawing with the literal text "
             "that gets saved -- the quickest way to check a plate against the "
             "bench.",

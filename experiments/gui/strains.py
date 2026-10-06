@@ -17,6 +17,7 @@ from tkinter import ttk
 from typing import Callable
 
 from plate_template import theme
+from uikit import tokens
 
 
 class StrainPanel(ttk.Frame):
@@ -29,6 +30,9 @@ class StrainPanel(ttk.Frame):
         self.control = tk.IntVar(value=0)
         self._rows: list[tuple[int, tk.StringVar]] = []
         self._entries: dict[int, ttk.Entry] = {}
+        from .groups import GroupSelector
+        self.group_selector = GroupSelector(self, controller, on_change)
+        self.group_selector.pack(fill="x", pady=(0, 8))
 
         panes = ttk.PanedWindow(self, orient="horizontal")
         self.panes = panes
@@ -46,7 +50,7 @@ class StrainPanel(ttk.Frame):
             text=("Name each sample slot of the plate template. Leave a slot "
                   "blank if nothing was spotted there.\nThe control is the "
                   "strain every other one is reported relative to."),
-            foreground="#555", justify="left",
+            foreground=tokens.TEXT_MUTED, justify="left",
         )
         self.intro.pack(anchor="w", fill="x", pady=(0, 8))
         left.bind("<Configure>", lambda e: self.intro.configure(
@@ -94,12 +98,12 @@ class StrainPanel(ttk.Frame):
             command=self._choose_template)
         self.choose_template_button.pack(side="left")
         self.template_label = ttk.Label(
-            preview_bar, text="", foreground="#555", width=1, anchor="w")
+            preview_bar, text="", foreground=tokens.TEXT_MUTED, width=1, anchor="w")
         self.template_label.pack(side="left", fill="x", expand=True,
                                  padx=(10, 0))
 
         self.template_details = ttk.Label(
-            right, text="", foreground="#555", justify="left", anchor="nw",
+            right, text="", foreground=tokens.TEXT_MUTED, justify="left", anchor="nw",
         )
         self.template_details.pack(fill="x", pady=(0, 6))
         preview_area = ttk.Frame(right)
@@ -107,8 +111,8 @@ class StrainPanel(ttk.Frame):
         preview_area.columnconfigure(0, weight=1)
         preview_area.rowconfigure(0, weight=1)
         self.template_preview = tk.Canvas(
-            preview_area, highlightthickness=1, highlightbackground="#cfcfcf",
-            background="white", width=360, height=280,
+            preview_area, highlightthickness=1, highlightbackground=tokens.LINE,
+            background=tokens.SURFACE, width=360, height=280,
         )
         self.template_scroll = ttk.Scrollbar(
             preview_area, orient="horizontal", command=self.template_preview.xview)
@@ -130,7 +134,8 @@ class StrainPanel(ttk.Frame):
                 pass
 
     def refresh(self) -> None:
-        e = self.ctl.experiment
+        self.group_selector.refresh()
+        e = self.ctl.panel_experiment
         if self.ctl.template is not None:
             self.template_label.configure(
                 text=f"{self.ctl.template.name}  "
@@ -180,7 +185,7 @@ class StrainPanel(ttk.Frame):
         if template is None or width < 80 or height < 80:
             canvas.create_text(max(10, width // 2), max(10, height // 2),
                                text="Click here to choose a plate template",
-                               fill="#777", justify="center")
+                               fill=tokens.TEXT_MUTED, justify="center")
             return
 
         plates = template.plates
@@ -199,7 +204,7 @@ class StrainPanel(ttk.Frame):
                 )
             canvas.create_text(
                 left + 9, 18, text=plate.label or f"Plate {plate.id}",
-                anchor="w", fill="#444", tags=("plate", f"plate-{index}"),
+                anchor="w", fill=tokens.TEXT, tags=("plate", f"plate-{index}"),
             )
             if not plate.rows or not plate.cols:
                 continue
@@ -274,7 +279,7 @@ class StrainPanel(ttk.Frame):
                              borderwidth=0)
             chip.pack(side="left", padx=(0, 6))
             chip.create_rectangle(0, 0, 16, 16, fill=theme.slot_colour(slot, 1),
-                                  outline="#999")
+                                  outline=tokens.LINE_STRONG)
             ttk.Label(row, text=str(slot), width=3).pack(side="left")
 
             var = tk.StringVar()

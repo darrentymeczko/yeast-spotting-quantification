@@ -305,6 +305,38 @@ def coverage(files: list[ImageFile], profile: NamingProfile, mode: str) -> float
 def infer_profile(
     files: list[ImageFile], *, mode: str = TIMECOURSE
 ) -> tuple[NamingProfile, list[str]]:
+    """Suggest a reviewable layout, including mixed folder/filename metadata."""
+    from .names import HOURS, PLATE, treatment_label
+
+    profile, report = _infer_structure(files, mode=mode)
+    if not files:
+        return profile, report
+    if profile.name != "Flat filenames":
+        labels = [treatment_label(f.parts) for f in files]
+        # Keep the established capture layout when it fits. Otherwise read
+        # treatments independently of whether plate/time information exists.
+        compound = any(re.search(r"\b\d+(?:\.\d+)?C\b", v) for v in labels)
+        if any(labels) and (compound or coverage(files, profile, mode) < 1):
+            profile.rules = tuple(r for r in profile.rules if r.facet != "condition") + (
+                FacetRule("condition", "treatment", -1, (r"^(.+)$",), "code"),
+            )
+            report.append("Treatment suggestions combine folder and filename labels, including temperature and dosage. Review the full paths for omitted or ambiguous details.")
+        for facet, pattern, transform in (("plate", PLATE, "int"), ("timepoint", HOURS, "hours")):
+            if profile.rule_for(facet) is None and any(
+                re.search(pattern, "/".join(f.parts[:-1] + (Path(f.parts[-1]).stem,)), re.I)
+                for f in files
+            ):
+                profile.rules += (FacetRule(facet, "path", -1, (pattern,), transform),)
+                report.append(f"Explicit {facet} labels can be read anywhere in a path.")
+    labels = [apply_profile(f.parts, profile).get("condition_label", "") for f in files]
+    profile.aliases = _alias_table([v for v in labels if v])
+    report.append("Suggestions need review. R1/R2, bare photo numbers and camera counters do not identify template plates; dates and 'next day' do not establish elapsed hours.")
+    return profile, report
+
+
+def _infer_structure(
+    files: list[ImageFile], *, mode: str = TIMECOURSE
+) -> tuple[NamingProfile, list[str]]:
     """Work out what this folder layout means.
 
     Returns the profile and a plain-language report of what it decided, which
@@ -333,7 +365,7 @@ def infer_profile(
 
     for key in ("capture_tree", "flat_lab"):
         candidate = builtin(key)
-        if coverage(pool, candidate, mode) != 1.0:
+        if coverage(pool, candidate, QUANTIFY if key == "flat_lab" else mode) != 1.0:
             continue
         if mode == TIMECOURSE and not _timepoints_look_real(pool, candidate):
             # The layout fits, but the level the profile calls the timepoint
@@ -374,10 +406,6 @@ def infer_profile(
     if mode == TIMECOURSE:
         rest = [d for d in dir_depths if d != plate_depth]
         tp_depth = _best_slot(pool, rest, _HOURS_STRICT)
-        if tp_depth is None:
-            tp_depth = _best_slot(pool, rest, _BARE_NUMBER)
-            if tp_depth is not None and len(set(_texts_at(pool, tp_depth))) < 2:
-                tp_depth = None  # a single constant number is not a time course
         if tp_depth is not None:
             rules.append(
                 FacetRule("timepoint", "segment", tp_depth, HOURS_PATTERNS, "hours")
@@ -393,6 +421,13 @@ def infer_profile(
     remaining = [d for d in dir_depths if d not in used]
     if remaining:
         # Nearest the photo wins: the more specific label.
+        from .names import _DATE, _SESSION, _CAMERA
+        remaining = [d for d in remaining if not all(
+            _DATE.search(t) or _SESSION.fullmatch(t.strip())
+            or _CAMERA.fullmatch(t.strip()) or re.fullmatch(r"R\d+", t, re.I)
+            for t in _texts_at(pool, d)
+        )]
+    if remaining:
         cond_depth = max(remaining)
         rules.append(FacetRule("condition", "segment", cond_depth, (r"^(.+)$",), "code"))
         labels = sorted(set(_texts_at(pool, cond_depth)))
@@ -433,6 +468,8 @@ def _timepoints_look_real(files: list[ImageFile], profile: NamingProfile) -> boo
     texts = _texts_at(files, rule.depth)
     if _hit_rate(texts, _HOURS_STRICT) >= 0.9:
         return True
+    if all(t.strip() in ("25", "30", "37", "42") for t in texts):
+        return False  # common incubation temperatures need explicit hour units
     return len(set(texts)) >= 2
 
 
@@ -455,7 +492,7 @@ def _level_name(depth: int) -> str:
     return f"the folder {-depth - 1} levels above each photo"
 
 
-def _alias_table(labels: list[str]) -> dict[str, str]:
+def _alias_table(labels: list[str], existing: dict[str, str] | None = None) -> dict[str, str]:
     """Seed aliases so differently-spelled folders collapse onto one code.
 
     Starts from the built-in medium names, then adds any label that would
@@ -463,9 +500,25 @@ def _alias_table(labels: list[str]) -> dict[str, str]:
     "Potassium Acetate" and "k acetate" end up as the same condition.
     """
     table = dict(builtin("capture_tree").aliases)
-    for label in labels:
+    table.update(existing or {})
+    used = {value.casefold() for value in table.values()}
+    for label in sorted(set(labels), key=lambda s: (s.casefold(), s)):
         key = re.sub(r"\s+", " ", label.strip().lower())
-        table.setdefault(key, condition_code(label, table))
+        if key in table:
+            continue
+        canonical = next((v for v in table.values() if v.casefold() == key), None)
+        if canonical:
+            table[key] = canonical
+            continue
+        base = condition_code(label, {})
+        code = base
+        suffix = 2
+        # Short-code truncation must never pool distinct treatments.
+        while code.casefold() in used:
+            code = f"{base}-{suffix}"
+            suffix += 1
+        table[key] = code
+        used.add(code.casefold())
     return table
 
 
@@ -515,6 +568,13 @@ def _match_declared_condition(e: Experiment, facets: dict) -> None:
     def key(value) -> str:
         return re.sub(r"\s+", " ", str(value).strip()).casefold()
 
+    # A full label is more specific than a truncated generated code.
+    label = facets.get("condition_label")
+    matches = {c.code for c in e.conditions if label and
+               key(label) in (key(c.code), key(c.display()))}
+    if len(matches) == 1:
+        facets["condition"] = next(iter(matches))
+        return
     # Preserve an existing declared code, including a harmless case mismatch.
     code_matches = {c.code for c in e.conditions if key(c.code) == key(parsed)}
     if len(code_matches) == 1:
@@ -542,6 +602,8 @@ def resolve(e: Experiment, files: list[ImageFile]) -> Resolution:
     correction.
     """
     required = INFER_FACETS.get(e.mode, ())
+    if e.strain_groups:
+        required = (*required, "set")
     ignored = set(e.ignored)
     # An experiment with exactly one condition and no way to read one off the
     # path is not a failure: the whole folder is that condition. This is the
@@ -554,8 +616,12 @@ def resolve(e: Experiment, files: list[ImageFile]) -> Resolution:
 
     rows: list[PhotoRow] = []
     complaints: list[str] = []
+    # Newly added photographs must not collide with already saved short codes.
+    # Use a local profile: resolving a saved experiment is a read-only operation.
+    labels = [apply_profile(f.parts, e.profile).get("condition_label", "") for f in files]
+    profile = replace(e.profile, aliases=_alias_table([v for v in labels if v], e.profile.aliases))
     for f in files:
-        facets = apply_profile(f.parts, e.profile)
+        facets = apply_profile(f.parts, profile)
         _match_declared_condition(e, facets)
         for facet, value in e.overrides.get(f.relpath, {}).items():
             if facet.endswith("_label"):
@@ -570,7 +636,7 @@ def resolve(e: Experiment, files: list[ImageFile]) -> Resolution:
         missing = tuple(f_ for f_ in required if facets.get(f_) is None)
         if f.relpath in ignored:
             status = "ignored"
-        elif e.set_key is not None and facets.get("set") not in (None, e.set_key):
+        elif not e.strain_groups and e.set_key is not None and facets.get("set") not in (None, e.set_key):
             status = "other_set"
         elif missing:
             status = "unresolved"
@@ -616,17 +682,53 @@ def _number_shots(rows: list[PhotoRow]) -> list[PhotoRow]:
 # ---------------------------------------------------------------------------
 
 
-def check_resolution(e: Experiment, res: Resolution, template=None) -> list[Issue]:
+def group_resolution(res: Resolution, key: str) -> Resolution:
+    """Never let a missing group assignment leak into multiple panels."""
+    return Resolution(rows=[r for r in res.rows if r.set_key == key],
+                      complaints=list(res.complaints))
+
+
+def check_resolution(e: Experiment, res: Resolution, template=None,
+                     flagged_plates=None) -> list[Issue]:
     """Problems with what the photos turned out to be.
 
     Kept apart from `validate.validate` because this one needs the disk: the
     experiment can be checked on its own merits without a folder present.
+
+    `flagged_plates` (relpath -> reason) are the plates the data review marked
+    as bad; the multi-step analysis leaves them out, so it asks nothing of them.
     """
+    if e.strain_groups:
+        issues = []
+        unassigned = [r for r in res.rows if r.status != "ignored"
+                      and r.set_key not in e.strain_groups]
+        if unassigned:
+            issues.append(Issue(Severity.ERROR, "unassigned_strain_group",
+                                f"{len(unassigned)} photos have no defined strain group. "
+                                "Assign a strain group in Data, define the detected group on Panel, or ignore these photos."))
+        by_path = {r.relpath: r for r in res.rows}
+        for key in e.strain_groups:
+            panel = e.for_group(key)
+            for slots in panel.picks.values():
+                for path in slots.values():
+                    row = by_path.get(path)
+                    if row is None or row.set_key != key or row.status == "ignored":
+                        issues.append(Issue(Severity.ERROR, "wrong_group_pick",
+                                            f"Strain group {key!r}: picked photo {path!r} is not assigned to this group."))
+            issues.extend(replace(i, message=f"Strain group {key!r}: {i.message}")
+                          for i in check_resolution(panel, group_resolution(res, key),
+                                                    template, flagged_plates))
+        return issues
+
     if e.mode == QUANTIFY:
         # Nothing here is the authority in handpicked mode: the photographs are
         # chosen one at a time and `validate._check_picks` judges those. All the
         # folder can say is what is physically in it.
-        return _check_folder_contents(res)
+        from .multistep import design_errors
+        return _check_folder_contents(res) + [
+            Issue(Severity.ERROR, "multi_step_photos", m)
+            for m in design_errors(e, resolution=res,
+                                   flagged_plates=flagged_plates)]
 
     issues: list[Issue] = []
     usable = res.usable()
@@ -681,8 +783,9 @@ def check_resolution(e: Experiment, res: Resolution, template=None) -> list[Issu
                     "multiple_sets",
                     f"these photos span {len(sets)} different sets "
                     f"({', '.join(sets)}). Each set is its own strain panel and "
-                    f"they must never be pooled: either point at a single set's "
-                    f"folder, or choose which set this experiment is",
+                    f"they must never be pooled. Use Add strain group to define "
+                    f"each panel (with these exact group names), or point at a "
+                    f"single group's folder",
                 )
             )
 
@@ -723,6 +826,10 @@ def check_resolution(e: Experiment, res: Resolution, template=None) -> list[Issu
         )
 
     issues.extend(_check_plate_coverage(e, res, template))
+    from .multistep import design_errors
+    issues.extend(Issue(Severity.ERROR, "multi_step_photos", m)
+                  for m in design_errors(e, resolution=res,
+                                         flagged_plates=flagged_plates))
     return issues
 
 

@@ -119,10 +119,18 @@ def test_chosen_is_a_separate_folder(exported):
 def test_every_rebuilt_medium_is_in_one_csv(exported):
     import pandas as pd
 
+    from results_review.export import named_frames
+
     out = pd.read_csv(exported["result"].csv_path, encoding="utf-8-sig")
     got = set(out["experiment"].unique())
-    assert got == {f.experiment for f in exported["frames"]}, (
+    named = named_frames(exported["run"], exported["frames"])
+    assert got == {f.experiment for f in named}, (
         "all media must share one CSV, or R overwrites its own t-test table")
+    # Named in the experiment's words, not the treatments' generated codes.
+    run = exported["run"]
+    for f in exported["frames"]:
+        assert (f"{run.label} {run.medium_label(f.medium)} "
+                f"{f.candidate.timepoint}") in got
 
 
 def test_the_pipelines_columns_come_first(exported):

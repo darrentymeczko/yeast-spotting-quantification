@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import BUNDLE, REPO, geometry, intake, schema
-from .model import QUANTIFY, TIMECOURSE, Experiment
+from .model import DATA_OUTPUT, QUANTIFY, TIMECOURSE, Experiment
 
 SRC = REPO / "src"
 # Packaged, this is also what lets an edit to `src/` take effect without a
@@ -107,6 +107,8 @@ def to_pipeline_config(e: Experiment) -> dict:
     `medium_cfg` reads. The per-condition control lands in `media`, which is the
     seam the branch added for it; nothing in the pipeline needs to change.
     """
+    if e.strain_groups:
+        raise RunError("Choose a single strain-group view before building a pipeline config.")
     media = {}
     for c in e.conditions:
         media[c.code] = {
@@ -128,6 +130,8 @@ def to_shots(e: Experiment, res: intake.Resolution):
     Only photos for a declared condition are handed over: an undeclared one has
     no control and no strain names, and `check_resolution` has already said so.
     """
+    if e.strain_groups:
+        raise RunError("Split strain groups before creating timecourse shots.")
     _, tc = _pipeline()
     root = Path(e.photo_root)
     declared = set(e.condition_codes())
@@ -157,6 +161,8 @@ def to_photo_refs(e: Experiment, res: "intake.Resolution | None" = None):
     read, which is what a migrated `spotting_config.json` relies on -- its
     photos were never picked in a window, they were named on disk.
     """
+    if e.strain_groups:
+        raise RunError("Split strain groups before creating plate references.")
     if e.picks:
         return _refs_from_picks(e)
     if res is None:
@@ -247,22 +253,36 @@ def default_results_dir(e: Experiment) -> Path:
 HANDOFF_NAME = "experiment.json"
 
 
+def review_plates(review) -> dict:
+    """relpath -> reason for the plates a data review flagged (none without one)."""
+    if review is None:
+        return {}
+    return {path: flag.reason for path, flag in review.plates.items()}
+
+
 def write_handoff(e: Experiment, res: intake.Resolution, outdir: Path,
-                  layout=None) -> Path:
+                  layout=None, review=None, review_path=None) -> Path:
     """Record what was run, for the review tool to read.
 
     A resolved snapshot, not a reference: the experiment file may be edited
     again tomorrow, and the results folder has to keep saying what produced it.
+
+    `review` is the experiment's data review (`data_review.flags.DataFlags`)
+    and `review_path` where it is saved. Both are recorded: the snapshot says
+    what was flagged when this ran, and the path lets the results review show
+    flags made since.
     """
     sb, _ = _pipeline()
     photos = [
         {
             "relpath": r.relpath,
             "condition": r.condition,
+            "condition_label": e.condition(r.condition).display(),
             "timepoint": r.timepoint,
             "timepoint_label": r.timepoint_label,
             "plate": r.plate,
             "shot": r.shot,
+            "strain_group": r.set_key or e.set_key,
         }
         for r in res.usable()
         if r.condition in set(e.condition_codes())
@@ -284,6 +304,7 @@ def write_handoff(e: Experiment, res: intake.Resolution, outdir: Path,
         # could only assume the classic three.
         "pipeline_config": {
             **to_pipeline_config(e),
+            "resolved_photos": photos,
             **({"dilution_layout": layout.to_dict()}
                if layout is not None and not layout.is_classic() else {}),
         },
@@ -296,6 +317,10 @@ def write_handoff(e: Experiment, res: intake.Resolution, outdir: Path,
         # manual (see the README), so recording it is how a stale results
         # folder can later be told apart from a current one.
         "cache_key_version": _cache_tag(sb),
+        "data_review": {
+            "file": str(review_path) if review_path else "",
+            "flags": review.to_dict() if review is not None else None,
+        },
     }
     outdir.mkdir(parents=True, exist_ok=True)
     path = outdir / HANDOFF_NAME
@@ -355,21 +380,245 @@ def _timecourse_args(outdir: Path, **overrides) -> Namespace:
 
 def run(e: Experiment, *, outdir: Path | None = None, estimate: bool = False,
         workers: int | None = None, res: intake.Resolution | None = None,
-        template=None) -> int:
-    """Run this experiment. Returns the pipeline's exit code."""
+        template=None, review=None, review_path=None) -> int:
+    """Run this experiment. Returns the pipeline's exit code.
+
+    `review` is the experiment's data review (`data_review.flags.DataFlags`),
+    if it has one. The multi-step analysis excludes what it flags; the endpoint
+    analysis is left exactly as it is, and only records the flags beside its
+    results so the results review can mark them.
+    """
     if res is None:
         res = prepare(e)
     outdir = Path(outdir) if outdir else default_results_dir(e)
+    flagged = review_plates(review)
 
+    if e.strain_groups:
+        # Split BEFORE creating shots: Shot itself has no strain-group axis.
+        # Each child keeps its own config, normalisation and review snapshot.
+        from hashlib import sha256
+        from .validate import blocking, validate
+        if template is None:
+            template = load_template(e)
+        errors = blocking(validate(e, template)
+                          + intake.check_resolution(e, res, template, flagged))
+        if errors:
+            raise RunError("\n".join(i.message for i in errors))
+        _, tc = _pipeline()
+        codes = []
+        for key in e.strain_groups:
+            # Hash prevents names sanitising to the same folder on Windows.
+            folder = f"group-{tc.safe_dirname(key)[:60]}-{sha256(key.encode('utf-8')).hexdigest()[:12]}"
+            print(f"\n  Strain group: {key}")
+            # Flags are keyed by photo, so every group's run reads the same set.
+            codes.append(run(e.for_group(key), outdir=outdir / folder,
+                             estimate=estimate, workers=workers,
+                             res=intake.group_resolution(res, key), template=template,
+                             review=review, review_path=review_path))
+        return next((code for code in codes if code), 0)
+
+    handoff = {"review": review, "review_path": review_path}
     if e.mode == TIMECOURSE:
-        return _run_timecourse(e, res, outdir, estimate=estimate, workers=workers,
-                               template=template)
-    if e.mode == QUANTIFY:
-        return _run_quantify(e, res, outdir, estimate=estimate, template=template)
-    raise RunError(f"unknown mode {e.mode!r}")
+        runner = lambda: _run_timecourse(e, res, outdir, estimate=estimate,
+                                         workers=workers, template=template,
+                                         **handoff)
+    elif e.mode == QUANTIFY:
+        runner = lambda: _run_quantify(e, res, outdir, estimate=estimate,
+                                       template=template, **handoff)
+    else:
+        raise RunError(f"unknown mode {e.mode!r}")
+    if e.multi_step.enabled:
+        from .multistep import design_errors, exclusions, selected_rows
+        if template is None:
+            template = load_template(e)
+        errors = design_errors(e, template, res, flagged)
+        if template is None:
+            errors.append("Multi-step analysis requires a plate template.")
+        if errors:
+            raise RunError("\n".join(errors))
+        selected = selected_rows(e, res)
+        left_out = exclusions(e, flagged)
+        print(f"  Additional {e.multi_step.method} analysis: "
+              f"{len(selected)} selected photographs, "
+              f"{len(e.multi_step.hours)} timepoint(s).")
+        if review is not None:
+            by_review = sum(1 for r in selected if r.relpath in flagged)
+            spots = sum(len(review.spots_on(r.relpath)) for r in selected
+                        if r.relpath not in left_out)
+            print(f"  Data review: {by_review} flagged plate(s) and {spots} "
+                  f"flagged spot(s) are left out of it.")
+        if not estimate:
+            # The legacy runner only honours a custom directory if it exists.
+            outdir.mkdir(parents=True, exist_ok=True)
+    baseline_path = outdir / ("best" if e.is_timecourse else "") / "spotting_results_normalized.csv"
+    previous_baseline_time = baseline_path.stat().st_mtime_ns if baseline_path.exists() else None
+    code = runner()
+    if e.multi_step.enabled and not estimate:
+        # Missing legacy candidates must not discard a valid additional analysis.
+        # Its graph simply has no current-endpoint marker when no baseline exists.
+        fresh_baseline = (baseline_path.exists()
+                          and baseline_path.stat().st_mtime_ns != previous_baseline_time)
+        run_multi_step(e, res, template, outdir,
+                       include_baseline=(code == 0 and fresh_baseline),
+                       review=review)
+    return code
 
 
-def _run_timecourse(e, res, outdir, *, estimate, workers, template=None) -> int:
+def measure_multi_step(e, res, template, review=None):
+    """One measurement per actual physical plate/time; no candidate products.
+
+    Read the same cached pixels as the current pipeline. Keep technical failure
+    records; do not apply statistical outlier deletion to this additional path.
+
+    What the data review flagged is excluded with its reason: a flagged plate
+    like a photo excluded in the dialog, a flagged spot like an image artifact
+    -- which also invalidates any contrast that used it as the matched control.
+    """
+    import pandas as pd
+    import numpy as np
+    import spotting_quant as sq
+    from .multistep import exclusions, selected_rows
+    sb, tc = _pipeline()
+    layout = to_layout(template, e.photo_top)
+    level = layout.levels[e.multi_step.dilution]
+    cache = sb.PROJECT_ROOT / sb.CACHE_DIR
+    root = Path(e.photo_root)
+    observations = []
+    selected = selected_rows(e, res)
+    excluded = exclusions(e, review_plates(review))
+    for n, row in enumerate(selected, 1):
+        reason = excluded.get(row.relpath, "")
+        data = None
+        floor = sq.MIN_CONTROL_GRAY
+        if not reason:
+            try:
+                data = tc._cached_measure(root / row.relpath, row.plate,
+                                          level.quant_rows(row.plate), cache, layout)
+                floor = max(sq.MIN_CONTROL_GRAY,
+                            sq.CONTROL_NOISE_MULT * sq.bg_noise(data.bg_samples))
+            except Exception as exc:
+                reason = f"measurement failed: {type(exc).__name__}: {exc}"
+        label = e.multi_step.plate_ids.get(row.relpath, "unassigned excluded plate")
+        physical = json.dumps([e.set_key or e.name, row.condition, row.plate, label], ensure_ascii=False)
+        # An excluded duplicate must remain auditable without becoming a second
+        # observation of the same biological spot in the statistical input.
+        if reason:
+            physical = json.dumps([physical, "excluded", row.relpath], ensure_ascii=False)
+        for cell in level.cells(row.plate):
+            strain = e.strain(cell.slot)
+            if not strain:
+                continue
+            reasons = [reason] if reason else []
+            if cell.slot in e.exclude_for(row.condition):
+                reasons.append("strain excluded in experiment")
+            if data is not None and data.rim[cell.row, cell.col]:
+                reasons.append("image artifact / unreliable ROI")
+            # Level cells are photograph-grid cells, as the review keys them.
+            flagged = (review.spot_reason(row.relpath, cell.row + 1, cell.col + 1)
+                       if review is not None else "")
+            if flagged:
+                reasons.append(f"data review: {flagged}")
+            observations.append({
+                "condition": row.condition, "strain": strain, "strain_col": cell.slot,
+                "replicate": f"rep{cell.replicate}", "template_plate": row.plate,
+                "technical_plate": label, "physical_plate": physical,
+                "hours": row.timepoint, "dilution": e.multi_step.dilution,
+                "image": row.relpath, "row": cell.row + 1, "column": cell.col + 1,
+                "raw_growth": float(data.net[cell.row, cell.col]) if data is not None else np.nan,
+                "detection_limit": floor, "is_control": cell.slot == e.control_for(row.condition),
+                "qc_reason": "; ".join(reasons)})
+        print(f"  Multi-step measurements: {n}/{len(selected)}", flush=True)
+    if not observations:
+        raise RunError("No spots available for multi-step analysis.")
+    return pd.DataFrame(observations)
+
+
+def _multi_step_baseline(e, res, outdir):
+    """Map the legacy endpoint to its actual hour, not an inferred photo order."""
+    import pandas as pd
+    location = Path(outdir) / ("best" if e.is_timecourse else "") / "spotting_results_normalized.csv"
+    if not location.exists():
+        return None
+    baseline = pd.read_csv(location)
+    baseline["hours"] = float("nan")
+    if e.is_timecourse:
+        for row in res.usable():
+            label = f"{e.name} {row.condition} {row.timepoint_label or f'{row.timepoint:g} Hours'}"
+            match = baseline["treatment"] == label
+            baseline.loc[match, "hours"] = row.timepoint
+            baseline.loc[match, "treatment"] = row.condition
+    else:
+        by_path = {r.relpath: r for r in res.usable()}
+        for c in e.conditions:
+            picked_hours = {by_path[p].timepoint for p in e.picked_plates(c.code).values() if p in by_path}
+            if len(picked_hours) == 1 and None not in picked_hours:
+                baseline.loc[baseline.treatment == c.code, "hours"] = next(iter(picked_hours))
+    return baseline
+
+
+def run_multi_step(e, res, template, outdir, *, include_baseline=True, review=None):
+    """Technical-only analysis of several hours runs once per hour; repeated measures runs once."""
+    s = e.multi_step
+    if s.scope == "technical" and len(s.hours) > 1:
+        from dataclasses import replace
+        observations = measure_multi_step(e, res, template, review)
+        destination = None
+        for h in s.hours:
+            single = replace(s, hours=(h,))
+            part = observations[observations.hours == h]
+            if part.empty:
+                continue
+            print(f"  Technical-replicate analysis at {h:g} h", flush=True)
+            destination = _run_multi_step_once(e, res, outdir, single, part, include_baseline,
+                                               suffix=f"-{h:g}h", review=review)
+        return destination
+    return _run_multi_step_once(e, res, outdir, s, measure_multi_step(e, res, template, review),
+                                include_baseline, review=review)
+
+
+def _run_multi_step_once(e, res, outdir, settings, observations, include_baseline, suffix="",
+                         review=None):
+    import spotting_multistep as multi
+    from .multistep import to_dict
+    print("  Fitting additional multi-step analysis ...", flush=True)
+    result = multi.analyze(observations, settings, e.statistics.alpha)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    destination = Path(outdir) / "multi_step" / f"{stamp}-{settings.scope}-{settings.method}{suffix}"
+    baseline = _multi_step_baseline(e, res, outdir) if include_baseline else None
+    multi.write_results(result, destination, settings, e.statistics.alpha, baseline)
+    # Record selection/exclusion even for ignored or unresolved photos, which
+    # cannot produce a measurement row. Never erase a previous analysis run.
+    from .multistep import exclusions, selected_rows
+    selected = {r.relpath for r in selected_rows(e, res)}
+    excluded = exclusions(e, review_plates(review))
+    selection = [{"image": r.relpath, "status": r.status,
+                  "selected": r.relpath in selected,
+                  "technical_plate": e.multi_step.plate_ids.get(r.relpath),
+                  "exclusion_reason": excluded.get(r.relpath, ""),
+                  "data_review_spots": (len(review.spots_on(r.relpath))
+                                        if review is not None else 0)}
+                 for r in res.rows]
+    (destination / "selection.json").write_text(json.dumps(selection, indent=2, ensure_ascii=False), encoding="utf-8")
+    (destination / "experiment.json").write_text(schema.dumps_experiment(e), encoding="utf-8")
+    if review is not None:
+        # The flags exactly as they stood for this analysis: the review file
+        # beside the experiment goes on changing, this record must not.
+        (destination / "data_review.json").write_text(
+            json.dumps(review.to_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+    latest = Path(outdir) / "multi_step" / "latest.json"
+    temp = latest.with_suffix(".tmp")
+    temp.write_text(json.dumps({"directory": destination.name, "settings": to_dict(settings)}, indent=2), encoding="utf-8")
+    os.replace(temp, latest)
+    for diagnostic in result.diagnostics:
+        if diagnostic["status"] != "ok":
+            print(f"  ! {diagnostic['condition']} / {diagnostic['strain']}: {diagnostic['reason']}")
+    print(f"  Additional graphs and statistics: {destination}")
+    return destination
+
+
+def _run_timecourse(e, res, outdir, *, estimate, workers, template=None,
+                    review=None, review_path=None) -> int:
     _, tc = _pipeline()
     if template is None:
         template = load_template(e)
@@ -383,13 +632,51 @@ def _run_timecourse(e, res, outdir, *, estimate, workers, template=None) -> int:
 
     cfg = to_pipeline_config(e)
     tree = tc.Tree(path=Path(e.photo_root), label=e.name, set_hint=e.set_key)
-    args = _timecourse_args(outdir, estimate=estimate, workers=workers)
+    # Data only: every candidate is still scored and ranked, and the best
+    # per medium still gets its per-spot CSV -- only the sheets are not drawn.
+    figures = "none" if e.output == DATA_OUTPUT else None
+    args = _timecourse_args(outdir, estimate=estimate, workers=workers,
+                            figures=figures)
     _configure_timecourse_workers(tc, args)
 
-    code = tc.run_one(tree, args, cfg, multi=False, shots=shots, layout=layout)
+    code = tc.run_one(tree, args, cfg, multi=False, shots=shots, layout=layout,
+                      statistics=e.statistics.plot_kwargs())
     if code == 0 and not estimate:
-        write_handoff(e, res, outdir, layout=layout)
+        write_handoff(e, res, outdir, layout=layout, review=review,
+                      review_path=review_path)
+        seed_review_statistics(e, outdir)
     return code
+
+
+#: The review tool's own file, beside the results. Named here rather than
+#: imported so the bridge does not depend on the review package.
+REVIEW_NAME = "review.json"
+
+
+def seed_review_statistics(e: Experiment, outdir: Path) -> Path:
+    """Start the review tool on the tests this run's figures were drawn with.
+
+    Only the `statistics` block is written; picks and spot edits already in a
+    `review.json` are kept. Without this the review tool would open on its own
+    defaults and disagree with the figures it is showing.
+    """
+    path = Path(outdir) / REVIEW_NAME
+    data: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+    data.setdefault("version", 1)
+    data["statistics"] = e.statistics.review_dict()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def _configure_timecourse_workers(tc, args) -> None:
@@ -434,8 +721,14 @@ def _measure_all_serial(tc, jobs, *, timing=False):
         print(f"\r    {done_n}/{total}", end="", flush=True)
     print()
 
+    wall = time.perf_counter() - started
+    if not errors:    # as tc.measure_all: a failure would make it look fast
+        import spotting_estimate as est
+
+        est.record_measure(sum(1 for _, cached in elapsed if not cached),
+                           wall, 1)
+
     if timing:
-        wall = time.perf_counter() - started
         fresh = sorted(seconds for seconds, cached in elapsed if not cached)
         hits = sum(1 for _, cached in elapsed if cached)
         print(f"    timing: {wall / 60:.1f} min wall-clock on 1 worker(s) "
@@ -556,15 +849,19 @@ def load_template(e: Experiment):
     return None
 
 
-def _run_quantify(e, res, outdir, *, estimate, template=None) -> int:
+def _run_quantify(e, res, outdir, *, estimate, template=None, review=None,
+                  review_path=None) -> int:
     """Measure the chosen photos once and write the tidy data and figures.
 
     The same sequence `spotting_batch.main` runs, with the answers taken from
     the experiment instead of from console prompts.
     """
+    import time
+
     import pandas as pd
 
     sb, _ = _pipeline()
+    import spotting_estimate as est
     import spotting_quant as sq
 
     if template is None:
@@ -597,17 +894,48 @@ def _run_quantify(e, res, outdir, *, estimate, template=None) -> int:
             f"scored per plate and it cannot be picked for you"
         )
 
+    def options(code, ref):
+        """The options this plate is measured, and so cached, under."""
+        plate_id = str(ref.plate)
+        index = resolved_level(e, template, code, plate_id)
+        # The rows this level occupies on THIS plate, read off the design.
+        # `spotting_quant` sizes its measuring ROI to fit them, and accepts
+        # however many there are -- one per plate, two, or more.
+        rows = geometry.oriented_rows_for(
+            template, plate_id, index, e.photo_top
+        )
+        # `replace` rather than mutating the instance: the pipeline's own
+        # idiom (spotting_timecourse.py:1764), and it keeps the options
+        # hashable for the cache key.
+        #
+        # The lattice to look for comes from the template too. The engine
+        # derives the expected spot pitch from it, so a 12x16 design is
+        # found at a 12x16 pitch rather than being read as a sparse 8x6.
+        grid_rows, grid_cols = geometry.oriented_grid_shape(
+            template, e.photo_top
+        )
+        return replace(sq.MeasureOptions(), quant_rows=rows,
+                       n_rows=grid_rows, n_cols=grid_cols)
+
     cache = sb.PROJECT_ROOT / sb.CACHE_DIR
     n_photos = sum(len(refs) for refs in combos.values())
     print(f"\n  {n_photos} photo(s) in {len(combos)} condition(s)")
+    # Checked with the options each plate is really measured under: the grid
+    # is part of the cache key, so a default-options check miscounts any
+    # design that is not 8x6.
+    todo = sum(
+        1 for combo, refs in combos.items() for ref in refs
+        if not (cache / f"{sb._cache_key(ref.path, options(combo.split('|', 1)[1], ref))}.npz").exists()
+    )
     if estimate:
-        opts = sq.MeasureOptions()
-        todo = sum(
-            1 for refs in combos.values() for ref in refs
-            if not (cache / f"{sb._cache_key(ref.path, opts)}.npz").exists()
-        )
-        print(f"  {todo} not yet cached; at ~{60} s each that is about "
-              f"{todo * 60 / 60:.0f} min")
+        # Plates are measured one at a time here, then one graph is drawn per
+        # condition.
+        per_photo, _ = est.measure_s(1)
+        graphs = 0 if e.output == DATA_OUTPUT else len(combos)
+        seconds = todo * per_photo + graphs * est.GRAPH_S + est.OVERHEAD_S
+        print(f"  {todo} not yet cached; measured one at a time at "
+              f"~{per_photo:.0f} s each, the run takes about "
+              f"{est.format_minutes(seconds)}")
         return 0
 
     cache.mkdir(parents=True, exist_ok=True)
@@ -615,38 +943,19 @@ def _run_quantify(e, res, outdir, *, estimate, template=None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     frames = []
+    started = time.perf_counter()
     for combo in sb.sort_combos(combos):
         refs = combos[combo]
         code = combo.split("|", 1)[1]
         print(f"\n  {combo}: measuring {len(refs)} plate(s) ...")
 
-        plates = []
-        for ref in refs:
-            plate_id = str(ref.plate)
-            index = resolved_level(e, template, code, plate_id)
-            # The rows this level occupies on THIS plate, read off the design.
-            # `spotting_quant` sizes its measuring ROI to fit them, and accepts
-            # however many there are -- one per plate, two, or more.
-            rows = geometry.oriented_rows_for(
-                template, plate_id, index, e.photo_top
-            )
-            # `replace` rather than mutating the instance: the pipeline's own
-            # idiom (spotting_timecourse.py:1764), and it keeps the options
-            # hashable for the cache key.
-            #
-            # The lattice to look for comes from the template too. The engine
-            # derives the expected spot pitch from it, so a 12x16 design is
-            # found at a 12x16 pitch rather than being read as a sparse 8x6.
-            grid_rows, grid_cols = geometry.oriented_grid_shape(
-                template, e.photo_top
-            )
-            opts = replace(sq.MeasureOptions(), quant_rows=rows,
-                           n_rows=grid_rows, n_cols=grid_cols)
-            plates.append((plate_id, sb.measure(ref, opts, cache)))
+        plates = [(str(ref.plate), sb.measure(ref, options(code, ref), cache))
+                  for ref in refs]
 
         tidy = build_tidy(e, template, code, plates)
         if not tidy.empty:
             frames.append(tidy)
+    est.record_measure(todo, time.perf_counter() - started, 1)
 
     if not frames:
         print("  Nothing could be quantified.", file=sys.stderr)
@@ -658,7 +967,14 @@ def _run_quantify(e, res, outdir, *, estimate, template=None) -> int:
     tidy.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"\n  wrote {csv_path}")
 
-    sb.run_plots(csv_path, outdir)
+    if e.output == DATA_OUTPUT:
+        # The CSV already holds both raw_growth (grey value) and
+        # relative_growth (normalised to the control); nothing is drawn.
+        print("  data only: graphs, charts and statistics were not made")
+        write_handoff(e, res, outdir, review=review, review_path=review_path)
+        return 0
+
+    sb.run_plots(csv_path, outdir, **e.statistics.plot_kwargs())
     sb.write_condition_matrix(outdir)
-    write_handoff(e, res, outdir)
+    write_handoff(e, res, outdir, review=review, review_path=review_path)
     return 0

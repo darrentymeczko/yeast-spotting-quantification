@@ -6,11 +6,13 @@ setter on its own.
 """
 
 import pytest
+from copy import deepcopy
+from pathlib import Path
 
 from experiments import intake, schema
 from experiments.gui.controller import ExperimentController, UndoStack
-from experiments.model import QUANTIFY, TIMECOURSE, Condition, Experiment
-from experiments.profiles import capture_tree
+from experiments.model import QUANTIFY, TIMECOURSE, Condition, Experiment, MultiStepAnalysis
+from experiments.profiles import capture_tree, NamingProfile
 
 
 @pytest.fixture
@@ -214,8 +216,11 @@ def test_every_edit_can_be_undone(ctl, action):
     before = schema.to_dict(ctl.experiment)
     assert action(ctl) is True
     assert schema.to_dict(ctl.experiment) != before
+    after = ctl.snapshot()
     ctl.undo()
     assert schema.to_dict(ctl.experiment) == before
+    ctl.redo()
+    assert ctl.snapshot() == after
 
 
 def test_undo_then_redo_returns_to_the_edited_state(ctl):
@@ -308,3 +313,146 @@ def test_a_plate_missing_everywhere_is_not_reported_as_incomplete(ctl):
 def _plate_two_at(ctl, timepoint: str) -> list[str]:
     return [f.relpath for f in ctl.files
             if "Plate 2" in f.relpath and timepoint in f.relpath]
+
+
+@pytest.mark.parametrize("name, action", [
+    ("template", lambda c: c.bind_template(Path(__file__).resolve().parents[2] / "plate_template/templates/lab_standard_8x6.json")),
+    ("orientation", lambda c: c.set_photo_top("left")),
+    ("output", lambda c: c.set_output("data")),
+    ("statistics", lambda c: c.set_statistics(alpha=.01)),
+    ("multistep", lambda c: c.set_multi_step(MultiStepAnalysis(hours=(16.,)))),
+    ("named_condition", lambda c: c.add_named_condition("New treatment")),
+    ("condition_name", lambda c: c.set_condition_name("GLU", "New name")),
+    ("condition_code", lambda c: c.rename_condition("GLU", "NEW", "New name")),
+    ("assign_treatment", lambda c: c.assign_treatment([c.files[0].relpath], "New treatment")),
+    ("profile", lambda c: c.set_profile(NamingProfile("Manual organization"))),
+    ("detect", lambda c: c.detect_organization()),
+    ("override", lambda c: c.override(c.files[0].relpath, "plate", 9)),
+    ("bulk_override", lambda c: c.override_many([f.relpath for f in c.files], "timepoint", 99)),
+    ("ignore", lambda c: c.set_ignored([c.files[0].relpath], True)),
+    ("pick", lambda c: c.set_pick("GLU", "1", c.files[0].relpath)),
+    ("dilution", lambda c: c.set_plate_dilution("GLU", "1", 0)),
+    ("groups", lambda c: c.add_strain_group("B", first_key="A")),
+])
+def test_remaining_edits_restore_model_and_derived_photos(ctl, name, action):
+    if name == "detect":
+        ctl.experiment.profile = NamingProfile()
+        ctl.reresolve()
+    before, rows = ctl.snapshot(), deepcopy(ctl.resolution)
+    action(ctl)
+    after, after_rows = ctl.snapshot(), deepcopy(ctl.resolution)
+    assert before != after, name
+    ctl.undo()
+    assert ctl.snapshot() == before, name
+    assert ctl.resolution == rows, name
+    if name == "template":
+        assert ctl.template is None and ctl.plate_ids() == []
+    ctl.redo()
+    assert ctl.snapshot() == after, name
+    assert ctl.resolution == after_rows, name
+    if name == "template":
+        assert ctl.template is not None and ctl.plate_ids()
+
+
+def test_folder_change_is_one_complete_undo_step(ctl, tmp_path):
+    from experiments.model import MultiStepAnalysis
+    from experiments.profiles import NamingProfile
+    ctl.add_strain_group("B", first_key="A")
+    ctl.experiment.strain_groups["A"].picks = {"GLU": {"1": "old.JPG"}}
+    ctl.experiment.multi_step = MultiStepAnalysis(plate_ids={"old.JPG": "A"},
+                                               excluded_photos={"bad.JPG": "blur"})
+    ctl.experiment.profile = NamingProfile()
+    ctl.reresolve()
+    before, rows = ctl.snapshot(), deepcopy(ctl.resolution)
+    # A sibling, not a new subtree of the old root: rescanning legitimately
+    # discovers any files added below the old root since the snapshot.
+    other_root = tmp_path.parent / (tmp_path.name + "-other")
+    other = other_root / "24 Hours" / "Glycerol" / "Plate 1"
+    other.mkdir(parents=True)
+    (other / "photo.JPG").write_bytes(b"x")
+    ctl.set_photo_root(other_root, adopt_conditions=True)
+    after = ctl.snapshot()
+    assert ctl.experiment.has_condition("GLY")
+    assert not ctl.experiment.strain_groups["A"].picks
+    assert not ctl.experiment.multi_step.plate_ids
+    ctl.undo()
+    assert ctl.snapshot() == before
+    assert ctl.resolution == rows
+    ctl.redo()
+    assert ctl.snapshot() == after
+
+
+def test_reread_inference_is_undoable_and_does_not_reinfer_on_undo(ctl):
+    from experiments.profiles import NamingProfile
+    ctl.experiment.profile = NamingProfile()
+    ctl.reresolve()
+    before = ctl.snapshot()
+    ctl.rescan()
+    after = ctl.snapshot()
+    assert before != after
+    ctl.undo()
+    assert ctl.snapshot() == before
+    ctl.redo()
+    assert ctl.snapshot() == after
+
+
+def test_relative_template_is_reloaded_using_experiment_directory(ctl, tmp_path):
+    from plate_template import presets, schema as tschema
+    tschema.save(presets.lab_standard_8x6(), tmp_path / "local.json", bump_revision=False)
+    ctl.experiment.template_path = "local.json"
+    ctl.load_template(tmp_path)
+    original = tschema.to_dict(ctl.template)
+    tschema.save(presets.blank(), tmp_path / "other.json", bump_revision=False)
+    ctl.bind_template(tmp_path / "other.json")
+    ctl.undo()
+    assert tschema.to_dict(ctl.template) == original
+    ctl.redo()
+    assert ctl.template.name != original["name"]
+
+
+def test_compound_edits_are_one_undo_step(ctl):
+    before = ctl.snapshot()
+    with ctl.transaction("Compound action"):
+        ctl.add_strain_group("B", first_key="A")
+        ctl.set_name("New")
+    after = ctl.snapshot()
+    assert ctl.undo() == "Compound action"
+    assert ctl.snapshot() == before
+    ctl.redo()
+    assert ctl.snapshot() == after
+
+
+def test_reselecting_same_folder_adopts_conditions_in_one_step(ctl):
+    ctl.remove_condition("GLU")
+    before = ctl.snapshot()
+    assert ctl.set_photo_root(Path(ctl.experiment.photo_root), adopt_conditions=True)
+    assert ctl.experiment.has_condition("GLU")
+    ctl.undo()
+    assert ctl.snapshot() == before
+
+
+@pytest.mark.parametrize("action", ["adopt", "include", "clear_one", "clear_many", "clear_treatment", "clear_pick"])
+def test_restoring_and_clearing_actions_are_also_undoable(ctl, action):
+    path = ctl.files[0].relpath
+    if action == "adopt":
+        ctl.remove_condition("GLU")
+        edit = ctl.adopt_found_conditions
+    elif action == "include":
+        ctl.set_ignored([path], True)
+        edit = lambda: ctl.set_ignored([path], False)
+    elif action in ("clear_one", "clear_many"):
+        ctl.override(path, "plate", 9)
+        edit = (lambda: ctl.override(path, "plate", None)) if action == "clear_one" else (lambda: ctl.override_many([path], "plate", None))
+    elif action == "clear_treatment":
+        ctl.assign_treatment([path], "New treatment")
+        edit = lambda: ctl.assign_treatment([path], "")
+    else:
+        ctl.set_pick("GLU", "1", path)
+        edit = lambda: ctl.set_pick("GLU", "1", None)
+    before = ctl.snapshot()
+    assert edit()
+    after = ctl.snapshot()
+    ctl.undo()
+    assert ctl.snapshot() == before
+    ctl.redo()
+    assert ctl.snapshot() == after

@@ -24,6 +24,8 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Callable
 
+from uikit import tokens
+
 from .imaging import ImageCache, unreadable_reason
 
 #: Longest edge of the preview. Big enough to judge whether a row of spots is
@@ -40,13 +42,16 @@ class PlatePicker(ttk.Frame):
         self.dilution = tk.StringVar(value="")
         self._showing: str = ""      # relpath currently in the preview
         self._levels: list[str] = []
+        from .groups import GroupSelector
+        self.group_selector = GroupSelector(self, controller, on_change)
+        self.group_selector.pack(fill="x", pady=(0, 8))
 
         self.intro = ttk.Label(
             self,
             text=("Choose the photograph for each plate, then the dilution row "
                   "to score on it.\nEach plate has its own level: every spot is "
                   "compared to the control on its own plate."),
-            foreground="#555", justify="left",
+            foreground=tokens.TEXT_MUTED, justify="left",
         )
         self.intro.pack(anchor="w", fill="x", pady=(0, 8))
         self.bind("<Configure>", lambda e: self.intro.configure(
@@ -91,7 +96,7 @@ class PlatePicker(ttk.Frame):
         self.slots.grid(row=0, column=0, sticky="nsew")
         slot_scroll.grid(row=0, column=1, sticky="ns")
         slot_x_scroll.grid(row=1, column=0, sticky="ew")
-        self.slots.tag_configure("empty", foreground="#b3261e")
+        self.slots.tag_configure("empty", foreground=tokens.ERROR)
         self.slots.bind("<<TreeviewSelect>>", self._slot_selected)
 
         ttk.Label(left, text="Photographs in the folder",
@@ -118,14 +123,14 @@ class PlatePicker(ttk.Frame):
         self.caption.pack(anchor="w", fill="x")
 
         self.preview = ttk.Label(right, anchor="center", justify="center",
-                                 foreground="#777")
+                                 foreground=tokens.TEXT_MUTED)
         self.preview.pack(fill="both", expand=True, pady=(4, 6))
 
         nav = ttk.Frame(right)
         nav.pack(fill="x")
         ttk.Button(nav, text="< Previous", width=11,
                    command=lambda: self._step(-1)).pack(side="left")
-        self.position = ttk.Label(nav, text="", foreground="#555")
+        self.position = ttk.Label(nav, text="", foreground=tokens.TEXT_MUTED)
         self.position.pack(side="left", expand=True)
         ttk.Button(nav, text="Next >", width=11,
                    command=lambda: self._step(1)).pack(side="right")
@@ -151,7 +156,7 @@ class PlatePicker(ttk.Frame):
         self.level_box.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.level_box.bind("<<ComboboxSelected>>", lambda _e: self._set_dilution())
 
-        self.hint = ttk.Label(right, text="", foreground="#555", justify="left",
+        self.hint = ttk.Label(right, text="", foreground=tokens.TEXT_MUTED, justify="left",
                               wraplength=PREVIEW_BOX[0])
         self.hint.pack(anchor="w", fill="x", pady=(8, 0))
         right.bind("<Configure>", lambda e: self.hint.configure(
@@ -161,7 +166,8 @@ class PlatePicker(ttk.Frame):
     # -- display -------------------------------------------------------------
 
     def refresh(self) -> None:
-        e = self.ctl.experiment
+        self.group_selector.refresh()
+        e = self.ctl.panel_experiment
         self._sync_levels()
 
         selected = self.selected_slot()
@@ -173,7 +179,7 @@ class PlatePicker(ttk.Frame):
             self.slots.insert(
                 "", "end", iid=iid,
                 tags=() if (relpath and level != "-") else ("empty",),
-                values=(code, plate_id,
+                values=(self.ctl.condition_name(code), plate_id,
                         Path(relpath).name if relpath else "-",
                         level),
             )
@@ -200,7 +206,7 @@ class PlatePicker(ttk.Frame):
             for relpath in wanted:
                 self.candidates.insert("end", relpath)
         slot = self.selected_slot()
-        chosen = self.ctl.experiment.pick(*slot) if slot else None
+        chosen = self.ctl.panel_experiment.pick(*slot) if slot else None
         target = self._showing or chosen
         if target in wanted:
             index = wanted.index(target)
@@ -210,10 +216,12 @@ class PlatePicker(ttk.Frame):
             self._showing = target
         elif not wanted:
             self._showing = ""
+        else:
+            self._showing = ""
 
     def _sync_controls(self) -> None:
         slot = self.selected_slot()
-        e = self.ctl.experiment
+        e = self.ctl.panel_experiment
 
         if slot:
             code, plate_id = slot
@@ -223,7 +231,7 @@ class PlatePicker(ttk.Frame):
                 self.dilution.set(shown)
             chosen = e.pick(code, plate_id)
             self.levels_box.configure(
-                text=f"Dilution row to score on {code} {self.ctl.plate_label(plate_id)}")
+                text=f"Dilution row to score on {self.ctl.condition_name(code)} {self.ctl.plate_label(plate_id)}")
             self.level_box.configure(
                 state="readonly" if chosen and self._levels else "disabled")
             self.hint.configure(
@@ -259,9 +267,9 @@ class PlatePicker(ttk.Frame):
         self.position.configure(text=f"{index + 1} of {total}")
 
         slot = self.selected_slot()
-        used_by = [f"{code} plate {plate}"
+        used_by = [f"{self.ctl.condition_name(code)} plate {plate}"
                    for code, plate in self.ctl.slots()
-                   if self.ctl.experiment.pick(code, plate) == self._showing]
+                   if self.ctl.panel_experiment.pick(code, plate) == self._showing]
         mark = f"   (already used for {', '.join(used_by)})" if used_by else ""
         self.caption.configure(text=f"{self._showing}{mark}")
 
@@ -284,7 +292,7 @@ class PlatePicker(ttk.Frame):
     def _slot_selected(self, _event=None) -> None:
         slot = self.selected_slot()
         if slot:
-            chosen = self.ctl.experiment.pick(*slot)
+            chosen = self.ctl.panel_experiment.pick(*slot)
             if chosen:
                 self._showing = chosen
         self._sync_candidates()
@@ -326,7 +334,7 @@ class PlatePicker(ttk.Frame):
         Filling a folder of plates is a run of the same action, so the obvious
         next one is selected rather than leaving the cursor where it was.
         """
-        e = self.ctl.experiment
+        e = self.ctl.panel_experiment
         for code, plate_id in self.ctl.slots():
             if not e.pick(code, plate_id):
                 iid = _iid(code, plate_id)

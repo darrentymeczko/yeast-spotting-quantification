@@ -13,14 +13,16 @@ from tkinter import font as tkfont
 from tkinter import ttk
 from typing import Callable
 
+from uikit import tokens
+
 from ..validate import Severity
 
 #: Colours per severity, kept muted so the list reads as information rather
 #: than alarm. Errors are the only thing that stops a run.
 _COLOURS = {
-    Severity.ERROR: "#b3261e",
-    Severity.WARNING: "#8a6100",
-    Severity.INFO: "#4a4a4a",
+    Severity.ERROR: tokens.ERROR,
+    Severity.WARNING: tokens.WARNING,
+    Severity.INFO: tokens.INFO,
 }
 
 _PREFIX = {
@@ -167,7 +169,7 @@ class StatusBar(ttk.Frame):
         super().__init__(master, padding=(8, 3))
         self.message = ttk.Label(self, text="")
         self.message.pack(side="left")
-        self.detail = ttk.Label(self, text="", foreground="#666")
+        self.detail = ttk.Label(self, text="", foreground=tokens.TEXT_MUTED)
         self.detail.pack(side="right")
 
     def say(self, text: str) -> None:
@@ -200,7 +202,7 @@ class HeaderBar(ttk.Frame):
         if on_rename is not None:
             ttk.Button(top, text="Rename...", width=10,
                        command=on_rename).grid(row=0, column=1, padx=8)
-        self.summary = ttk.Label(top, text="", foreground="#555", width=1,
+        self.summary = ttk.Label(top, text="", foreground=tokens.TEXT_MUTED, width=1,
                                  anchor="e")
         self.summary.grid(row=0, column=2, sticky="ew")
 
@@ -209,10 +211,10 @@ class HeaderBar(ttk.Frame):
         row.columnconfigure(1, weight=3)
         row.columnconfigure(2, weight=2)
         ttk.Label(row, text="Photos:").grid(row=0, column=0, sticky="w")
-        self.folder = ttk.Label(row, text="none chosen", foreground="#555",
+        self.folder = ttk.Label(row, text="none chosen", foreground=tokens.TEXT_MUTED,
                                 width=1, anchor="w")
         self.folder.grid(row=0, column=1, sticky="ew", padx=(6, 8))
-        self.folder_note = ttk.Label(row, text="", foreground="#555", width=1,
+        self.folder_note = ttk.Label(row, text="", foreground=tokens.TEXT_MUTED, width=1,
                                      anchor="e")
         self.folder_note.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         if on_rescan is not None:

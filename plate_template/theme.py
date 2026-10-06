@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import colorsys
 
+from uikit import tokens
+
 # --- geometry ---------------------------------------------------------------
 
 PAD = 10          # outer breathing room
@@ -30,25 +32,29 @@ LABEL_INSET = 0.04       # replicate number's offset from the cell's top-left
 LABEL_SIZE = 0.18        # ...and its height, kept clear of the spot's arc
 
 # --- palette ----------------------------------------------------------------
+#
+# Neutrals and the accent are the shared ones (`uikit.tokens`), so the grid
+# sits in the same window chrome as every other tool. The colours below that
+# carry MEANING on the plate -- empty, undecided, the control ring -- are this
+# tool's own.
 
-BG = "#f7f7f6"
-CELL_BG = "#ffffff"
+BG = tokens.BG
+CELL_BG = tokens.SURFACE
 EMPTY_BG = "#e2e2df"
 UNASSIGNED_BG = "#f6f3ec"
-GRID_LINE = "#d5d5d1"
-TEXT = "#23262b"
-MUTED = "#8b8d92"
-ACCENT = "#3d6ea8"
+GRID_LINE = tokens.LINE
+TEXT = tokens.TEXT
+MUTED = tokens.TEXT_MUTED
+ACCENT = tokens.ACCENT
 CONTROL_RING = "#2c2f35"
 #: One fixed ink for every replicate number. The replicate is identified by the
 #: digit, not by a colour, so nothing about this mark varies between replicates.
 REPLICATE_LABEL = "#5a5e66"
-HOVER = "#8fb3dc"
 FLASH = "#e8bf5a"
 
-ERROR = "#a8323a"
-WARNING = "#8a6320"
-INFO = "#55585d"
+ERROR = tokens.ERROR
+WARNING = tokens.WARNING
+INFO = tokens.INFO
 
 #: Hand-picked hues rather than an even sweep: an even sweep lands squarely in
 #: the muddy yellow-greens and the electric magentas, which is what made the
@@ -90,6 +96,11 @@ def blend(colour: str, toward: str, amount: float) -> str:
     a, b = _rgb(colour), _rgb(toward)
     amount = min(max(amount, 0.0), 1.0)
     return _hex(*(x + (y - x) * amount for x, y in zip(a, b)))
+
+
+#: The hover outline: the accent, softened so it reads as "pointing at", not
+#: as "selected".
+HOVER = blend(ACCENT, CELL_BG, 0.55)
 
 
 def luminance(colour: str) -> float:

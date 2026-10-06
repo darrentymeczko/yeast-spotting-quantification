@@ -29,12 +29,38 @@ except Exception:                               # pragma: no cover - env depende
     HAVE_PIL = False
 
 
+def fit_sheet(im, box: tuple[int, int], mode: str = "fit",
+              rotate: bool = False):
+    """`im` shown as `mode`, graph turned if `rotate`, and laid out to fill
+    `box`, never enlarged.
+
+    Raises ValueError, with a reason fit to show, when the sheet cannot be
+    shown as `mode`.
+    """
+    try:
+        from ..export import fit_sheet as fit
+    except Exception:                           # pragma: no cover - env dependent
+        fit = None
+    if fit is not None:
+        return fit(im, box, mode, rotate)
+    if mode != "fit" or rotate:
+        raise ValueError("this view needs the measurement engine (src/)")
+    scale = min(box[0] / im.width, box[1] / im.height, 1.0)
+    if scale < 1.0:
+        im = im.resize((max(1, int(im.width * scale)),
+                        max(1, int(im.height * scale))), Image.LANCZOS)
+    return im.convert("RGB")
+
+
 class ImageCache:
     """Decoded, scaled images, keyed by (path, target box)."""
 
     def __init__(self, limit: int = 48) -> None:
         self.limit = limit
         self._items: "OrderedDict[tuple, tk.PhotoImage]" = OrderedDict()
+        #: Why the last `get` returned None, when there is a reason worth
+        #: showing (a view this sheet cannot provide); "" otherwise.
+        self.last_error = ""
 
     def clear(self) -> None:
         self._items.clear()
@@ -57,8 +83,10 @@ class ImageCache:
         return img
 
     def get(self, path: Path, box: tuple[int, int], brightness: float = 1.0,
-            contrast: float = 1.0) -> "tk.PhotoImage | None":
-        """An adjusted image for `path` scaled to fit `box`.
+            contrast: float = 1.0, mode: str = "fit",
+            rotate: bool = False) -> "tk.PhotoImage | None":
+        """An adjusted image for `path`, shown as `mode` (graph turned if
+        `rotate`), scaled to fit `box`.
 
         Aspect ratio is preserved and the image is never scaled UP: a sheet
         blown past its own resolution looks like a mistake, and the detail the
@@ -70,15 +98,23 @@ class ImageCache:
         w, h = max(1, int(box[0])), max(1, int(box[1]))
         brightness = round(max(0.01, float(brightness)), 2)
         contrast = round(max(0.01, float(contrast)), 2)
-        key = (str(path), w, h, brightness, contrast)
+        key = (str(path), w, h, brightness, contrast, mode, bool(rotate))
+        self.last_error = ""
         if key in self._items:
             self._items.move_to_end(key)
             return self._items[key]
         if not path.exists():
             return None
+        if (mode != "fit" or rotate) and not HAVE_PIL:
+            self.last_error = "this view needs Pillow (pip install pillow)"
+            return None
         try:
-            img = (self._with_pil(path, w, h, brightness, contrast) if HAVE_PIL
-                   else self._with_tk(path, w, h))
+            img = (self._with_pil(path, w, h, brightness, contrast, mode,
+                                 rotate)
+                   if HAVE_PIL else self._with_tk(path, w, h))
+        except ValueError as e:
+            self.last_error = str(e)
+            return None
         except Exception:
             return None
         return self._put(key, img) if img is not None else None
@@ -87,15 +123,13 @@ class ImageCache:
 
     @staticmethod
     def _with_pil(path: Path, w: int, h: int, brightness: float,
-                  contrast: float):
+                  contrast: float, mode: str = "fit", rotate: bool = False):
         with Image.open(path) as im:
             im.load()
-            scale = min(w / im.width, h / im.height, 1.0)
-            if scale < 1.0:
-                im = im.resize((max(1, int(im.width * scale)),
-                                max(1, int(im.height * scale))),
-                               Image.LANCZOS)
-            im = im.convert("RGB")
+            # A sheet that records its pieces is rearranged for this box and
+            # view rather than shrunk whole into it. Anything else is scaled
+            # as before.
+            im = fit_sheet(im, (w, h), mode, rotate)
             if brightness != 1.0:
                 im = ImageEnhance.Brightness(im).enhance(brightness)
             if contrast != 1.0:

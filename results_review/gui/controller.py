@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from .. import links, review as rv
+from .. import datareview, links, review as rv
 from ..discovery import SetRun
 from ..model import Candidate, Review, SpotEdit
 from ..rebuild import Frame, RebuildError, rebuild
@@ -73,15 +73,24 @@ class UndoStack:
 
 class ReviewController:
     def __init__(self, run: SetRun, review: "Review | None" = None,
-                 on_change: "Callable[[], None] | None" = None) -> None:
+                 on_change: "Callable[[], None] | None" = None,
+                 rebuilder: "Callable[..., Frame] | None" = None) -> None:
         self.run = run
         self.review = rv.with_defaults(run, review or Review())
         self.on_change = on_change
+        #: What does the rebuilding: `rebuild` in this process unless told
+        #: otherwise. The window hands it `background.rebuild`, the same
+        #: function in a worker process.
+        self.rebuilder = rebuilder
         self.undo_stack = UndoStack()
         self._saved = self.review.to_dict()
         self.last_change = ""
         self._frames: dict[str, Frame] = {}
         self._errors: dict[str, str] = {}
+        # Candidates looked at but not chosen. Keyed by candidate, so flicking
+        # back and forth between two graphs rebuilds neither twice.
+        self._preview_frames: dict[tuple, Frame] = {}
+        self._preview_errors: dict[tuple, str] = {}
         self.medium: str = (run.media[0] if run.media else "")
 
         self.capture_root: "Path | None" = links.resolve(
@@ -89,6 +98,46 @@ class ReviewController:
         self.cfg: "dict | None" = None
         self.config_error: str = ""
         self._load_cfg()
+        #: The experiment's data review, and the file stamp it was read at.
+        self._data_flags = None
+        self._flags_stamp: object = "unread"
+
+    # -- the data review -----------------------------------------------------
+
+    def reload_data_flags(self) -> bool:
+        """Re-read the data review if its file changed. True when it had.
+
+        The data review may be open in another tab and saved while this one
+        is open. When its file changes, the rebuilt frames are dropped, since
+        each carries the flags as they stood when it was built -- so a True
+        here means the current medium needs rebuilding.
+        """
+        info = getattr(self.run, "experiment", None)
+        path = Path(info.data_review_file) if info and info.data_review_file else None
+        try:
+            stamp = path.stat().st_mtime_ns if path is not None else None
+        except OSError:
+            stamp = None
+        if stamp == self._flags_stamp:
+            return False
+        first = self._flags_stamp == "unread"
+        self._data_flags = datareview.load_flags(self.run)
+        self._flags_stamp = stamp
+        if first:
+            return False
+        self._frames.clear()
+        self._errors.clear()
+        self._drop_previews()
+        return True
+
+    def data_flags(self):
+        """The data review's flags (`DataFlags`), or None."""
+        self.reload_data_flags()
+        return self._data_flags
+
+    def candidate_flags(self, cand: Candidate) -> tuple[int, int]:
+        """(flagged plates, flagged spots) a candidate scores."""
+        return datareview.candidate_flags(self.run, cand, self.data_flags())
 
     # -- plumbing ------------------------------------------------------------
 
@@ -103,9 +152,16 @@ class ReviewController:
         if invalidate:
             self._frames.pop(invalidate, None)
             self._errors.pop(invalidate, None)
+            self._drop_previews(invalidate)
         self.last_change = label
         self._notify()
         return True
+
+    def _drop_previews(self, medium: str = "") -> None:
+        """Forget previewed frames (all, or one medium's): their edits moved."""
+        for cache in (self._preview_frames, self._preview_errors):
+            for key in [k for k in cache if not medium or k[0] == medium]:
+                del cache[key]
 
     def _notify(self) -> None:
         if self.on_change:
@@ -145,12 +201,14 @@ class ReviewController:
         from ..rebuild import clear_cache
 
         root = Path(root)
-        if not links.is_capture_tree(root):
+        recorded = self.cfg is not None and "resolved_photos" in self.cfg
+        if not root.is_dir() or (not recorded and not links.is_capture_tree(root)):
             return False, (f"{root.name} does not look like a capture tree "
                            f"(expected timepoint / medium / plate folders).")
         clear_cache()
         self._frames.clear()
         self._errors.clear()
+        self._drop_previews()
         self.capture_root = root
         self.review.capture_root = str(root)
         self._load_cfg()
@@ -191,7 +249,8 @@ class ReviewController:
         """
         before = self.snapshot()
         self.review.set_pick(cand.medium, cand, reason)
-        return self._commit(before, f"Choose {cand.medium} {cand.label}",
+        return self._commit(before, f"Choose {self.run.medium_label(cand.medium)} "
+                                    f"{cand.label}",
                             invalidate=cand.medium)
 
     def reset_pick(self, medium: str = "") -> bool:
@@ -201,7 +260,8 @@ class ReviewController:
             return False
         before = self.snapshot()
         self.review.set_pick(medium, best)
-        return self._commit(before, f"Reset {medium} to the pipeline's pick",
+        return self._commit(before, f"Reset {self.run.medium_label(medium)} "
+                                    f"to the pipeline's pick",
                             invalidate=medium)
 
     # -- edits ---------------------------------------------------------------
@@ -249,26 +309,86 @@ class ReviewController:
                            f"Note on {strain} {replicate}", note=note.strip())
 
     def set_statistics(self, statistical_test: str, p_adjust: str,
-                       alpha: "float | None" = None) -> bool:
-        """Choose the test used by review previews and exports."""
+                       alpha: "float | None" = None,
+                       posthoc: "str | None" = None) -> bool:
+        """Choose the test used by review previews and exports.
+
+        `p_adjust` is the t-tests' correction and `posthoc` the ANOVA's
+        follow-up test; each is kept while the other test is selected, so
+        switching back and forth does not lose either choice.
+        """
+        from ..model import POSTHOC_METHODS
+
         if statistical_test not in {"t_test", "anova"}:
             raise ValueError("statistical_test must be 't_test' or 'anova'")
         if p_adjust not in {"none", "holm", "bonferroni", "sidak"}:
             raise ValueError("unknown multiple-testing correction")
+        posthoc = self.review.posthoc if posthoc is None else posthoc
+        if posthoc not in POSTHOC_METHODS:
+            raise ValueError("unknown post-hoc test")
+        if posthoc == "dunnett" and self.review.all_pairs:
+            raise ValueError("Dunnett's test compares strains with a "
+                             "reference; use Tukey HSD for every pair")
         alpha = self.review.alpha if alpha is None else float(alpha)
         if not 0 < alpha < 1:
             raise ValueError("alpha must be between 0 and 1")
         before = self.snapshot()
         self.review.statistical_test = statistical_test
         self.review.p_adjust = p_adjust
+        self.review.posthoc = posthoc
         self.review.alpha = alpha
-        test_label = "ratio paired t-tests" if statistical_test == "t_test" \
-            else "one-way ANOVA"
-        correction = (f" with {p_adjust} correction"
-                      if statistical_test == "t_test" and p_adjust != "none"
-                      else " without correction"
-                      if statistical_test == "t_test" else "")
-        return self._commit(before, f"Use {test_label}{correction}, α={alpha:g}")
+        if statistical_test == "t_test":
+            detail = (f"ratio paired t-tests with {p_adjust} correction"
+                      if p_adjust != "none"
+                      else "ratio paired t-tests without correction")
+        else:
+            detail = ("one-way ANOVA, omnibus only" if posthoc == "none"
+                      else f"one-way ANOVA with {posthoc} post-hoc")
+        return self._commit(before, f"Use {detail}, α={alpha:g}")
+
+    def strain_names(self) -> list[str]:
+        """The strain panel, in slot order, for choosing references from.
+
+        From the run's config when it is loaded, otherwise from whatever
+        medium has already been rebuilt; empty when neither is available.
+        """
+        names = list((self.cfg or {}).get("strains") or [])
+        if not names:
+            for frame in self._frames.values():
+                t = frame.tidy.sort_values("strain_col")
+                names = t["strain"].drop_duplicates().tolist()
+                break
+        return list(dict.fromkeys(str(n) for n in names if n))
+
+    def control_name(self, medium: str = "") -> str:
+        """The current medium's control strain, when it can be told."""
+        frame = self._frames.get(medium or self.medium)
+        if frame is not None:
+            rows = frame.tidy[frame.tidy["strain_col"].astype(int)
+                              == frame.control_col]
+            if not rows.empty:
+                return str(rows["strain"].iloc[0])
+        return ""
+
+    def set_comparisons(self, extra_references, all_pairs: bool) -> bool:
+        """Choose which pairs of strains are compared.
+
+        Each medium's control is always a reference. An extra that happens to
+        be a medium's control is simply a no-op there -- the control differs
+        by medium, so it is not filtered out here. Asking for every pair while
+        Dunnett is the post-hoc test
+        switches it to Tukey HSD -- Dunnett only compares with a reference --
+        and the change says so.
+        """
+        before = self.snapshot()
+        self.review.extra_references = list(dict.fromkeys(
+            str(r) for r in extra_references if str(r)))
+        self.review.all_pairs = bool(all_pairs)
+        label = f"Compare {self.review.comparisons_text()}"
+        if self.review.all_pairs and self.review.posthoc == "dunnett":
+            self.review.posthoc = "tukey"
+            label += " (post-hoc test now Tukey HSD)"
+        return self._commit(before, label)
 
     def revert_spot(self, replicate: str, strain_col: int, strain: str) -> bool:
         """Forget every correction to one spot."""
@@ -282,7 +402,8 @@ class ReviewController:
         medium = medium or self.medium
         before = self.snapshot()
         self.review.clear_medium(medium)
-        return self._commit(before, f"Revert every edit on {medium}",
+        return self._commit(before, f"Revert every edit on "
+                                    f"{self.run.medium_label(medium)}",
                             invalidate=medium)
 
     def edit_for(self, replicate: str, strain_col: int) -> "SpotEdit | None":
@@ -290,14 +411,34 @@ class ReviewController:
 
     # -- rebuilt data --------------------------------------------------------
 
-    def frame(self, medium: str = "", force: bool = False) -> "Frame | None":
+    def _rebuild(self, cand: Candidate, edits: dict) -> Frame:
+        return (self.rebuilder or rebuild)(
+            self.capture_root, self.run.label, self.cfg, cand, edits,
+            data_flags=self._data_flags)
+
+    def _previewed(self, cand: "Candidate | None") -> bool:
+        """True when `cand` is a candidate other than the chosen one."""
+        if cand is None:
+            return False
+        chosen = self.chosen(cand.medium)
+        return chosen is None or chosen.key != cand.key
+
+    def frame(self, medium: str = "", force: bool = False,
+              cand: "Candidate | None" = None) -> "Frame | None":
         """The rebuilt per-spot frame for a medium, or None if it cannot be built.
 
         Cached per medium and dropped whenever that medium's pick or edits
         change, so the table can never show numbers from a superseded decision.
         Slow the first time (it walks the capture tree); call it off the UI
         thread.
+
+        `cand` is a candidate being previewed rather than chosen: its numbers
+        are what the graph on screen shows, so they are what the table must
+        show. Those are cached per candidate and dropped with the medium's.
         """
+        self.data_flags()                # drops stale frames if it changed
+        if self._previewed(cand):
+            return self._preview_frame(cand)
         medium = medium or self.medium
         if force:
             self._frames.pop(medium, None)
@@ -309,12 +450,12 @@ class ReviewController:
         cand = self.chosen(medium)
         if cand is None:
             self._errors[medium] = (
-                f"the candidate recorded for {medium} is not in this run's "
+                f"the candidate recorded for {self.run.medium_label(medium)} "
+                f"is not in this run's "
                 f"results any more; choose one from the list")
             return None
         try:
-            f = rebuild(self.capture_root, self.run.label, self.cfg, cand,
-                        self.review.edits_for(medium))
+            f = self._rebuild(cand, self.review.edits_for(medium))
         except RebuildError as e:
             self._errors[medium] = str(e)
             return None
@@ -324,25 +465,52 @@ class ReviewController:
         self._frames[medium] = f
         return f
 
-    def cached_frame(self, medium: str = "") -> "Frame | None":
+    def _preview_frame(self, cand: Candidate) -> "Frame | None":
+        key = cand.key
+        if key in self._preview_frames:
+            return self._preview_frames[key]
+        if key in self._preview_errors or not self.can_edit:
+            return None
+        try:
+            f = self._rebuild(cand, self.review.edits_for(cand.medium))
+        except RebuildError as e:
+            self._preview_errors[key] = str(e)
+            return None
+        except Exception as e:                    # pragma: no cover - defensive
+            self._preview_errors[key] = f"{type(e).__name__}: {e}"
+            return None
+        self._preview_frames[key] = f
+        return f
+
+    def cached_frame(self, medium: str = "",
+                     cand: "Candidate | None" = None) -> "Frame | None":
         """The rebuilt frame ONLY if it is already in hand.
 
         Used by every redraw, so that painting the window never blocks on
         reading a photograph. `frame()` is the one that does real work, and it
         belongs on a worker thread.
         """
+        if self._previewed(cand):
+            return self._preview_frames.get(cand.key)
         return self._frames.get(medium or self.medium)
 
-    def is_pending(self, medium: str = "") -> bool:
+    def is_pending(self, medium: str = "",
+                   cand: "Candidate | None" = None) -> bool:
         """Rebuildable, but not rebuilt yet -- i.e. worth showing a wait for."""
+        if self._previewed(cand):
+            return (self.can_edit and cand.key not in self._preview_frames
+                    and cand.key not in self._preview_errors)
         medium = medium or self.medium
         return (self.can_edit and medium not in self._frames
                 and medium not in self._errors)
 
-    def error(self, medium: str = "") -> str:
-        medium = medium or self.medium
+    def error(self, medium: str = "",
+              cand: "Candidate | None" = None) -> str:
         if not self.can_edit:
             return self.config_error or "no capture folder linked"
+        if self._previewed(cand):
+            return self._preview_errors.get(cand.key, "")
+        medium = medium or self.medium
         return self._errors.get(medium, "")
 
     def frames(self) -> tuple[list[Frame], list[str]]:
@@ -351,7 +519,8 @@ class ReviewController:
         for medium in self.run.media:
             f = self.frame(medium)
             if f is None:
-                bad.append(f"{medium}: {self.error(medium)}")
+                bad.append(f"{self.run.medium_label(medium)}: "
+                           f"{self.error(medium)}")
             else:
                 out.append(f)
         return out, bad
@@ -372,6 +541,7 @@ class ReviewController:
         self.review = Review.from_dict(snapshot)
         self._frames.clear()
         self._errors.clear()
+        self._drop_previews()
         self._notify()
 
     def undo(self) -> "str | None":

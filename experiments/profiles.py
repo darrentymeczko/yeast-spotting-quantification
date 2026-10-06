@@ -46,7 +46,9 @@ TRANSFORMS = ("raw", "int", "hours", "code")
 #: Where a rule reads its text from. `segment` indexes the path parts (negative
 #: counts from the file upwards, which is what makes a rule survive an extra
 #: folder level above it); `stem` is the filename without its extension.
-SOURCES = ("segment", "stem")
+#: `path` searches all relative components for explicit metadata; `treatment`
+#: combines reviewable treatment labels from folders and the filename.
+SOURCES = ("segment", "stem", "path", "treatment")
 
 
 class ProfileError(ValueError):
@@ -148,6 +150,11 @@ def condition_code(name: str, aliases: dict[str, str]) -> str:
 
 def _text_for(parts: tuple[str, ...], rule: FacetRule) -> str | None:
     """The piece of the path this rule reads, or None if the path is too short."""
+    if rule.source == "treatment":
+        from .names import treatment_label
+        return treatment_label(parts)
+    if rule.source == "path":
+        return "/".join(parts[:-1] + (parts[-1].rsplit(".", 1)[0],)) if parts else ""
     if rule.source == "stem":
         stem = parts[-1] if parts else ""
         return stem.rsplit(".", 1)[0] if "." in stem else stem
@@ -199,9 +206,16 @@ def apply_rule(parts: tuple[str, ...], rule: FacetRule, aliases: dict[str, str])
     if text is None:
         return None, None
     for pat in rule.patterns:
+        if rule.source == "path":
+            matches = list(re.finditer(pat, text, re.I))
+            values = {_transform(m.group(1), rule, aliases) for m in matches}
+            if len(values) > 1:
+                return None, None
         m = re.search(pat, text, re.I)
         if m is not None:
-            label = text if rule.facet in _LABEL_FROM_SEGMENT else m.group(1)
+            label = text if rule.facet in _LABEL_FROM_SEGMENT and rule.source == "segment" else m.group(1)
+            if rule.facet == "timepoint" and rule.source != "segment":
+                label = f"{m.group(1)} Hours"
             return _transform(m.group(1), rule, aliases), label
     return None, text
 

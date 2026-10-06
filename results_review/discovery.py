@@ -127,6 +127,10 @@ class RunInfo:
     #: them. Empty for a classic run.
     dilution_layout: dict = field(default_factory=dict)
     cache_key_version: str = ""
+    #: Where the experiment's data review is saved, and what it held when the
+    #: run was made (`data_review.flags.DataFlags.to_dict`). Either may be empty.
+    data_review_file: str = ""
+    data_review_snapshot: dict = field(default_factory=dict)
 
     @property
     def level_names(self) -> list:
@@ -168,7 +172,11 @@ def load_run_info(results_dir: Path) -> "RunInfo | None":
     experiment = raw.get("experiment") or {}
     cfg = raw.get("pipeline_config")
     layout = raw.get("dilution_layout")
+    review = raw.get("data_review") if isinstance(raw.get("data_review"), dict) else {}
+    snapshot = review.get("flags")
     return RunInfo(
+        data_review_file=str(review.get("file") or ""),
+        data_review_snapshot=snapshot if isinstance(snapshot, dict) else {},
         dilution_layout=layout if isinstance(layout, dict) else {},
         name=str(experiment.get("name") or ""),
         written=str(raw.get("written") or ""),
@@ -218,6 +226,16 @@ class SetRun:
     def media(self) -> list[str]:
         seen = {c.medium for c in self.candidates}
         return sorted(seen, key=medium_rank)
+
+    def medium_label(self, medium: str) -> str:
+        """What the experiment calls a medium ("Glucose + 37C"), for display.
+
+        The code ("GLUCOSE3") stays the key -- it names the figure folders and
+        the review's picks -- but it is generated, and nobody wrote it. A
+        console-pipeline run has no labels, so its codes are shown as they are.
+        """
+        return next((c.medium_label for c in self.candidates
+                     if c.medium == medium and c.medium_label), medium)
 
     def for_medium(self, medium: str) -> list[Candidate]:
         """This medium's candidates, in the CSV's own (rank_score) order."""
@@ -279,6 +297,8 @@ def load_set(results_dir: Path) -> SetRun:
             f"{TIMECOURSE_RESULTS / 'Set01'}.")
     run.candidates = load_candidates(run.candidates_csv)
     run.experiment = load_run_info(results_dir)
+    if run.experiment and run.experiment.name:
+        run.label = run.experiment.name
     names = run.experiment.level_names if run.experiment is not None else []
     if names:
         # The recorded order is the only source of it: a design's own level
@@ -301,9 +321,8 @@ def list_sets(root: "Path | None" = None) -> list[Path]:
     root = Path(root or TIMECOURSE_RESULTS)
     if not root.is_dir():
         return []
-    return sorted((p for p in root.iterdir()
-                   if p.is_dir() and (p / CANDIDATES_CSV).exists()),
-                  key=lambda p: p.name.lower())
+    return sorted({p.parent for p in root.rglob(CANDIDATES_CSV)},
+                  key=lambda p: str(p.relative_to(root)).lower())
 
 
 def missing_sheets(run: SetRun) -> list[Candidate]:

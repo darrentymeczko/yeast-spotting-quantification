@@ -19,14 +19,19 @@ than applied silently.
 
 | | |
 |---|---|
+| `run_workbench.bat` | **The program.** Every tool below in one window: plate templates, experiments (where photos are measured) and their review, as tabs, with a Home page to start from. See [One program, every stage](#one-program-every-stage). |
 | `run_plate_designer.bat` | **Plate designer.** Draw the layout of the assay: which cell holds which sample, replicate and dilution. Strain-free, so one template serves many experiments. |
 | `run_experiment_designer.bat` | **Experiment designer.** Bind a template to real strains, conditions and photographs, and drive either pipeline from it. |
+| `run_data_review.bat` | **Data review.** Before the statistics, flip through every photograph an experiment imported and flag bad plates and bad spots. See [Reviewing the data before the statistics](#reviewing-the-data-before-the-statistics). |
 | `run_spotting.bat` | **Main pipeline.** A folder of chosen photos → measurements, statistics, figures. |
 | `run_timecourse.bat` | **Selection pipeline.** A raw capture tree → which photos are worth quantifying. |
 | `run_review.bat` | **Review.** Every candidate the selection pipeline scored → the one you choose, with bad spots corrected. |
-| `spotting_app.py` | **All five stages behind one launcher window.** See [One program, every stage](#one-program-every-stage). |
+| `spotting_app.py` | **The entry point.** Bare, it opens the workbench; with a stage name, it runs that one stage. |
+| `workbench/` | The workbench window: Home, tabs, the Explorer, the Jobs panel. |
+| `uikit/` | What every tool shares: the colours and fonts, the flat theme, and the host contract that lets a tool run alone or as a tab. |
 | `plate_template/` | The plate designer: model, schema, validation, autofill, and its window. |
 | `experiments/` | The experiment layer: strain panels, conditions, photo intake, and the bridge that drives the pipelines. |
+| `data_review/` | The data review: every photo with its detected spots, and the flags saved beside the experiment. |
 | `src/spotting_quant.py` | Measurement engine: plate finding, grid detection, ROI placement and sizing, background subtraction, normalisation, statistics. |
 | `src/spotting_batch.py` | Driver for the main pipeline: discovery, prompts, caching, exports. |
 | `src/spotting_montage.py` | Figure of the spots themselves, one block per biological replicate. |
@@ -73,20 +78,73 @@ The **experiment designer** removes both constraints.
 run_experiment_designer.bat
 ```
 
-An *experiment* is one strain panel, spotted across one or more conditions, with
-a positive control that every strain is reported relative to. The photo folder
-is chosen at the top of the window, since both ways of quantifying need it.
+An *experiment* contains one or more strain groups using the same plate template,
+spotted across treatments. Each group has its own strains and positive control.
 
-1. **Panel** — choose the plate template the assay was spotted on, name each
-   sample slot, and mark the control. Leaving a slot blank says nothing was
-   spotted there.
-2. **Conditions** — each medium or treatment. A condition may name its **own**
-   control, which is what you want when a strain does not grow on one medium
-   and so cannot be the reference there.
-3. **Plates** — handpicked quantification only. One row per plate the template
+Start on **Panel** to import and preview the plate template, name the sample
+slots, and mark the positive control. Leave a slot blank if nothing was spotted
+there. Then open **Data** and choose the experiment's photo folder. The designer scans
+the names, suggests treatments, and adds them to
+**Conditions** for review. No photos are moved or renamed, and the scan does
+not read image pixels. Suggestions remain available when plate numbers or
+elapsed hours are still unknown.
+
+Review and edit the suggested treatment names in **Conditions**, then return to
+**Data** to specify the organization. Each photo shows its relative path,
+suggested treatment, plate, elapsed hours, set, and missing information. You can
+choose where each detail is written, check the examples, and press **Use these
+choices**, or select several
+photos and assign a condition, plate, hours or set together. **Ignore** excludes
+unwanted photos. **Add strain group** defines another panel in the same folder.
+Use **Add detected conditions** after changing rules or correcting photos.
+
+For multiple panels, choose **Multiple strain groups - assign photos below**
+and apply, or click **Add strain group**. Name the existing and additional
+groups, then select each group on **Panel** to enter its strains and control.
+On **Data**, select photos and click **Strain group** to assign them (or use a
+folder/filename rule whose values match the group names). Every included photo
+must belong to a defined group. **Conditions** and **Plates** also have a group
+selector for group-specific controls, exclusions, photo picks and dilutions.
+All groups run separately, with separate result subfolders. Review lists these
+by experiment/group name and uses their saved photo assignments and controls;
+groups are never pooled. Version-1 experiment files still open; new files use
+version 2 so older designers cannot silently ignore their strain groups.
+
+Each detail has one dropdown combining where to look and how to read the name,
+for example, “Read hours from the ‘16 Hours, 18 Hours’ folders.” Choices include
+names from your own data and show the values they would read before you apply them.
+Common name formats such as `Plate 1`, `16 Hours`, and `R1` can be selected
+without writing a pattern. `R1` is treated as a plate number only when you
+explicitly choose that interpretation. The **advanced pattern editor** is
+optional and hidden by default.
+
+**Re-read** preserves your naming rules and corrections. **Detect organization**
+explicitly regenerates the rules, retaining manual photo corrections and code
+aliases. Corrections and organization are saved in the experiment JSON and can
+be undone. Adding or correcting a treatment requires only its name. Internal
+identifiers are generated automatically; renaming a treatment preserves its
+identifier, photo picks, controls and saved links. Existing experiment files
+keep their original identifiers and output filenames.
+
+Temperature, medium and stress/dose can be combined into a treatment suggestion,
+for example `30/glucose/H2O2 - 17h.JPG`. The scanner does not interpret `R1`,
+`1a`, `1.1`, or `_9_1` as template plates. Confirm their meaning against your
+plate template. Dates, `next day`, and bare temperature folders do not establish
+elapsed hours. Unknown spellings, strain details and irregular names need review.
+The lab layout survey and extension plan are in
+[data organization notes](docs/data-organization.md).
+
+The tab order is **Panel → Data → Conditions → Plates → Run**. After reviewing
+Data and Conditions, finish the remaining tabs:
+
+4. **Plates** — handpicked quantification only. One row per plate the template
    needs. Flip through the photographs, press *Use this photograph*, then set
    that plate's dilution row while you can see it.
-4. **Run** — handpicked quantification, or the time course.
+5. **Run** — handpicked quantification, or the time course (tab 4 when Plates
+   is hidden).
+
+A condition may name its **own control** on Conditions. Use this when a strain
+does not grow on one medium and cannot be the reference there.
 
 **The dilution row is chosen per plate, not per treatment.** Every spot is
 divided by the control on its *own* plate, so two plates of one medium that grew
@@ -178,6 +236,74 @@ A run also writes `experiment.json` beside its results. That is purely
 additive — every file the review window already reads is still written exactly
 as before — and it lets the review show real strain names and find the
 photographs without being pointed at them.
+
+---
+
+## Reviewing the data before the statistics
+
+Outliers can be marked one at a time in the results review, but judging one
+usually needs both the number and the spot itself. The **data review** is for
+doing that up front: flip through every photograph an experiment imported,
+before anything is tested, and flag what is not good data.
+
+```
+run_data_review.bat "Experiment Designs\Set09.spotexp.json"
+```
+
+In the workbench it is step 3 on Home, or **Review data...** on the experiment
+designer's Run tab.
+
+**Spots have to be located first.** Each photo is shown with the grid the
+program's own detection found, so a photo whose spots are not located yet shows
+a banner. Press **Locate spots...** to run detection on every photo still
+missing it, as a background job (the Jobs panel in the workbench, or a window
+of its own). This is the measuring step of a run. It fills the same measurement
+cache, so a later run finds everything already measured. Photos become
+reviewable as they finish. A whole plate can be flagged before its spots are
+located.
+
+| | |
+|---|---|
+| click a spot | flag it, with the reason chosen under **Reasons for new flags**; click again to clear it |
+| right-click | flag with a different reason, clear, flag the plate, mark looked at |
+| `P` | flag the whole plate, or clear it |
+| `Space` | looks good: mark it looked at, and go to the next photo |
+| `PgUp` `PgDn` (or `←` `→`) | previous / next photo |
+| `V` | write each spot's grey value on the photo |
+| `Ctrl+S`, `Ctrl+Z`, `Ctrl+Y` | save, undo, redo |
+
+Pointing at a spot shows it magnified from the full-resolution photo, with its
+neighbours. It also shows the strain, replicate and dilution, the grey value the
+run will measure, that value relative to the plate's control, and the same
+strain's other replicates on the plate. **Show** narrows the list to photos not
+looked at yet, flagged photos, or photos without located spots. Flagged spots
+are red on the photo and in the magnifier. A flagged plate gets a red border.
+
+**What a flag does differs between the two analyses, on purpose:**
+
+- **The additional multi-step analysis excludes it.** A flagged plate is left
+  out like a photo excluded in its own dialog, and needs no technical-plate
+  label. A flagged spot gets a QC reason (`data review: ...`), the same as an
+  image artifact, so a flagged control spot also removes the one strain/control
+  pairing that used it. The analysis folder keeps a copy of the flags as they
+  stood (`data_review.json`).
+- **The endpoint analysis only marks it.** Nothing is dropped from the
+  candidates, graphs or statistics. The results review shows each flagged spot
+  in red with its reason, and marks with ⚑ the candidates that use one. The
+  person reviewing decides whether to omit it (`O`). The exported
+  `chosen/spotting_results_normalized.csv` has a `data_review` column.
+
+The flags are saved beside the experiment, as `Set09.datareview.json` next to
+`Set09.spotexp.json`. They live in their own file, so the designer and the data
+review can be open at the same time without either overwriting the other's
+saves. They are keyed by photo path and by the cell of the photographed grid. A
+run records the file's location and a copy of its flags in `experiment.json`.
+The results review reads the live file when it can, so flags made after a run
+still show. If the experiment file is renamed, rename its `.datareview.json`
+with it.
+
+`py -m data_review.cli status <experiment>` says how far a review has got;
+`py -m data_review.cli detect <experiment>` locates spots without the window.
 
 ---
 
@@ -322,10 +448,25 @@ brightness or contrast adjustment is applied to any spot image.
 
 ### On ranking
 
+**Optional additional analysis.** In Experiment Designer, open **Run → Statistics →
+Additional multi-step analysis** to combine technical plates, optionally across
+repeated timepoints, using either a two-step or full hierarchical analysis.
+Assign physical technical-plate identities across time and choose the hours and
+dilution. Separate comparison graphs and audited statistics go under `multi_step/`;
+the current candidate selection and endpoint output remain available.
+See [setup, statistical models and limitations](docs/multistep-analysis.md).
+
 The default (`--rank-by combined`) ranks on **both** replicate spread and the
 number of strains separating from the control, because the output is a triage
 list: it decides what to open first, and every winner is still inspected before
 anything is reported.
+
+A strain counts as separating from the control under the experiment's own
+statistical test — the one chosen under **Run → Statistics**, which the figures
+draw — at its p cutoff. The `n_significant` column, each sheet's "N of M strains
+significant" and the strain consensus are therefore the brackets on the graphs;
+the CSV's `significance_test` column says which test that was. An ANOVA with no
+post-hoc test names no strain, so it ranks on spread and controls alone.
 
 Be aware of what that means. Comparing candidates partly on their own results is
 selecting on the outcome, so the winning candidate's p-values are optimistic as
@@ -415,9 +556,28 @@ Choose the analysis beside the medium tabs at the top of the review window. **Ra
 t-tests** compare each strain with its normalized control on the log-ratio
 scale; the adjacent menu can leave the p-values unadjusted or control the
 family-wise error rate with Holm, Bonferroni, or Šidák correction. **One-way
-ANOVA** instead reports a single omnibus test across all strains, so the
-multiple-comparison menu is disabled for that choice. The selection is saved
-in `review.json` and is used by both **Redraw graph** and **Export chosen/**.
+ANOVA** tests all strains at once; the adjacent menu then becomes **Post-hoc**
+and chooses the follow-up test that says *which* strains differ:
+
+| post-hoc | what it does |
+|---|---|
+| Dunnett (default) | each strain against a reference strain |
+| Tukey HSD | controls the error rate over every pair |
+| Holm / Bonferroni / Šidák | t-tests on the ANOVA's pooled variance, corrected over the comparisons requested |
+| None (omnibus only) | just the ANOVA's single p-value |
+
+**Comparisons…** chooses which pairs are tested, for either test. Every strain
+is always compared with the medium's control; you can add further reference
+strains (each compared with every other strain), or tick **Compare every pair
+of strains**. Asking for more comparisons makes each one harder to call, since
+the correction or post-hoc test covers all of them. Dunnett only compares
+against a reference, so choosing every pair switches it to Tukey HSD.
+Brackets that don't overlap share a line on the graph. The strain table's p
+column is always against the control; comparisons between other strains are
+on the graph and in the statistics CSV.
+
+The selection is saved in `review.json` and is used by both **Recompute data**
+and **Export…**.
 
 Corrections run through the pipeline's own normalisation, not over the top of
 it. Re-measuring a **control** spot therefore changes that plate's divisor and
@@ -429,6 +589,14 @@ opinion rather than asserting the opposite. "I have no view on this spot" and "I
 checked this and it is fine" are different claims and the CSV records which one
 you made.
 
+Spots flagged in the [data review](#reviewing-the-data-before-the-statistics)
+are red, with `⚑ data review: <reason>` in the flag column, and the line above
+the table counts how many still count. They are **not** left out: press `O` on
+one to omit it. Your own decision then shows in amber over the red. Candidates
+whose scored spots include a flagged plate or spot carry ⚑ in the list, and the
+note under the sheet says how many. Flags saved in the data review while this
+window is open show up on the next refresh.
+
 ### What a review writes
 
 Decisions go to `Results/Timecourse/<set>/review.json` — which candidate per
@@ -436,16 +604,32 @@ medium, and what changed about which spot, with your reasons. Numbers are never
 stored there; they are rebuilt from the photographs through the same functions
 the pipeline uses, so a review still means something after a re-measure.
 
-**Export chosen/** then writes the result to `Results/Timecourse/<set>/chosen/`,
-laid out exactly like `best/` and produced by the same PyPrism renderer and the
-same montage code:
+**Export…** lets you select outputs, treatments, and a destination folder
+(default: `Results/Timecourse/<set>/chosen/`). Click **PowerPoint only** for just
+the deck, or combine any of the outputs below. All treatments start selected;
+click a treatment to leave it out.
+
+The PowerPoint is named for the experiment (`Set13.pptx`) and has one slide per
+selected treatment: the sheet of the candidate from **Use this candidate**,
+with a freshly generated graph using your current statistics, corrections, and
+outlier flags, laid out the way the review is showing sheets (Fit or Aligned,
+rotated or not). Merely previewing another candidate does not change the
+export. Photo filenames and analysis settings are recorded in speaker notes.
+Rebuilding and exporting run in the background.
 
 | file | contents |
 |---|---|
-| `spotting_results_normalized.csv` | one row per spot, plus who changed what and why |
+| `<experiment>.pptx` | one slide per selected treatment, the chosen sheet with the updated graph, in the review's view |
+| `spotting_results_normalized.csv` | one row per spot, plus who changed what and why, and (`data_review`) what the data review flagged |
 | `figures/` | one graph per medium, plus `spotting_paired_ttests.csv` or `spotting_anova.csv` for the selected analysis |
 | `montages/` | the spots themselves |
 | `chosen_summary.csv` | what was picked per medium, the selected statistical analysis, whether it was the pipeline's pick, and the reason |
+
+Only selected outputs are written; intermediate data and images for a
+PowerPoint-only export are temporary. Matching filenames are replaced, while
+other files already in the destination are kept. If a treatment's photos or
+updated graph cannot be produced, the export reports the problem and does not
+write an incomplete PowerPoint.
 
 `best/` is never written to, so re-running pipeline 2 cannot destroy a review,
 and the automatic pick stays there to be compared against.
@@ -577,32 +761,63 @@ Known limits, stated plainly:
 
 ## One program, every stage
 
-`spotting_app.py` puts all five stages behind one entry point. Run it bare for a
-launcher window listing them in order — **1** design (plate template,
-experiment), **2** measure (spotting, time course), **3** review — with a button
-each. The `.bat` files are unchanged and still work; this is an alternative to
-them, not a replacement.
+`run_workbench.bat` (or `py spotting_app.py`, bare) opens the **workbench**: the
+plate designer, the experiment designer and the review window in one window,
+each open file a tab.
 
-Or name a stage. Everything after it goes to that stage exactly as the matching
-`.bat` file would pass it on:
+- **Home** is where work starts: four steps — **1** plate template, **2**
+  experiment (set up, then measured from its Run tab), **3** review data (the
+  photos, checked by eye before the statistics), **4** review results —
+  each with its actions (new, open, import, …) and what was opened recently.
+- **The Explorer** on the left lists every plate template, experiment and
+  result set in the project; double-click to open one (or bring its tab
+  forward — a file is never open twice).
+- **The menubar follows the active tab**: File, the tool's own menus, Window,
+  Help. Shortcuts do too — Ctrl+Z undoes in the tab you are looking at and no
+  other. Ctrl+Tab steps through tabs, Ctrl+W closes one, asking first if it has
+  unsaved changes. Drag a document tab left or right to reorder it; the accent
+  line marks where it will land. You can also right-click a tab and choose
+  **Move left** or **Move right**. Home stays first. Saved files reopen in your
+  chosen order next time.
+- **Runs** started from an experiment's Run tab no longer open a console: they
+  run in the background, listed in the **Jobs** panel under the Explorer with a
+  progress bar. Click one for its log, live. When it ends, a notice in the
+  corner offers **Open in Review**. Stop ends the run and its worker processes.
+  Logs are kept in `.workbench/logs/`.
+
+The single-tool `.bat` files still work — each tool also runs on its own, which
+is how it is developed and tested. So do the console pipelines, for scripting:
+name a stage, and everything after it goes to that stage exactly as the
+matching `.bat` file would pass it on:
 
 ```
-py spotting_app.py spotting
+py spotting_app.py workbench "Experiment Designs\Set09.spotexp.json"
+py spotting_app.py plate
 py spotting_app.py timecourse "D:\Set09" --workers 8
 py spotting_app.py review --apply
 py spotting_app.py --help
 ```
 
-Stages are `plate`, `experiment`, `spotting`, `timecourse` and `review`. The
-command-line tools behind them are `plate-cli`, `experiment-cli`, `montage`,
-`pptx` and `quant`. Dragging capture-tree folders onto the file runs the time
-course on them, as it does for `run_timecourse.bat`. Each stage opened from the
-launcher runs as its own process, so one crashing cannot take the others with
-it and several can be open side by side.
+Stages are `workbench`, `plate`, `experiment`, `data-review`, `review`, and the
+console pipelines `spotting` and `timecourse`. The command-line tools behind them
+are `plate-cli`, `experiment-cli`, `data-review-cli`, `montage`, `pptx` and `quant`. Dragging
+capture-tree folders onto the file runs the time course on them, as it does for
+`run_timecourse.bat`.
 
 `--selftest` imports every stage and exercises the fragile parts — compiled
-Numba code, every figure format, the slide template, Tk — which is the quickest
-way to tell whether an environment is intact.
+Numba code, every figure format, the slide template, Tk, the workbench window —
+which is the quickest way to tell whether an environment is intact. Home's
+*Check the installation* runs it in the Jobs panel.
+
+**How the tools share one window.** Each tool builds itself into a *host*
+(`uikit/host.py`) instead of owning a window: it asks the host for its menus,
+shortcuts, title and closing, and the host decides what those mean — a window
+of its own when the tool runs alone, a tab when it runs in the workbench. All
+of them wear one flat theme built from `uikit/tokens.py`; only colours that
+carry meaning (a plate's slot hues, review's amber for a person's edit) stay
+with the tool. `tests/test_tool_guardrails.py` keeps a tool from reaching past
+its host — a bare ttk style, a `bind_all`, retitling the window — because in a
+shared window each of those would quietly change every other tool too.
 
 ### Packaging
 
@@ -632,12 +847,24 @@ it enabled before publishing, whichever route you take.
 
 ```
 .
-├── spotting_app.py             launcher window and stage dispatcher
+├── spotting_app.py             entry point: the workbench, or one stage by name
+├── run_workbench.bat           the program: every tool in one window
 ├── run_plate_designer.bat      plate designer launcher
 ├── run_experiment_designer.bat experiment designer launcher
+├── run_data_review.bat         data review launcher
 ├── run_spotting.bat            main pipeline launcher
 ├── run_timecourse.bat          selection pipeline launcher
 ├── run_review.bat              review window launcher
+├── workbench/                  the one-window program
+│   ├── shell.py                the main window: tabs, menus, shortcuts, closing
+│   ├── home.py                 Home, the task manager
+│   ├── explorer.py             the project's files, by kind
+│   ├── jobs.py / jobs_ui.py    runs in the background, their logs and progress
+│   └── registry.py             the kinds of document and how to open each
+├── uikit/                      shared by every tool
+│   ├── tokens.py               colours, fonts, spacing (no tkinter)
+│   ├── theme.py                the flat ttk theme
+│   └── host.py                 how a tool lives in a window or a tab
 ├── plate_template/             the plate designer (model, schema, validation, GUI)
 │   └── templates/              shipped layouts, e.g. the lab standard 8x6
 ├── experiments/
@@ -648,6 +875,12 @@ it enabled before publishing, whichever route you take.
 │   ├── run.py                  the bridge into src/ (the only place that imports it)
 │   ├── cli.py                  scan / check / run / migrate
 │   └── app.py                  the experiment designer window
+├── data_review/                the photos checked by eye before the statistics
+│   ├── flags.py                the flags file every other tool reads (stdlib only)
+│   ├── catalog.py              which photos, and what is in each grid cell
+│   ├── spots.py                where detection put the spots (the cache)
+│   ├── cli.py                  detect / status
+│   └── app.py                  the data review window
 ├── results_review/             the review window
 ├── src/
 │   ├── spotting_quant.py       measurement engine

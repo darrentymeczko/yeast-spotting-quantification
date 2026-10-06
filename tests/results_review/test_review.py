@@ -114,6 +114,36 @@ def test_statistical_choice_is_an_undoable_review_decision():
     assert ctl.review.alpha == pytest.approx(0.01)
 
 
+def test_post_hoc_and_comparisons_round_trip():
+    r = Review(statistical_test="anova", posthoc="tukey",
+               extra_references=["ATX1", "SOD1"])
+    back = Review.from_dict(json.loads(json.dumps(r.to_dict())))
+    assert back.posthoc == "tukey"
+    assert back.extra_references == ["ATX1", "SOD1"] and not back.all_pairs
+    kw = back.statistics_kwargs()
+    assert kw["posthoc"] == "tukey" and kw["extra_references"] == ("ATX1", "SOD1")
+    # Old reviews: Dunnett after an ANOVA, compared with the control only.
+    old = Review.from_dict({"version": 1})
+    assert old.posthoc == "dunnett" and old.extra_references == []
+    # The post-hoc test only applies to an ANOVA.
+    assert Review(posthoc="tukey").statistics_kwargs()["posthoc"] == "none"
+
+
+def test_every_pair_moves_dunnett_to_tukey():
+    from results_review.gui.controller import ReviewController
+
+    ctl = ReviewController(run_with(cand()), Review())
+    ctl.set_statistics("anova", "none", posthoc="dunnett")
+    assert ctl.set_comparisons([], True)
+    assert ctl.review.all_pairs and ctl.review.posthoc == "tukey"
+    with pytest.raises(ValueError):
+        ctl.set_statistics("anova", "none", posthoc="dunnett")
+    assert ctl.undo()
+    assert not ctl.review.all_pairs and ctl.review.posthoc == "dunnett"
+    assert ctl.set_comparisons(["ATX1"], False)
+    assert ctl.review.comparisons_text() == "vs control + ATX1"
+
+
 def test_invalid_p_cutoffs_are_rejected():
     from results_review.gui.controller import ReviewController
 
@@ -205,3 +235,32 @@ def test_strain_col_is_normalised_to_an_int():
     r = Review()
     r.amend("GLU", "rep1", "4", excluded=True)
     assert r.edit("GLU", ("rep1", 4)) is not None
+
+
+@pytest.mark.parametrize("action", [
+    lambda c: c.choose(cand(tp="24 Hours")),
+    lambda c: c.reset_pick(),
+    lambda c: c.set_raw("rep1", 2, "Mutant", 10.),
+    lambda c: c.set_excluded("rep1", 2, "Mutant", True),
+    lambda c: c.set_outlier("rep1", 2, "Mutant", True),
+    lambda c: c.set_note("rep1", 2, "Mutant", "New note"),
+    lambda c: c.set_statistics("t_test", "holm", .01),
+    lambda c: c.set_comparisons(["Mutant"], False),
+    lambda c: c.revert_spot("rep1", 2, "Mutant"),
+    lambda c: c.revert_medium(),
+])
+def test_review_edit_actions_have_matching_undo_redo(action, monkeypatch):
+    from results_review.gui import controller
+    monkeypatch.setattr(controller.links, "resolve", lambda *a, **k: None)
+    ctl = controller.ReviewController(run_with(cand()), Review())
+    ctl.choose(cand(tp="16 Hours"))
+    ctl.set_note("rep1", 2, "Mutant", "Original note")
+    ctl.undo_stack.clear()
+    before = ctl.snapshot()
+    assert action(ctl)
+    after = ctl.snapshot()
+    ctl.undo()
+    assert ctl.snapshot() == before
+    assert not ctl.undo_stack.can_undo
+    ctl.redo()
+    assert ctl.snapshot() == after

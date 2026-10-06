@@ -155,6 +155,32 @@ class DilutionLayout:
     def plates(self) -> list:
         return sorted({int(no) for lv in self.levels for no, _ in lv.plates})
 
+    def populated_levels(self) -> list:
+        """The levels that place at least one spot.
+
+        A template can declare more levels than it spots -- a 96-well design
+        spotted at a single dilution still says "levels: 3" -- and a level with
+        no cells is not a choice anyone made, so figures that ask "was there a
+        dilution choice to show?" count these, not `levels`.
+        """
+        return [lv for lv in self.levels if any(cells for _, cells in lv.plates)]
+
+    def slot_at(self, plate: int) -> dict:
+        """{(row, col): sample slot} for every spot any level places on a plate."""
+        return {rc: c.slot for rc, c in self.cell_at(plate).items()}
+
+    def cell_at(self, plate: int) -> dict:
+        """{(row, col): LevelCell} for every spot any level places on a plate."""
+        out = {}
+        for lv in self.levels:
+            try:
+                cells = lv.cells(plate)
+            except KeyError:
+                continue
+            for c in cells:
+                out.setdefault((c.row, c.col), c)
+        return out
+
     def row_sets(self, plate: int) -> list:
         """Every level's 1-based rows on one plate, in level order, de-duplicated.
 
@@ -1506,7 +1532,9 @@ def make_montages(data: dict, cfg: dict, opts: "sq.MeasureOptions",
 
 
 def run_plots(csv_path: Path, outdir: Path, *, statistical_test: str = "t_test",
-              p_adjust: str = "none", alpha: float = 0.05) -> None:
+              p_adjust: str = "none", alpha: float = 0.05,
+              posthoc: str = "none", extra_references=(),
+              all_pairs: bool = False) -> None:
     """Draw figures and the selected statistical test with PyPrism Plot."""
     csv_path = Path(csv_path).resolve()
     outdir = Path(outdir).resolve()
@@ -1519,9 +1547,13 @@ def run_plots(csv_path: Path, outdir: Path, *, statistical_test: str = "t_test",
                     "spotting_paired_ttests.csv", "spotting_anova.csv"):
         for old in figures.glob(pattern):
             old.unlink()
+    for old in (figures / "horizontal").glob("spotting_*.png"):
+        old.unlink()               # the sideways twins of those graphs
     import spotting_plots
     spotting_plots.draw(csv_path, figures, statistical_test=statistical_test,
-                        p_adjust=p_adjust, alpha=alpha)
+                        p_adjust=p_adjust, alpha=alpha, posthoc=posthoc,
+                        extra_references=extra_references,
+                        all_pairs=all_pairs)
 
 
 if __name__ == "__main__":

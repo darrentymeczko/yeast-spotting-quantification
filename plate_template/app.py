@@ -14,12 +14,14 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 
+from uikit import dpi
+from uikit.host import StandaloneHost, as_host
+
 from . import theme
 from .autofill import (
     Plan,
     RunFillSpec,
     SeriesFillSpec,
-    plan_duplicate_plate,
     plan_paint,
     plan_run_fill,
     plan_series_fill,
@@ -84,12 +86,7 @@ the line under the grid tells you what that tool does.
 def _enable_dpi_awareness() -> None:
     """Without this tkinter is blurry on high-DPI Windows and the digits in
     each spot become unreadable. Must run before the Tk root is created."""
-    try:
-        import ctypes
-
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    dpi.enable_dpi_awareness()
 
 
 def default_template_dir() -> Path:
@@ -102,16 +99,21 @@ def default_template_dir() -> Path:
 
 class DesignerApp:
     def __init__(
-        self, root: tk.Tk, template: Template, path: Path | None = None
+        self, root, template: Template, path: Path | None = None
     ) -> None:
-        self.root = root
+        """`root` is a host (`uikit.host`), or a Tk window to stand alone in."""
+        self.host = as_host(root, APP_TITLE)
+        #: The toplevel, for dialog parents and focus. Hosted in the workbench
+        #: it is the workbench's own window, so it is never retitled, resized
+        #: or destroyed from here -- all of that goes through `self.host`.
+        self.root = self.host.window
         self.path = path
         self.show_tokens = tk.BooleanVar(value=False)
         self.tool = tk.StringVar(value="assign")
         self.canvases: dict[str, GridCanvas] = {}
         self.controller = EditorController(template, on_change=self.refresh)
 
-        root.title(APP_TITLE)
+        self.host.set_title(APP_TITLE)
         self._size_window()
         self._build_menu()
         self._build_body()
@@ -120,7 +122,11 @@ class DesignerApp:
         for variable in (self.context.replicate, self.context.dilution):
             variable.trace_add("write", lambda *_: self._sync_first_slot())
         self.refresh()
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.host.on_close(self._confirm_discard)
+        # For the surrounding program's own toolbar, when there is one.
+        for name, action in (("save", self.save_file), ("undo", self.undo),
+                             ("redo", self.redo)):
+            self.host.add_command(name, action)
 
     # -- construction --------------------------------------------------------
 
@@ -136,24 +142,18 @@ class DesignerApp:
         screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
         width = max(900, min(1700, int(screen_w * 0.70)))
         height = max(600, min(1100, int(screen_h * 0.80)))
-        root.geometry(
-            f"{width}x{height}+{max(0, (screen_w - width) // 2)}"
-            f"+{max(0, (screen_h - height) // 3)}"
-        )
         line = root.winfo_fpixels("1i") / 96 * 22
-        root.minsize(int(line * 26), int(line * 16))
+        self.host.suggest_size(width, height, int(line * 26), int(line * 16))
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self.root)
-
-        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu = self.host.add_menu("File")
         file_menu.add_command(
             label="New blank template", accelerator="Ctrl+N", command=self.new_blank
         )
         preset_menu = tk.Menu(file_menu, tearoff=False)
         for key, label, factory in list_presets():
             preset_menu.add_command(
-                label=label, command=lambda f=factory: self._load(f(), None)
+                label=label, command=lambda f=factory: self.new_from(f())
             )
         file_menu.add_cascade(label="New from preset", menu=preset_menu)
         file_menu.add_separator()
@@ -163,33 +163,29 @@ class DesignerApp:
         file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_file)
         file_menu.add_command(label="Save As...", command=self.save_file_as)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self._on_close)
-        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label=self.host.close_label, command=self.host.close)
+        self.file_menu = file_menu
 
-        edit_menu = tk.Menu(menubar, tearoff=False)
+        edit_menu = self.host.add_menu("Edit")
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
         edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
         edit_menu.add_separator()
         edit_menu.add_command(label="Rename template...", command=self.rename_template)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
         self.edit_menu = edit_menu
 
-        view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu = self.host.add_menu("View")
         view_menu.add_checkbutton(
             label="Show tokens", accelerator="Ctrl+T",
             variable=self.show_tokens, command=self._apply_token_view,
         )
-        menubar.add_cascade(label="View", menu=view_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu = self.host.add_menu("Help")
         help_menu.add_command(label="Quick start", command=self.quick_start)
         help_menu.add_command(label="About", command=self._about)
-        menubar.add_cascade(label="Help", menu=help_menu)
 
-        self.root.config(menu=menubar)
-
-        # Keys bound to a Canvas never fire unless it holds focus, so bind on
-        # the toplevel and ignore the event while a text field has focus.
+        # Keys bound to a Canvas never fire unless it holds focus, so they go
+        # to the host -- live anywhere in this tool, nowhere else -- and are
+        # ignored while a text field has focus.
         for sequence, action in (
             ("<Control-n>", self.new_blank),
             ("<Control-o>", self.open_file),
@@ -201,12 +197,13 @@ class DesignerApp:
             ("<Left>", lambda: self._step_plate(-1)),
             ("<Right>", lambda: self._step_plate(1)),
         ):
-            self.root.bind_all(sequence, self._guarded(action))
+            self.host.bind_key(sequence, self._guarded(action))
 
     def _guarded(self, action):
         def handler(_event=None):
             widget = self.root.focus_get()
-            if isinstance(widget, (tk.Entry, ttk.Entry, ttk.Spinbox, ttk.Combobox)):
+            if (action not in (self.undo, self.redo, self.save_file)
+                    and isinstance(widget, (tk.Entry, ttk.Entry, ttk.Spinbox, ttk.Combobox))):
                 return None
             action()
             return "break"
@@ -214,7 +211,7 @@ class DesignerApp:
         return handler
 
     def _build_body(self) -> None:
-        outer = ttk.Frame(self.root)
+        outer = ttk.Frame(self.host.frame)
         outer.pack(fill="both", expand=True)
 
         self.status = StatusBar(outer)
@@ -246,12 +243,14 @@ class DesignerApp:
 
         top = ttk.Frame(split)
         base = tkfont.nametofont("TkDefaultFont")
+        # A prefixed style, never the bare "TNotebook.Tab": that one is shared
+        # by every notebook in the process, the other tools' included.
         ttk.Style().configure(
-            "TNotebook.Tab",
+            "Plates.TNotebook.Tab",
             padding=(20, 10),
             font=(base.cget("family"), base.cget("size") + 1, "bold"),
         )
-        self.notebook = ttk.Notebook(top)
+        self.notebook = ttk.Notebook(top, style="Plates.TNotebook")
         self.notebook.pack(fill="both", expand=True)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.notebook.bind("<Button-3>", self._on_tab_menu)
@@ -548,6 +547,7 @@ class DesignerApp:
             "Shrink grid",
             f"Shrinking to {rows}x{cols} will discard {lost} placed spot(s).\n\n"
             f"Continue?",
+            parent=self.root,
         ):
             return
         self.controller.resize(rows, cols)
@@ -577,9 +577,7 @@ class DesignerApp:
         if offset is None:
             return
         new_id = self._next_plate_id()
-        self.controller.add_plate(new_id, f"Plate {new_id}")
-        plan = plan_duplicate_plate(self.template, source, new_id, offset)
-        self.controller.apply(new_id, plan, f"Duplicate plate {source}")
+        self.controller.duplicate_plate(source, new_id, offset)
         self.select_plate(new_id)
 
     def delete_plate(self) -> None:
@@ -587,10 +585,12 @@ class DesignerApp:
         if plate_id is None:
             return
         if len(self.template.plates) == 1:
-            messagebox.showinfo("Delete plate", "A template needs at least one plate.")
+            messagebox.showinfo("Delete plate", "A template needs at least one plate.",
+                                parent=self.root)
             return
         if not messagebox.askyesno(
-            "Delete plate", f"Delete plate {plate_id} and everything on it?"
+            "Delete plate", f"Delete plate {plate_id} and everything on it?",
+            parent=self.root,
         ):
             return
         self.controller.remove_plate(plate_id)
@@ -627,13 +627,20 @@ class DesignerApp:
     # -- files ---------------------------------------------------------------
 
     def new_blank(self) -> None:
-        self._load(blank(), None)
+        self.new_from(blank())
+
+    def new_from(self, template: Template) -> None:
+        """Start a new, unsaved template: in a tab of its own where the host
+        has tabs, otherwise in place of this one."""
+        if not self.host.open_document("plate", None, template):
+            self._load(template, None)
 
     def _confirm_discard(self) -> bool:
         if not self.controller.dirty:
             return True
         answer = messagebox.askyesnocancel(
-            "Unsaved changes", "Save the current template first?"
+            "Unsaved changes", "Save the current template first?",
+            parent=self.root,
         )
         if answer is None:
             return False
@@ -642,7 +649,9 @@ class DesignerApp:
         return True
 
     def open_file(self) -> None:
-        if not self._confirm_discard():
+        # Alone, opening replaces what is here, so ask about it first. In the
+        # workbench it opens beside it and there is nothing to discard.
+        if self.host.standalone and not self._confirm_discard():
             return
         start = default_template_dir()
         chosen = filedialog.askopenfilename(
@@ -650,13 +659,17 @@ class DesignerApp:
             initialdir=str(start if start.exists() else Path.cwd()),
             defaultextension=".json",
             filetypes=[("Plate template", "*.json"), ("All files", "*.*")],
+            parent=self.root,
         )
         if not chosen:
+            return
+        if self.host.open_document("plate", Path(chosen)):
             return
         try:
             template = load(Path(chosen))
         except TemplateError as exc:
-            messagebox.showerror("Could not open template", str(exc))
+            messagebox.showerror("Could not open template", str(exc),
+                                 parent=self.root)
             return
         self.controller.replace(template)
         self.path = Path(chosen)
@@ -670,14 +683,16 @@ class DesignerApp:
             "Save anyway?",
             f"This template has {len(errors)} blocking error(s) and cannot be "
             f"used for analysis yet.\n\nSave it anyway?",
+            parent=self.root,
         ):
             return False
         try:
             save(self.template, self.path)
         except OSError as exc:
-            messagebox.showerror("Could not save", str(exc))
+            messagebox.showerror("Could not save", str(exc), parent=self.root)
             return False
         self.controller.mark_saved()
+        self.refresh()
         return True
 
     def save_file_as(self) -> bool:
@@ -689,15 +704,12 @@ class DesignerApp:
             initialfile=f"{self.template.name}.json",
             defaultextension=".json",
             filetypes=[("Plate template", "*.json"), ("All files", "*.*")],
+            parent=self.root,
         )
         if not chosen:
             return False
         self.path = Path(chosen)
         return self.save_file()
-
-    def _on_close(self) -> None:
-        if self._confirm_discard():
-            self.root.destroy()
 
     # -- refresh -------------------------------------------------------------
 
@@ -729,7 +741,10 @@ class DesignerApp:
 
         mark = "*" if self.controller.dirty else ""
         name = self.path.name if self.path else f"{self.template.name} (unsaved)"
-        self.root.title(f"{mark}{name} - {APP_TITLE}")
+        self.host.set_title(f"{mark}{name} - {APP_TITLE}",
+                            tab=self.path.stem if self.path else self.template.name)
+        self.host.set_dirty(self.controller.dirty)
+        self.host.set_path(self.path)
 
         for canvas in self.canvases.values():
             canvas.redraw()
@@ -777,6 +792,7 @@ class DesignerApp:
             f"{APP_TITLE}\n\n"
             "Design a spotting-assay plate layout and save it as a reusable, "
             "strain-agnostic template.",
+            parent=self.root,
         )
 
 
@@ -865,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _enable_dpi_awareness()
     root = tk.Tk()
-    app = DesignerApp(root, template, path)
+    app = DesignerApp(StandaloneHost(root, APP_TITLE), template, path)
 
     if args.selftest:
         root.update_idletasks()

@@ -142,6 +142,40 @@ def build(pairs: list, out_path: Path, note=None) -> Path:
     return out_path
 
 
+def build_slides(slides: list, out_path: Path) -> Path:
+    """One slide per `(pictures, note)`, in the same widescreen deck.
+
+    Two pictures are the montage and the graph, placed as `build` places them.
+    One picture is already laid out whole -- the review's view of a sheet, its
+    montage and graph arranged together -- and is run as large as the slide
+    allows, centred.
+    """
+    from pptx import Presentation
+    from pptx.util import Inches
+    from PIL import Image
+
+    pres = Presentation()
+    pres.slide_width = Inches(SLIDE_W_IN)
+    pres.slide_height = Inches(SLIDE_H_IN)
+    blank = pres.slide_layouts[6]        # "Blank" -- no placeholders
+
+    for pictures, note in slides:
+        slide = pres.slides.add_slide(blank)
+        boxes = (((0.0, SLIDE_W_IN),) if len(pictures) == 1
+                 else ((0.0, LEFT_W_IN), (RIGHT_X_IN, RIGHT_W_IN)))
+        for path, (box_x, box_w) in zip(pictures, boxes):
+            with Image.open(path) as im:
+                iw, ih = im.size
+            x, y, w, h = _fit(iw, ih, box_x, box_w)
+            slide.shapes.add_picture(str(path), Inches(x), Inches(y),
+                                     Inches(w), Inches(h))
+        slide.notes_slide.notes_text_frame.text = note
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pres.save(str(out_path))
+    return out_path
+
+
 def main(argv=None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

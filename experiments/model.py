@@ -4,9 +4,10 @@
 `sample_slot` means "the Nth sample in the panel" and its docstring defers
 binding those slots to strain names to "a separate layer". This is that layer.
 
-An experiment is one strain panel, spotted across one or more conditions, with a
-positive control that every strain is relativised to. Condition stays an axis
-INSIDE the experiment rather than splitting it, because the panel is the thing
+Each strain group is one panel, spotted across one or more conditions, with a
+positive control that every strain is relativised to. An experiment can hold
+multiple named groups, but each is quantified and reviewed independently.
+Condition stays an axis inside each group, because the panel is the thing
 that was physically spotted: the same eight strains go onto glucose, glycerol
 and potassium acetate, and only the control may differ between them. That
 difference is not cosmetic -- the WT BY used here has a growth defect on
@@ -21,11 +22,13 @@ This module must stay importable headless -- no tkinter, no pipeline imports.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .profiles import NamingProfile
 
-SCHEMA_VERSION = 1
+# Version 2 adds strain groups; version 3 adds optional multi-step settings.
+# Older designers must refuse newer files rather than silently omit analyses.
+SCHEMA_VERSION = 3
 KIND = "spotting_experiment"
 
 #: Handpicked photos the user has already chosen, quantified once.
@@ -39,6 +42,12 @@ MODES = (QUANTIFY, TIMECOURSE)
 #: every measured row and column, not a display preference.
 PHOTO_TOPS = ("top", "right", "bottom", "left")
 
+#: Graphs, charts and statistics, as the pipelines have always produced.
+FULL_OUTPUT = "full"
+#: Only the per-spot CSV of raw and normalised grey values; nothing is drawn.
+DATA_OUTPUT = "data"
+OUTPUTS = (FULL_OUTPUT, DATA_OUTPUT)
+
 #: Which dilution level to score, for `QUANTIFY` mode. Mirrors the shape already
 #: stored in `spotting_config.json`: one choice for the whole condition, or one
 #: per plate when the two plates grew differently.
@@ -48,6 +57,73 @@ PHOTO_TOPS = ("top", "right", "bottom", "left")
 #: treatment that grew to different densities can each be scored at whichever
 #: dilution is actually readable on it without the two becoming incomparable.
 DILUTION_MODES = ("condition", "plate")
+
+#: The statistics the review tool offers, repeated here so the designer can set
+#: them before a run without importing the plotting stack. The values are the
+#: keyword arguments `spotting_batch.run_plots` takes.
+STATISTICAL_TESTS = ("t_test", "anova")
+#: Multiple-comparison corrections for the ratio t-tests.
+P_ADJUST_METHODS = ("none", "holm", "bonferroni", "sidak")
+#: The pairwise test that follows an ANOVA. Mirrors
+#: `spotting_plots.POSTHOC_METHODS`.
+POSTHOC_METHODS = ("dunnett", "tukey", "holm", "bonferroni", "sidak", "none")
+
+
+@dataclass
+class Statistics:
+    """Which tests the figures report, chosen before the run.
+
+    A time course also counts each candidate's significant strains with this
+    test, so its ranking and the figures agree on which strains differ.
+
+    The defaults are the pipeline's own: ratio paired t-tests of every strain
+    against the control, uncorrected, at p < 0.05. The review tool can still
+    change any of this afterwards; the run seeds it with these.
+    """
+
+    test: str = "t_test"
+    p_adjust: str = "none"
+    #: Only read after an ANOVA.
+    posthoc: str = "dunnett"
+    alpha: float = 0.05
+    #: Compare every strain with every other, instead of with the references.
+    all_pairs: bool = False
+    #: Strain names every other strain is ALSO compared with, besides the
+    #: control. Ignored when `all_pairs`.
+    extra_references: tuple[str, ...] = ()
+
+    def plot_kwargs(self) -> dict:
+        """The keyword arguments `spotting_batch.run_plots` takes, as chosen."""
+        return {"statistical_test": self.test,
+                "p_adjust": self.p_adjust if self.test == "t_test" else "none",
+                "alpha": float(self.alpha),
+                "posthoc": self.posthoc if self.test == "anova" else "none",
+                "extra_references": tuple(self.extra_references),
+                "all_pairs": bool(self.all_pairs)}
+
+    def review_dict(self) -> dict:
+        """The `statistics` block of a results folder's `review.json`."""
+        return {"test": self.test, "p_adjust": self.p_adjust,
+                "alpha": float(self.alpha), "posthoc": self.posthoc,
+                "extra_references": list(self.extra_references),
+                "all_pairs": bool(self.all_pairs)}
+
+
+@dataclass
+class MultiStepAnalysis:
+    """Optional comparison analysis; physical plate labels persist across time.
+
+    Labels are local to a strain group, condition and template plate position.
+    The template's replicate numbers identify matched biological blocks.
+    """
+
+    enabled: bool = False
+    scope: str = "technical"
+    method: str = "two_step"
+    dilution: int | None = None
+    hours: tuple[float, ...] = ()
+    plate_ids: dict[str, str] = field(default_factory=dict)
+    excluded_photos: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,8 +152,18 @@ class Condition:
 
 
 @dataclass
+class StrainGroup:
+    """A separately labelled panel sharing the experiment's plate geometry."""
+
+    strains: list[str | None] = field(default_factory=list)
+    control_slot: int | None = None
+    picks: dict[str, dict[str, str]] = field(default_factory=dict)
+    conditions: dict[str, Condition] = field(default_factory=dict)
+
+
+@dataclass
 class Experiment:
-    """One strain panel, its conditions, and where its photos live."""
+    """One or more strain panels, their treatments and shared photo folder."""
 
     name: str = "Untitled"
     #: The template this panel was spotted on. `template_id` is the authority --
@@ -101,10 +187,11 @@ class Experiment:
     #: sets in one directory), only photos whose `set` facet equals this belong
     #: to this experiment. None means "every photo under the root".
     set_key: str | None = None
-    #: How a photo's path says what it is. TIMECOURSE only: a capture tree holds
-    #: hundreds of photos and they have to be read automatically. In QUANTIFY
-    #: mode the photos are chosen one at a time by eye, so there is nothing to
-    #: infer and no profile is required.
+    #: Explicit panels; every included photo must name one when this is used.
+    strain_groups: dict[str, StrainGroup] = field(default_factory=dict)
+    #: How a photo's path says what it is. Both modes use this to suggest
+    #: conditions; TIMECOURSE also requires plate and timepoint identities.
+    #: QUANTIFY still chooses photos by eye and does not require a profile.
     profile: NamingProfile = field(default_factory=NamingProfile)
     #: QUANTIFY only: condition code -> plate id -> relpath. The photograph the
     #: user picked for each plate of each condition, stated outright rather than
@@ -115,6 +202,12 @@ class Experiment:
     overrides: dict[str, dict] = field(default_factory=dict)
     #: relpaths the user positively excluded -- a blurred shot, a test frame.
     ignored: list[str] = field(default_factory=list)
+    #: The statistical tests the run's figures report.
+    statistics: Statistics = field(default_factory=Statistics)
+    multi_step: MultiStepAnalysis = field(default_factory=MultiStepAnalysis)
+    #: FULL_OUTPUT draws every graph and chart; DATA_OUTPUT only writes the
+    #: per-spot CSV (raw and normalised grey values).
+    output: str = FULL_OUTPUT
     id: str = ""
     revision: int = 1
     description: str = ""
@@ -122,6 +215,20 @@ class Experiment:
     schema_version: int = SCHEMA_VERSION
 
     # -- panel -------------------------------------------------------------
+
+    def for_group(self, key: str) -> Experiment:
+        """Single-panel view for existing measurement and review contracts.
+
+        Lists/picks reference the panel; condition views carry the shared names
+        and group-specific controls, exclusions and dilution choices.
+        """
+        group = self.strain_groups[key]
+        return replace(self, name=f"{self.name} - {key}", set_key=key,
+                       strains=group.strains, control_slot=group.control_slot,
+                       picks=group.picks, strain_groups={},
+                       conditions=[replace(group.conditions.get(c.code, c),
+                                           code=c.code, label=c.label)
+                                   for c in self.conditions])
 
     @property
     def is_timecourse(self) -> bool:

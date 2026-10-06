@@ -14,6 +14,8 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Callable
 
+from uikit import tokens
+
 _NONE = "(use the experiment's)"
 
 
@@ -24,13 +26,16 @@ class ConditionsPanel(ttk.Frame):
         self.on_change = on_change
         self.condition_control = tk.StringVar(value="")
         self._exclude_vars: dict[int, tk.BooleanVar] = {}
+        from .groups import GroupSelector
+        self.group_selector = GroupSelector(self, controller, on_change)
+        self.group_selector.pack(fill="x", pady=(0, 8))
 
         self.intro = ttk.Label(
             self,
             text=("Each medium or treatment the panel was spotted on. A "
                   "condition may name its own control:\nuse that when a strain "
                   "does not grow on one medium and cannot be the reference there."),
-            foreground="#555", justify="left",
+            foreground=tokens.TEXT_MUTED, justify="left",
         )
         self.intro.pack(anchor="w", fill="x", pady=(0, 8))
         self.bind("<Configure>", lambda e: self.intro.configure(
@@ -39,6 +44,7 @@ class ConditionsPanel(ttk.Frame):
         bar = ttk.Frame(self)
         bar.pack(fill="x", pady=(0, 6))
         ttk.Button(bar, text="Add...", command=self._add).pack(side="left")
+        ttk.Button(bar, text="Rename...", command=self._rename).pack(side="left", padx=4)
         ttk.Button(bar, text="Remove", command=self._remove).pack(side="left", padx=4)
         self.adopt = ttk.Button(bar, text="Add the ones found in the photos",
                                 command=self._adopt)
@@ -56,7 +62,7 @@ class ConditionsPanel(ttk.Frame):
 
         # No dilution column: which row to score is judged against the picture
         # and is set per plate, on the Plates tab.
-        columns = ("code", "label", "control", "exclude", "photos")
+        columns = ("label", "control", "exclude", "photos")
         table = ttk.Frame(left)
         self.table_frame = table
         table.pack(fill="both", expand=True)
@@ -75,8 +81,7 @@ class ConditionsPanel(ttk.Frame):
             style=self.tree_style,
         )
         self._column_specs = (
-            ("code", "Code", 42, 1),
-            ("label", "Written as", 68, 2),
+            ("label", "Treatment", 110, 3),
             ("control", "Control", 70, 2),
             ("exclude", "Excluded slots", 78, 2),
             ("photos", "Photos", 45, 1),
@@ -105,7 +110,7 @@ class ConditionsPanel(ttk.Frame):
         )
         self.condition_name.pack(fill="x")
         self.condition_photos = ttk.Label(
-            self.inspector, text="", foreground="#555", anchor="w")
+            self.inspector, text="", foreground=tokens.TEXT_MUTED, anchor="w")
         self.condition_photos.pack(fill="x", pady=(2, 12))
         ttk.Label(self.inspector, text="Control for this condition",
                   font=("", 9, "bold")).pack(anchor="w")
@@ -120,7 +125,7 @@ class ConditionsPanel(ttk.Frame):
         self.exclude_hint = ttk.Label(
             self.inspector,
             text="Uncheck every slot to include the full panel.",
-            foreground="#555", justify="left",
+            foreground=tokens.TEXT_MUTED, justify="left",
         )
         self.exclude_hint.pack(anchor="w", fill="x", pady=(2, 4))
         exclude_area = ttk.Frame(self.inspector)
@@ -178,11 +183,14 @@ class ConditionsPanel(ttk.Frame):
             self.tree.column(key, width=width)
 
     def refresh(self) -> None:
-        e = self.ctl.experiment
+        self.group_selector.refresh()
+        e = self.ctl.panel_experiment
         selected = self.selected_code()
         counts = {}
         if self.ctl.resolution is not None:
-            for row in self.ctl.resolution.usable():
+            for row in self.ctl.found_condition_rows():
+                if self.ctl.experiment.strain_groups and row.set_key != e.set_key:
+                    continue
                 counts[row.condition] = counts.get(row.condition, 0) + 1
 
         self.tree.delete(*self.tree.get_children())
@@ -193,7 +201,7 @@ class ConditionsPanel(ttk.Frame):
                        if e.control_slot else "-")
             self.tree.insert(
                 "", "end", iid=c.code,
-                values=(c.code, c.label, control,
+                values=(c.display(), control,
                         ", ".join(str(s) for s in c.exclude) or "-",
                         counts.get(c.code, 0)),
             )
@@ -202,7 +210,7 @@ class ConditionsPanel(ttk.Frame):
         elif self.tree.get_children():
             self.tree.selection_set(self.tree.get_children()[0])
 
-        found = set(self.ctl.resolution.conditions()) if self.ctl.resolution else set()
+        found = {r.condition for r in self.ctl.found_condition_rows()}
         missing = found - set(e.condition_codes())
         self.adopt.state(["!disabled"] if missing else ["disabled"])
         self.adopt.configure(
@@ -218,31 +226,39 @@ class ConditionsPanel(ttk.Frame):
     # -- edits ---------------------------------------------------------------
 
     def _add(self) -> None:
-        code = _ask_text(
+        name = _ask_text(
             self,
             "Add condition",
-            "Short code, used to name result files (e.g. GLU, K-OAc):",
+            "Treatment name (e.g. Glucose or Glucose + H2O2):",
         )
-        if not code:
+        if not name:
             return
-        label = _ask_text(
-            self,
-            "Add condition",
-            "How it is written on the plate (e.g. Glucose):",
-            initial=code,
-        )
-        code = code.strip()
-        if self.ctl.add_condition(code, label or code):
+        try:
+            code = self.ctl.add_named_condition(name)
             self.on_change()
             self._show(code)
-        else:
-            messagebox.showinfo("Add condition",
-                                f"{code.strip()!r} is already there.", parent=self)
+        except ValueError as exc:
+            messagebox.showerror("Add condition", str(exc), parent=self)
 
     def _remove(self) -> None:
         code = self.selected_code()
         if code and self.ctl.remove_condition(code):
             self.on_change()
+
+    def _rename(self) -> None:
+        old = self.selected_code()
+        if not old:
+            return
+        condition = self.ctl.experiment.condition(old)
+        label = _ask_text(self, "Rename treatment", "Treatment name:", initial=condition.display())
+        if label is None:
+            return
+        try:
+            if self.ctl.set_condition_name(old, label):
+                self.on_change()
+                self._show(old)
+        except ValueError as exc:
+            messagebox.showerror("Edit condition", str(exc), parent=self)
 
     def _adopt(self) -> None:
         before = set(self.ctl.experiment.condition_codes())
@@ -270,9 +286,11 @@ class ConditionsPanel(ttk.Frame):
         self.tree.selection_set(code)
         self.tree.focus(code)
         column = self.tree.identify_column(event.x)
-        if column == "#3":
+        if column == "#1":
+            self._rename()
+        elif column == "#2":
             self._set_control()
-        elif column == "#4":
+        elif column == "#3":
             self._set_exclude()
 
     def _selection_changed(self, _event=None) -> None:
@@ -296,14 +314,16 @@ class ConditionsPanel(ttk.Frame):
             self._exclude_vars.clear()
             return
 
-        e = self.ctl.experiment
+        e = self.ctl.panel_experiment
         condition = e.condition(code)
         if counts is None:
             counts = {}
             if self.ctl.resolution is not None:
-                for row in self.ctl.resolution.usable():
+                for row in self.ctl.found_condition_rows():
+                    if self.ctl.experiment.strain_groups and row.set_key != e.set_key:
+                        continue
                     counts[row.condition] = counts.get(row.condition, 0) + 1
-        self.condition_name.configure(text=f"{condition.label or code}  ({code})")
+        self.condition_name.configure(text=condition.display())
         photos = counts.get(code, 0)
         self.condition_photos.configure(
             text=f"{photos} photograph{'s' if photos != 1 else ''} found")
@@ -353,11 +373,11 @@ class ConditionsPanel(ttk.Frame):
         code = self.selected_code()
         if not code:
             return
-        e = self.ctl.experiment
+        e = self.ctl.panel_experiment
         options = [_NONE] + [
             f"{s}: {e.strain(s)}" for s in e.filled_slots()
         ]
-        chosen = _ask_choice(self, f"Control for {code}",
+        chosen = _ask_choice(self, f"Control for {e.condition(code).display()}",
                              "Which slot is the positive control here?", options)
         if chosen is None:
             return
@@ -369,13 +389,13 @@ class ConditionsPanel(ttk.Frame):
         code = self.selected_code()
         if not code:
             return
-        e = self.ctl.experiment
+        e = self.ctl.panel_experiment
         slot_options = {
             s: f"{s}: {e.strain(s)}" for s in e.filled_slots()
         }
         chosen = _ask_choices(
             self,
-            f"Excluded slots for {code}",
+            f"Excluded slots for {e.condition(code).display()}",
             "Which slots should be excluded here? Click a slot to toggle it.",
             list(slot_options.values()),
             selected={slot_options[s] for s in e.exclude_for(code)
@@ -388,7 +408,7 @@ class ConditionsPanel(ttk.Frame):
             self.on_change()
 
 
-def _ask_text(parent, title: str, prompt: str, initial: str = "") -> str | None:
+def _ask_text(parent, title: str, prompt: str, initial: str = "", *, choices=None) -> str | None:
     """A text prompt that reliably gives its entry keyboard focus on Windows."""
     win = tk.Toplevel(parent)
     win.title(title)
@@ -397,7 +417,8 @@ def _ask_text(parent, title: str, prompt: str, initial: str = "") -> str | None:
 
     ttk.Label(win, text=prompt, padding=(10, 8)).pack(anchor="w")
     value = tk.StringVar(value=initial)
-    entry = ttk.Entry(win, textvariable=value, width=42)
+    entry = (ttk.Combobox(win, textvariable=value, values=choices, width=42)
+             if choices is not None else ttk.Entry(win, textvariable=value, width=42))
     entry.pack(fill="x", padx=10)
 
     result: dict[str, str | None] = {"value": None}

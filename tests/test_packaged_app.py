@@ -31,8 +31,10 @@ import spotting_app as app  # noqa: E402
 #: bat file -> (stage, names both must mention). If a launcher is pointed at a
 #: different module, the .exe must follow, or the two quietly stop agreeing.
 PAIRS = {
+    "run_workbench.bat": ("workbench", ["workbench"]),
     "run_plate_designer.bat": ("plate", ["plate_template.app"]),
     "run_experiment_designer.bat": ("experiment", ["experiments.app"]),
+    "run_data_review.bat": ("data-review", ["data_review.app"]),
     "run_spotting.bat": ("spotting", ["spotting_batch"]),
     "run_timecourse.bat": ("timecourse", ["spotting_timecourse"]),
     "run_review.bat": ("review", ["results_review.app", "results_review.cli"]),
@@ -49,11 +51,20 @@ def test_a_stage_runs_what_its_bat_runs(bat):
         assert needle in stage_text, f"stage {key!r} does not run {needle}"
 
 
-def test_every_launcher_row_is_a_real_stage():
-    listed = [k for _, keys in app.SECTIONS for k in keys]
-    assert len(listed) == len(set(listed))
-    assert set(listed) == {s for s, _ in PAIRS.values()}
+def test_every_bat_file_is_a_real_stage_and_stage_keys_are_unique():
+    assert {s for s, _ in PAIRS.values()} <= set(app.BY_KEY)
     assert len({s.key for s in app.STAGES}) == len(app.STAGES)
+
+
+def test_home_offers_each_tool_in_the_order_the_work_happens():
+    """The workbench's Home cards are the four tools that still have a window
+    of their own; the console pipelines are deliberately not among them."""
+    from workbench.registry import KINDS
+
+    assert [k.key for k in KINDS] == ["plate", "experiment", "data-review",
+                                      "review"]
+    assert [k.step for k in KINDS] == [1, 2, 3, 4]
+    assert all(k.key in app.BY_KEY for k in KINDS)
 
 
 # --- dispatch ------------------------------------------------------------------
@@ -68,6 +79,11 @@ def seen(monkeypatch):
             return 0
         monkeypatch.setitem(app.BY_KEY, key, app.replace(stage, run=run))
     return calls
+
+
+def test_no_arguments_opens_the_workbench(seen):
+    assert app.main([]) == 0
+    assert seen == [("workbench", [])]
 
 
 def test_arguments_pass_through_untouched(seen):
@@ -162,7 +178,7 @@ def packaged(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "executable", str(exe))
     yield tmp_path
     monkeypatch.undo()
-    for name in ("spotting_paths", "experiments", "results_review"):
+    for name in ("spotting_paths", "experiments", "data_review", "results_review"):
         importlib.reload(importlib.import_module(name))
 
 
@@ -189,6 +205,13 @@ def test_the_review_window_uses_the_folder_the_exe_is_in(packaged):
 
     importlib.reload(results_review)
     assert results_review.PROJECT_ROOT == packaged.resolve()
+
+
+def test_the_data_review_uses_the_folder_the_exe_is_in(packaged):
+    import data_review
+
+    importlib.reload(data_review)
+    assert data_review.PROJECT_ROOT == packaged.resolve()
 
 
 def test_a_src_folder_beside_the_exe_is_used_ahead_of_the_bundled_engine(packaged):

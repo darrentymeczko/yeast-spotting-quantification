@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from ..autofill import Plan, apply_plan
+from ..autofill import Plan, apply_plan, plan_duplicate_plate
 from ..model import Template
 from ..schema import from_dict, to_dict
 
@@ -155,6 +155,19 @@ class EditorController:
         plate = self.template.plate(plate_id)
         self.template.plates.remove(plate)
         return self._commit(before, f"Delete plate {plate_id}")
+
+    def duplicate_plate(self, source: str, new_id: str, offset: int) -> bool:
+        """Creating the plate and copying its cells is a single user action."""
+        self.template.plate(source)  # Validate before adding anything.
+        before = self.snapshot()
+        try:
+            self.template.add_plate(new_id, f"Plate {new_id}")
+            plan = plan_duplicate_plate(self.template, source, new_id, offset)
+            apply_plan(self.template.plate(new_id), plan)
+        except Exception:
+            self.template = from_dict(before)
+            raise
+        return self._commit(before, f"Duplicate plate {source}")
 
     def rename_plate(self, plate_id: str, label: str) -> bool:
         before = self.snapshot()

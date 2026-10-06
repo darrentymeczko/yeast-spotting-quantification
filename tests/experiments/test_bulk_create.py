@@ -76,6 +76,27 @@ def fill(dialog, column: int, names, control: int = 1):
 # --- the grid ---------------------------------------------------------------
 
 
+def test_bulk_conditions_use_names_and_keep_existing_ids(
+        bulk_tk_root, out_dir, folders, monkeypatch):
+    from experiments.gui import bulk
+
+    dialog = open_dialog(bulk_tk_root, out_dir, folders)
+    dialog.conditions = [Condition("OLD-ID", "Glucose", control_slot=2)]
+
+    def answer(_parent, _title, prompt, initial):
+        assert initial == "Glucose"
+        assert "Potassium Acetate" in prompt
+        return "Glucose, Glycerol, glycerol"
+
+    monkeypatch.setattr(bulk, "_ask_line", answer)
+    dialog._edit_conditions()
+    assert [c.display() for c in dialog.conditions] == ["Glucose", "Glycerol"]
+    assert dialog.conditions[0].code == "OLD-ID"
+    assert dialog.conditions[0].control_slot == 2
+    assert dialog.conditions_label.cget("text") == "Glucose, Glycerol"
+    dialog.destroy()
+
+
 def test_the_grid_has_a_column_per_folder_and_a_row_per_slot(bulk_tk_root, out_dir,
                                                              folders):
     d = open_dialog(bulk_tk_root, out_dir, folders)

@@ -147,7 +147,7 @@ class StatusBar(ttk.Frame):
 class CandidateList(ttk.Frame):
     """Every candidate for the current medium, with the numbers it was ranked on."""
 
-    COLUMNS = (("mark", "", 26), ("when", "Timepoint", 78),
+    COLUMNS = (("mark", "", 36), ("when", "Timepoint", 78),
                ("dil", "Dilution", 62), ("pair", "Photos", 130),
                ("score", "Score", 52), ("cv", "CV", 50), ("sig", "Sig", 44))
 
@@ -171,7 +171,7 @@ class CandidateList(ttk.Frame):
             # a second thing to keep in step with the columns themselves.
             self.tree.heading(key, text=title,
                               command=lambda k=key: self.sort_by(k))
-            self.tree.column(key, width=width, stretch=(key == "pair"),
+            self.tree.column(key, width=theme.px(width), stretch=(key == "pair"),
                              anchor="w" if key in ("when", "dil", "pair")
                              else "center")
         bar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -180,6 +180,7 @@ class CandidateList(ttk.Frame):
         bar.grid(row=0, column=1, sticky="ns")
 
         self.tree.tag_configure("default", foreground=theme.DEFAULT_MARK)
+        self.tree.tag_configure("datareview", foreground=theme.REVIEWED_BAD)
         self.tree.tag_configure("chosen", background=theme.CHOSEN_SOFT,
                                 foreground=theme.CHOSEN, font=theme.FONT_BOLD)
         self.tree.tag_configure("nosheet", foreground=theme.MUTED)
@@ -197,15 +198,19 @@ class CandidateList(ttk.Frame):
         self._default: "Candidate | None" = None
         self._chosen: "Candidate | None" = None
         self._has_sheet = set()
+        self._flagged: dict = {}
 
     # -- contents ------------------------------------------------------------
 
     def show(self, candidates: list[Candidate], default: "Candidate | None",
-             chosen: "Candidate | None", has_sheet) -> None:
+             chosen: "Candidate | None", has_sheet, flagged=None) -> None:
+        """`flagged`: candidate key -> (plates, spots) the data review flagged
+        among what that candidate scores. Marked ⚑; nothing is hidden."""
         self._candidates = list(candidates)
         self._default = default
         self._chosen = chosen
         self._has_sheet = set(has_sheet)
+        self._flagged = dict(flagged or {})
         self._repopulate()
 
     def sort_by(self, column: str) -> None:
@@ -252,6 +257,11 @@ class CandidateList(ttk.Frame):
                 tags.append("chosen")
             if c.key not in self._has_sheet:
                 tags.append("nosheet")
+            if c.key in self._flagged:
+                mark += "⚑"
+                # Before "chosen", so the chosen row keeps its own colours.
+                at = tags.index("chosen") if "chosen" in tags else len(tags)
+                tags.insert(at, "datareview")
             iid = str(i)
             self._by_iid[iid] = c
             self.tree.insert(
@@ -266,6 +276,8 @@ class CandidateList(ttk.Frame):
         note = f"{len(self._candidates)} candidates"
         if n_missing:
             note += f" · {n_missing} without a drawn sheet"
+        if self._flagged:
+            note += f" · ⚑ {len(self._flagged)} use flagged data"
         self.count.configure(text=note)
         if select is not None:
             self.tree.selection_set(select)

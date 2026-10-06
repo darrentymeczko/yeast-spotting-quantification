@@ -5,7 +5,9 @@ import json
 import pytest
 
 from experiments import profiles, schema
-from experiments.model import KIND, SCHEMA_VERSION, QUANTIFY, TIMECOURSE, Condition, Experiment
+from experiments.model import (
+    KIND, SCHEMA_VERSION, QUANTIFY, TIMECOURSE, Condition, Experiment, Statistics,
+)
 from experiments.schema import ExperimentError
 
 
@@ -195,3 +197,46 @@ def test_slots_are_one_based():
     assert e.strain(99) is None
     with pytest.raises(ValueError, match="1-based"):
         e.set_strain(0, "x")
+
+
+# --- statistics ---------------------------------------------------------------
+
+
+def test_statistics_round_trip():
+    e = sample()
+    e.statistics = Statistics(test="anova", posthoc="holm", alpha=0.01,
+                              extra_references=("ΔATX1",))
+    again = schema.loads_experiment(schema.dumps_experiment(e))
+    assert again.statistics == e.statistics
+
+
+def test_an_older_file_without_statistics_gets_the_pipeline_defaults():
+    d = json.loads(schema.dumps_experiment(sample()))
+    del d["statistics"]
+    assert schema.from_dict(d).statistics == Statistics()
+
+
+@pytest.mark.parametrize("key, value", [
+    ("test", "chi_square"), ("p_adjust", "BH"), ("posthoc", "scheffe"),
+    ("alpha", 1.5), ("alpha", True), ("extra_references", [3]),
+])
+def test_bad_statistics_are_refused(key, value):
+    d = json.loads(schema.dumps_experiment(sample()))
+    d["statistics"][key] = value
+    with pytest.raises(ExperimentError, match=rf"\$\.statistics\.{key}"):
+        schema.from_dict(d)
+
+
+def test_dunnett_is_not_kept_for_every_pair():
+    d = json.loads(schema.dumps_experiment(sample()))
+    d["statistics"].update(test="anova", posthoc="dunnett", all_pairs=True)
+    assert schema.from_dict(d).statistics.posthoc == "tukey"
+
+
+def test_plot_kwargs_only_pass_the_follow_up_that_applies():
+    t = Statistics(p_adjust="holm", posthoc="tukey").plot_kwargs()
+    assert (t["statistical_test"], t["p_adjust"], t["posthoc"]) == (
+        "t_test", "holm", "none")
+    a = Statistics(test="anova", p_adjust="holm", posthoc="tukey").plot_kwargs()
+    assert (a["statistical_test"], a["p_adjust"], a["posthoc"]) == (
+        "anova", "none", "tukey")

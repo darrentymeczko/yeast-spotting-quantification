@@ -21,12 +21,19 @@ from .model import (
     DILUTION_MODES,
     KIND,
     MODES,
+    OUTPUTS,
+    P_ADJUST_METHODS,
     PHOTO_TOPS,
+    POSTHOC_METHODS,
     SCHEMA_VERSION,
+    STATISTICAL_TESTS,
     Condition,
     Experiment,
+    Statistics,
+    StrainGroup,
 )
 from .profiles import ProfileError, profile_from_dict, profile_to_dict
+from . import multistep
 
 
 class ExperimentError(ValueError):
@@ -100,9 +107,50 @@ def condition_from_dict(raw: dict, path: str) -> Condition:
     )
 
 
+def statistics_to_dict(s: Statistics) -> dict:
+    return s.review_dict()
+
+
+def statistics_from_dict(raw: dict, path: str) -> Statistics:
+    def choice(key: str, allowed: tuple[str, ...], default: str) -> str:
+        value = _get(raw, key, path, str, default=default)
+        if value not in allowed:
+            raise ExperimentError(
+                f"{path}.{key}: expected one of {', '.join(allowed)}, "
+                f"got {value!r}"
+            )
+        return value
+
+    test = choice("test", STATISTICAL_TESTS, "t_test")
+    p_adjust = choice("p_adjust", P_ADJUST_METHODS, "none")
+    posthoc = choice("posthoc", POSTHOC_METHODS, "dunnett")
+    alpha = _get(raw, "alpha", path, (int, float), default=0.05)
+    if isinstance(alpha, bool) or not 0 < float(alpha) < 1:
+        raise ExperimentError(f"{path}.alpha: must be between 0 and 1")
+    all_pairs = _get(raw, "all_pairs", path, bool, default=False)
+    refs = _get(raw, "extra_references", path, list, default=[])
+    for i, ref in enumerate(refs):
+        if not isinstance(ref, str):
+            raise ExperimentError(
+                f"{path}.extra_references[{i}]: expected a strain name, "
+                f"got {type(ref).__name__}"
+            )
+    if all_pairs and posthoc == "dunnett":
+        # Dunnett only compares with a reference; mirrors Review.from_dict.
+        posthoc = "tukey"
+    return Statistics(
+        test=test,
+        p_adjust=p_adjust,
+        posthoc=posthoc,
+        alpha=float(alpha),
+        all_pairs=all_pairs,
+        extra_references=tuple(dict.fromkeys(r for r in refs if r.strip())),
+    )
+
+
 def to_dict(e: Experiment) -> dict:
     d: dict = {
-        "schema_version": e.schema_version,
+        "schema_version": max(e.schema_version, SCHEMA_VERSION) if (e.strain_groups or e.multi_step.enabled) else e.schema_version,
         "kind": KIND,
         "id": e.id,
         "revision": e.revision,
@@ -118,6 +166,16 @@ def to_dict(e: Experiment) -> dict:
     d["strains"] = list(e.strains)
     d["control_slot"] = e.control_slot
     d["conditions"] = [condition_to_dict(c) for c in e.conditions]
+    d["statistics"] = statistics_to_dict(e.statistics)
+    d["multi_step"] = multistep.to_dict(e.multi_step)
+    d["output"] = e.output
+    if e.strain_groups:
+        d["strain_groups"] = {
+            key: {"strains": list(g.strains), "control_slot": g.control_slot,
+                  "picks": {c: dict(p) for c, p in g.picks.items()},
+                  "conditions": [condition_to_dict(c) for c in g.conditions.values()]}
+            for key, g in e.strain_groups.items()
+        }
 
     photos: dict = {
         "root": e.photo_root,
@@ -162,6 +220,12 @@ def from_dict(d: dict) -> Experiment:
     if mode not in MODES:
         raise ExperimentError(
             f"$.mode: expected one of {', '.join(MODES)}, got {mode!r}"
+        )
+
+    output = _get(d, "output", "$", str, default="full")
+    if output not in OUTPUTS:
+        raise ExperimentError(
+            f"$.output: expected one of {', '.join(OUTPUTS)}, got {output!r}"
         )
 
     template = _get(d, "template", "$", dict, default={})
@@ -232,6 +296,30 @@ def from_dict(d: dict) -> Experiment:
             )
         overrides[str(key)] = dict(value)
 
+    groups = {}
+    for key, raw in _get(d, "strain_groups", "$", dict, default={}).items():
+        path = f"$.strain_groups[{key!r}]"
+        if not isinstance(key, str) or not key.strip() or key != key.strip() or "|" in key or any(ord(c) < 32 for c in key):
+            raise ExperimentError(f"{path}: use a nonblank group name without | or control characters")
+        if not isinstance(raw, dict):
+            raise ExperimentError(f"{path}: expected an object")
+        # Reuse the same strict panel/pick/condition validation as a legacy file.
+        try:
+            panel = from_dict({"schema_version": SCHEMA_VERSION, "mode": mode,
+                               "strains": raw.get("strains", []),
+                               "control_slot": raw.get("control_slot"),
+                               "conditions": raw.get("conditions", []),
+                               "photos": {"picks": raw.get("picks", {})}})
+        except ExperimentError as exc:
+            raise ExperimentError(f"{path}: {exc}") from exc
+        groups[key] = StrainGroup(panel.strains, panel.control_slot, panel.picks,
+                                 {c.code: c for c in panel.conditions})
+
+    try:
+        multi_step = multistep.from_dict(d.get("multi_step", {}))
+    except (ValueError, TypeError) as exc:
+        raise ExperimentError(f"$.multi_step: {exc}") from exc
+
     return Experiment(
         name=_get(d, "name", "$", str, default="Untitled"),
         template_id=_get(template, "id", "$.template", str, default=""),
@@ -243,10 +331,16 @@ def from_dict(d: dict) -> Experiment:
         photo_top=photo_top,
         photo_root=_get(photos, "root", "$.photos", str, default=""),
         set_key=_get(photos, "set_key", "$.photos", str, default=None),
+        strain_groups=groups,
         profile=profile,
         picks=picks,
         overrides=overrides,
         ignored=[str(p) for p in _get(photos, "ignored", "$.photos", list, default=[])],
+        statistics=statistics_from_dict(
+            _get(d, "statistics", "$", dict, default={}), "$.statistics"
+        ),
+        output=output,
+        multi_step=multi_step,
         id=_get(d, "id", "$", str, default=""),
         revision=_get(d, "revision", "$", int, default=1),
         description=_get(d, "description", "$", str, default=""),

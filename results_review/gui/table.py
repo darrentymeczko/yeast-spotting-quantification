@@ -57,11 +57,11 @@ class SpotTable(ttk.Frame):
         self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
 
-        hint = ("Double-click a grey value to re-measure · O toggles outlier · "
-                "N adds a note · Backspace reverts")
-        ttk.Label(self, text=hint, font=theme.FONT_SMALL,
-                  foreground=theme.MUTED, anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=theme.PAD)
+        self.hint = ("Double-click a grey value to re-measure · O toggles outlier · "
+                     "N adds a note · Backspace reverts")
+        self.hint_label = ttk.Label(self, text=self.hint, font=theme.FONT_SMALL,
+                                    foreground=theme.MUTED, anchor="w")
+        self.hint_label.grid(row=0, column=0, sticky="ew", padx=theme.PAD)
 
         # A sash, not a fixed grid. Side by side these two want more width than
         # a laptop screen has, and in a grid whichever loses gets silently
@@ -82,7 +82,7 @@ class SpotTable(ttk.Frame):
                                  show="headings", selectmode="browse")
         for key, title, width in self.COLUMNS:
             self.tree.heading(key, text=title)
-            self.tree.column(key, width=width, minwidth=44,
+            self.tree.column(key, width=theme.px(width), minwidth=theme.px(44),
                              stretch=key in ("flags", "note"),
                              anchor="e" if key in ("raw", "rel") else "w")
         theme.configure_tags(self.tree)
@@ -106,7 +106,8 @@ class SpotTable(ttk.Frame):
                 ("mean", "Mean ± SD", 92, 78, "e"),
                 ("p", "p vs +", 68, 58, "e")):
             self.summary.heading(key, text=title)
-            self.summary.column(key, width=width, minwidth=minimum,
+            self.summary.column(key, width=theme.px(width),
+                                minwidth=theme.px(minimum),
                                 anchor=anchor, stretch=(key == "strain"))
         # Significance is conveyed by weight only; keep the same foreground
         # colour as every other summary row.
@@ -123,7 +124,7 @@ class SpotTable(ttk.Frame):
 
         self.message = ttk.Label(self, text="", font=theme.FONT,
                                  foreground=theme.MUTED, anchor="center",
-                                 justify="center", wraplength=520)
+                                 justify="center", wraplength=theme.px(520))
 
         # Match the footer under the large candidate table on the left.  A
         # blank label using the same font and top gap as its candidate-count
@@ -181,6 +182,22 @@ class SpotTable(ttk.Frame):
         elif self._rows:
             self.tree.selection_set(next(iter(self._rows)))
 
+        # Spots flagged in the data review are only marked, never dropped: say
+        # so above the table, where the decision to omit one is made.
+        flagged = [r for r in rows if r.get("data_review")]
+        kept = [r for r in flagged if not (r.get("outlier") or r.get("excluded")
+                                           or r.get("artifact"))]
+        if flagged:
+            self.hint_label.configure(
+                text=(f"⚑ {len(flagged)} spot(s) here were flagged in the data "
+                      f"review; {len(kept)} still count. Select one and press O "
+                      f"to omit it." if kept else
+                      f"⚑ {len(flagged)} spot(s) here were flagged in the data "
+                      f"review; all are already omitted."),
+                foreground=theme.REVIEWED_BAD)
+        else:
+            self.hint_label.configure(text=self.hint, foreground=theme.MUTED)
+
         self.summary.delete(*self.summary.get_children())
         heading = summary[0].get("p_heading", "p vs +") if summary else "p vs +"
         self.summary.heading("p", text=heading)
@@ -200,10 +217,10 @@ class SpotTable(ttk.Frame):
         if self._sash_placed:
             return
         width = self.panes.winfo_width()
-        if width < 400:                # not laid out yet
+        if width < theme.px(400):      # not laid out yet
             return
         try:
-            self.panes.sashpos(0, max(320, width - theme.SUMMARY_W))
+            self.panes.sashpos(0, max(theme.px(320), width - theme.SUMMARY_W))
             self._sash_placed = True
         except tk.TclError:            # pragma: no cover - not yet mapped
             pass

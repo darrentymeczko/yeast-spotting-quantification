@@ -72,3 +72,15 @@ desktop.ini
 # capture folder, so nothing is lost by leaving this out.
 .results_review_links.json
 review_error.log
+
+# The workbench's own memory: recent files, window size, what was open. Per
+# person, per machine -- and workbench_error.log is what a failed callback
+# leaves behind.
+.workbench.json
+.workbench.json.tmp
+.workbench/
+workbench_error.log
+
+# Scratch output from test and verification runs: rendered previews, temp
+# experiments and logs. Reproducible, and not source.
+validation/

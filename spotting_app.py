@@ -1,15 +1,21 @@
 """Spotting Quantification -- every stage of the pipeline behind one program.
 
-    py spotting_app.py               a launcher window listing the stages
+    py spotting_app.py               the workbench: every tool in one window
     py spotting_app.py <stage> ...   run one stage directly
 
+    workbench     the workbench window         (run_workbench.bat)
     plate         Plate Template Designer      (run_plate_designer.bat)
     experiment    Experiment Designer          (run_experiment_designer.bat)
+    data-review   Data Review                  (run_data_review.bat)
     spotting      Spotting quantification      (run_spotting.bat)
     timecourse    Time course                  (run_timecourse.bat)
     review        Results Review               (run_review.bat; --apply re-exports)
 
-    plate-cli, experiment-cli, montage, pptx, quant
+The workbench is the program people use. The single-tool stages are how each
+tool still runs on its own; `spotting` and `timecourse` are the older console
+pipelines, kept for scripting -- measuring is done from an experiment now.
+
+    plate-cli, experiment-cli, data-review-cli, montage, pptx, quant
                   the command-line tools that sit behind the stages
 
 Everything after the stage name goes to that stage untouched, exactly as the
@@ -51,7 +57,8 @@ ROOT = (Path(sys.executable).resolve().parent if FROZEN
         else Path(__file__).resolve().parent)
 
 #: The folders holding this program's own code, as they sit in the project.
-CODE_DIRS = ("src", "plate_template", "experiments", "results_review")
+CODE_DIRS = ("src", "uikit", "workbench", "plate_template", "experiments",
+             "data_review", "results_review")
 
 
 def _use_local_source() -> bool:
@@ -86,6 +93,9 @@ ERROR_LOG = ROOT / "spotting_error.log"
 
 #: Set by the launcher on the stages that need a console of their own.
 NEW_CONSOLE_ENV = "SPOTTING_NEW_CONSOLE"
+#: Set by the workbench on a job it shows in a console window of its own, so
+#: the window is held open at the end instead of vanishing with the output.
+PAUSE_ENV = "SPOTTING_PAUSE"
 
 #: Whether the process was handed real stdio. Recorded at import, before
 #: `_ensure_stdio` papers over a missing one.
@@ -94,8 +104,13 @@ HAD_STDIN = sys.stdin is not None
 
 # ---------------------------------------------------------------------------
 # The stages. Each imports its module when it is run, not before, so opening
-# the launcher does not cost a numpy import.
+# the workbench does not cost a numpy import.
 # ---------------------------------------------------------------------------
+
+
+def _workbench(argv):
+    from workbench.app import main
+    return main(argv)
 
 
 def _plate(argv):
@@ -105,6 +120,11 @@ def _plate(argv):
 
 def _experiment(argv):
     from experiments.app import main
+    return main(argv)
+
+
+def _data_review(argv):
+    from data_review.app import main
     return main(argv)
 
 
@@ -137,6 +157,11 @@ def _experiment_cli(argv):
     return main(argv)
 
 
+def _data_review_cli(argv):
+    from data_review.cli import main
+    return main(argv)
+
+
 def _montage(argv):
     import spotting_montage
     return spotting_montage.main(argv)
@@ -166,6 +191,10 @@ class Stage:
 
 
 STAGES = [
+    Stage("workbench", "Spotting Quantification",
+          "Every tool in one window: plate templates, experiments and their "
+          "review, as tabs, with Home to start from.",
+          _workbench, "window"),
     Stage("plate", "Plate Template Designer",
           "Lay out the plate: grid size, which cell holds which sample, "
           "replicate and dilution, and the control on each plate.",
@@ -174,6 +203,10 @@ STAGES = [
           "Say who was on the plate: the strain in each sample slot, what it "
           "grew on, the control, and where the photographs are.",
           _experiment, "window"),
+    Stage("data-review", "Data Review",
+          "Flip through every photograph an experiment imported and flag "
+          "bad plates and bad spots, before the statistics are run.",
+          _data_review, "window"),
     Stage("spotting", "Spotting assay quantification",
           "Quantify photos you chose by eye. Put them in the \"Spotting "
           "Assays\" folder, named <set>.<plate><TREATMENT>.JPG.",
@@ -190,18 +223,12 @@ STAGES = [
           _review, "window"),
     Stage("plate-cli", "", "", _plate_cli, "tool"),
     Stage("experiment-cli", "", "", _experiment_cli, "tool"),
+    Stage("data-review-cli", "", "", _data_review_cli, "tool"),
     Stage("montage", "", "", _montage, "tool"),
     Stage("pptx", "", "", _pptx, "tool"),
     Stage("quant", "", "", _quant, "tool"),
 ]
 BY_KEY = {s.key: s for s in STAGES}
-
-#: The launcher's layout: (heading, stage keys).
-SECTIONS = [
-    ("1   Design the experiment", ["plate", "experiment"]),
-    ("2   Measure the photos", ["spotting", "timecourse"]),
-    ("3   Review the results", ["review"]),
-]
 
 #: How this program was actually started, so the help text tells the reader to
 #: type what they typed -- correct from source and if it is ever packaged.
@@ -211,18 +238,22 @@ INVOCATION = (Path(sys.executable).name if FROZEN
 USAGE = f"""\
 {APP_TITLE}
 
-  {INVOCATION}                 open the launcher window
+  {INVOCATION}                 open the workbench: every tool in one window
   {INVOCATION} <stage> [...]   run one stage; arguments pass through
 
 Stages:
-  plate          Plate Template Designer
-  experiment     Experiment Designer
+  workbench      the workbench window (what running with no stage opens)
+  plate          Plate Template Designer, on its own
+  experiment     Experiment Designer, on its own
+  data-review    Data Review, on its own  (flag bad plates and spots first)
+  review         Results Review, on its own  (--apply re-exports, no window)
+
+Console pipelines, kept for scripting (measure from an experiment instead):
   spotting       Spotting assay quantification
   timecourse     Time course (drag folders onto the program to run these)
-  review         Results Review   (--apply re-exports without the window)
 
 Command-line tools:
-  plate-cli      experiment-cli      montage      pptx      quant
+  plate-cli      experiment-cli      data-review-cli      montage      pptx      quant
 
   --selftest     check that every stage loads, then exit
   --help         this text
@@ -367,13 +398,19 @@ def run_stage(stage: Stage, argv: list) -> int:
         print()
         print(f"  *** Finished with errors (exit code {rc}) ***" if rc
               else "  Done.")
-    if owned:
+    if _pause_requested() or owned:
         _pause()
     return rc
 
 
+def _pause_requested() -> bool:
+    """Asked for by whoever started this in a console window of its own.
+    Taken off the environment, so nothing this starts in turn pauses too."""
+    return os.environ.pop(PAUSE_ENV, "") == "1"
+
+
 # ---------------------------------------------------------------------------
-# The launcher window
+# Starting a stage as a process of its own
 # ---------------------------------------------------------------------------
 
 def spawn_stage(stage: Stage, args: list = ()) -> subprocess.Popen:
@@ -404,91 +441,6 @@ def source_note() -> str:
             "will NOT apply unless those folders sit beside it.")
 
 
-def _dpi_aware() -> None:
-    try:
-        import ctypes
-
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-
-def launcher(selftest: bool = False) -> int:
-    import tkinter as tk
-    from tkinter import messagebox, ttk
-
-    _dpi_aware()
-    root = tk.Tk()
-    root.title(APP_TITLE)
-    root.resizable(False, False)
-
-    body = ttk.Frame(root, padding=(20, 16))
-    body.grid()
-    body.columnconfigure(0, weight=1)
-
-    ttk.Label(body, text=APP_TITLE,
-              font=("Segoe UI", 16, "bold")).grid(row=0, column=0,
-                                                  columnspan=2, sticky="w")
-    ttk.Label(body, text="Work down the list. Each stage opens in its own "
-                         "window.", foreground="#555").grid(
-        row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-    def start(stage: Stage, button: ttk.Button, label: str) -> None:
-        try:
-            spawn_stage(stage)
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"Could not start {stage.title}:"
-                                            f"\n\n{exc}", parent=root)
-            return
-        # A packaged stage takes several seconds to unpack and appear. Say so,
-        # and stop a second click from starting a second copy.
-        button.configure(text="Starting...", state="disabled")
-        root.after(12000, lambda: button.configure(text=label, state="normal"))
-
-    row = 2
-    for heading, keys in SECTIONS:
-        ttk.Label(body, text=heading,
-                  font=("Segoe UI", 11, "bold")).grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(14, 2))
-        row += 1
-        for key in keys:
-            stage = BY_KEY[key]
-            cell = ttk.Frame(body)
-            cell.grid(row=row, column=0, sticky="w", padx=(12, 12), pady=3)
-            ttk.Label(cell, text=stage.title,
-                      font=("Segoe UI", 10, "bold")).pack(anchor="w")
-            ttk.Label(cell, text=stage.blurb, wraplength=430,
-                      justify="left", foreground="#555").pack(anchor="w")
-            label = "Open" if stage.kind == "window" else "Run"
-            button = ttk.Button(body, text=label, width=10)
-            button.configure(
-                command=lambda s=stage, b=button, t=label: start(s, b, t))
-            button.grid(row=row, column=1, sticky="e")
-            row += 1
-
-    ttk.Separator(body).grid(row=row, column=0, columnspan=2, sticky="ew",
-                             pady=(16, 8))
-    ttk.Label(body, text=f"Working folder:  {ROOT}", foreground="#555",
-              wraplength=500, justify="left").grid(
-        row=row + 1, column=0, sticky="w")
-    ttk.Button(body, text="Open folder", width=12,
-               command=lambda: os.startfile(ROOT)).grid(
-        row=row + 1, column=1, sticky="e")
-    # Which copy of the code is running is never left to be guessed at: it
-    # decides whether an edit just made will be picked up or silently ignored.
-    ttk.Label(body, text=source_note(), foreground="#555", wraplength=500,
-              justify="left").grid(row=row + 2, column=0, columnspan=2,
-                                   sticky="w", pady=(2, 0))
-
-    if selftest:
-        root.update_idletasks()
-        root.update()
-        root.destroy()
-        return 0
-    root.mainloop()
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Self-test: does the packaged program hold everything the stages reach for?
 # ---------------------------------------------------------------------------
@@ -515,8 +467,10 @@ def selftest() -> int:
 
     print(f"{APP_TITLE} self-test -- frozen={FROZEN}, root={ROOT}")
     print(f"{source_note()}\n")
-    for name in ("plate_template.app", "plate_template.cli", "experiments.app",
-                 "experiments.cli", "experiments.run", "results_review.app",
+    for name in ("uikit.theme", "uikit.host", "workbench.app", "workbench.shell",
+                 "plate_template.app", "plate_template.cli", "experiments.app",
+                 "experiments.cli", "experiments.run", "data_review.app",
+                 "data_review.cli", "data_review.spots", "results_review.app",
                  "results_review.cli", "results_review.rebuild",
                  "results_review.export", "spotting_batch",
                  "spotting_timecourse", "spotting_timecourse_figures",
@@ -590,17 +544,20 @@ def selftest() -> int:
     check("scikit-image", skimage_label)
     check("statsmodels + pyprism_plot", stats)
     check("bundled plate template", default_template)
-    def launcher_starts_a_stage():
-        # The launcher's buttons do exactly this: the program starting itself.
-        # Packaged, that is where unpacking, the environment reset and the
-        # missing stdio all have to work at once.
-        rc = spawn_stage(BY_KEY["plate"], ["--selftest"]).wait(timeout=180)
-        assert rc == 0, f"the plate designer's own self-test exited {rc}"
-        return "started plate, it exited 0"
+
+    def starts(key: str) -> Callable[[], object]:
+        # The program starting itself as a separate process: packaged, that is
+        # where unpacking, the environment reset and the missing stdio all
+        # have to work at once.
+        def go():
+            rc = spawn_stage(BY_KEY[key], ["--selftest"]).wait(timeout=180)
+            assert rc == 0, f"{key}'s own self-test exited {rc}"
+            return f"started {key}, it exited 0"
+        return go
 
     check("Tk opens", tk_root)
-    check("launcher window builds", lambda: launcher(selftest=True))
-    check("launcher starts a stage", launcher_starts_a_stage)
+    check("the workbench window builds and opens documents", starts("workbench"))
+    check("a single tool still runs on its own", starts("plate"))
 
     print()
     if failures:
@@ -617,7 +574,7 @@ def main(argv: list | None = None) -> int:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")   # for worker processes
 
     if not argv:
-        return launcher()
+        return run_stage(BY_KEY["workbench"], [])
     head, rest = argv[0], argv[1:]
 
     if head in ("-h", "--help", "help", "/?"):
@@ -626,8 +583,9 @@ def main(argv: list | None = None) -> int:
         return 0
     if head == "--selftest":
         owned = _open_console(interactive=False)
+        pause = _pause_requested()
         rc = selftest()
-        if owned:
+        if owned or pause:
             _pause()
         return rc
     if head.lower() in BY_KEY:

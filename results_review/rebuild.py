@@ -36,7 +36,7 @@ DERIVED = ("control_raw", "control_mean", "relative_growth", "control_ok")
 #: selects the columns it needs and ignores the rest, so the CSV stays readable
 #: by the unmodified script.
 ANNOTATIONS = ("raw_growth_original", "manual", "excluded_source",
-               "outlier_source", "edit_note")
+               "outlier_source", "edit_note", "data_review")
 
 
 class RebuildError(RuntimeError):
@@ -96,6 +96,19 @@ _TREE_CACHE: dict[tuple[str, tuple[int, ...]], list] = {}
 def clear_cache() -> None:
     """Forget discovered capture trees (after photos are moved or relinked)."""
     _TREE_CACHE.clear()
+
+
+def release_memory() -> None:
+    """Forget the capture trees and every measurement held in memory, here.
+    (The window's rebuilds run in a worker process, which `background.release`
+    ends; this is for a process that rebuilt in place.)"""
+    import sys
+
+    _TREE_CACHE.clear()
+    tc = sys.modules.get("spotting_timecourse")
+    cached = getattr(tc, "_cached_measure", None)
+    if cached is not None and hasattr(cached, "cache_clear"):
+        cached.cache_clear()
 
 
 def tree_candidates(root: Path, plates=(1, 2)) -> list:
@@ -168,6 +181,11 @@ def pipeline_candidate(root: Path, cand: Candidate,
     layout = layout_for(cfg)
     plates = tuple(layout.plates()) if layout and layout.plates() else \
         tuple(range(1, len(cand.photos) + 1))
+    if cfg is not None and "resolved_photos" in cfg:
+        # Experiment Designer assignments are authoritative, including manual
+        # strain-group membership. Re-scanning this root would mix other panels
+        # back in and discard corrected hours/plate/treatment identities.
+        return _recorded_candidate(root, cand, cfg, plates)
     candidates = tree_candidates(root, plates=plates)
     got = tcf._match_candidate(candidates, row)
     if got is None:
@@ -199,6 +217,44 @@ def pipeline_candidate(root: Path, cand: Candidate,
             f"the results but not under {root}. The photos have moved or been "
             f"renamed since the run; link the folder those photos are in.")
     return got
+
+
+def _recorded_candidate(root: Path, cand: Candidate, cfg: dict, plates) -> dict:
+    import spotting_timecourse as tc
+
+    records = cfg["resolved_photos"]
+    if not isinstance(records, list):
+        raise RebuildError("The run's saved photo assignments are invalid; cannot safely rebuild.")
+    root = Path(root).resolve()
+    shots = []
+    try:
+        for row in records:
+            if row["condition"] != cand.medium:
+                continue
+            hours = float(row["timepoint"])
+            label = row.get("timepoint_label") or f"{hours:g} Hours"
+            if label != cand.timepoint:
+                continue
+            relpath = Path(row["relpath"])
+            path = (root / relpath).resolve()
+            if relpath.is_absolute() or not path.is_relative_to(root):
+                raise ValueError("photo path leaves the linked folder")
+            shots.append(tc.Shot(path=path, tp_hours=hours, tp_label=label,
+                                 medium=row["condition"],
+                                 medium_label=row.get("condition_label") or cand.medium_label,
+                                 plate=int(row["plate"])))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RebuildError(f"Invalid saved photo assignment: {exc}") from exc
+    matches = [c for c in tc.candidates(shots, plates=plates)
+               if tuple(s.path.name for s in c["plates"]) == tuple(cand.photos)
+               and (cand.hours is None or c["hours"] == cand.hours)]
+    if len(matches) != 1:
+        raise RebuildError("The candidate does not identify exactly one saved photo pairing "
+                           f"({len(matches)} matches). Cannot safely choose photos for this strain group.")
+    missing = [str(s.path) for s in matches[0]["plates"] if not s.path.is_file()]
+    if missing:
+        raise RebuildError("Saved photos are missing; link the original data folder: " + ", ".join(missing))
+    return matches[0]
 
 
 # --- the rebuild -----------------------------------------------------------
@@ -313,12 +369,64 @@ def _flag_outliers(tidy, edits: dict):
     return tidy, [ln.strip() for ln in buf.getvalue().splitlines() if ln.strip()]
 
 
+def _mark_data_review(tidy, cand_dict, root: Path, level, flags):
+    """The data review's verdict on each spot, as a `data_review` column.
+
+    A MARKER, never an exclusion: nothing about the row's numbers, flags or
+    inclusion changes. The person reviewing decides whether a flagged spot is
+    omitted, with the same outlier control as any other.
+
+    Flags are keyed by photo path and photograph grid cell, so each tidy row is
+    traced back through its plate's photo and the level's cell for its
+    replicate and strain.
+    """
+    import spotting_timecourse as tc
+
+    tidy = tidy.copy()
+    tidy["data_review"] = ""
+    if flags is None or flags.is_empty or tidy.empty:
+        return tidy
+    root = Path(root).resolve()
+    relpaths: dict[int, str] = {}
+    for shot in tc.cand_shots(cand_dict):
+        try:
+            relpaths[int(shot.plate)] = (Path(shot.path).resolve()
+                                         .relative_to(root).as_posix())
+        except ValueError:
+            continue                        # not under the linked folder
+    cells: dict[tuple, tuple] = {}
+    for plate in relpaths:
+        try:
+            for c in level.cells(plate):
+                cells[(plate, int(c.replicate), int(c.slot))] = (c.row, c.col)
+        except KeyError:
+            continue
+    marks = []
+    for r in tidy.itertuples():
+        rel = relpaths.get(int(r.plate))
+        digits = "".join(ch for ch in str(r.replicate) if ch.isdigit())
+        cell = cells.get((int(r.plate), int(digits or 0), int(r.strain_col)))
+        if rel is None:
+            marks.append("")
+        elif cell is not None:
+            marks.append(flags.reason_for(rel, cell[0] + 1, cell[1] + 1))
+        else:
+            plate = flags.plate_reason(rel)
+            marks.append(f"plate: {plate}" if plate else "")
+    tidy["data_review"] = marks
+    return tidy
+
+
 def rebuild(root: Path, label: str, cfg: dict, cand: Candidate,
-            edits: "dict | None" = None, cache_dir: "Path | None" = None) -> Frame:
+            edits: "dict | None" = None, cache_dir: "Path | None" = None,
+            data_flags=None) -> Frame:
     """Everything behind one candidate's graph, corrections included.
 
     One code path for every candidate, the pipeline's automatic winner
     included, so the numbers can never depend on which one was picked.
+
+    `data_flags` is the experiment's data review, if it has one; its flags are
+    marked on the rows (`data_review`) and nothing else.
     """
     require_engine()
     import spotting_timecourse as tc
@@ -360,6 +468,7 @@ def rebuild(root: Path, label: str, cfg: dict, cand: Candidate,
     messages += notes
     tidy, notes = _flag_outliers(tidy, edits or {})
     messages += notes
+    tidy = _mark_data_review(tidy, cand_dict, root, level, data_flags)
 
     return Frame(medium=cand.medium, candidate=cand, experiment=experiment,
                  tidy=tidy, control_col=control_col,
@@ -367,12 +476,23 @@ def rebuild(root: Path, label: str, cfg: dict, cand: Candidate,
 
 
 def summarize(frame: Frame, *, statistical_test: str = "t_test",
-              p_adjust: str = "none", alpha: float = 0.05) -> list[dict]:
+              p_adjust: str = "none", alpha: float = 0.05,
+              posthoc: str = "none", extra_references=(),
+              all_pairs: bool = False, with_p: bool = True) -> list[dict]:
     """Mean relative growth per strain, over the rows that actually count.
 
     The same rows `spotting_plots.py` keeps: not excluded, not an artifact, not
     flagged an outlier. Shown beside the table so the effect of a correction is
     visible before the graph is redrawn.
+
+    The p column is each strain against the control. Extra comparisons are
+    still part of the family the correction or post-hoc test runs over, so the
+    number shown is the one the graph uses; the comparisons between other
+    strains appear on the graph and in the exported statistics table.
+
+    `with_p=False` stops after the means, leaving every p blank: the means are
+    instant, while a Dunnett over 24 strains takes most of a second, so the
+    window shows the means at once and fills the p column in when it lands.
     """
     t = frame.tidy
     use = (~t["excluded"].astype(bool) & ~t["artifact"].astype(bool)
@@ -394,11 +514,17 @@ def summarize(frame: Frame, *, statistical_test: str = "t_test",
     # pairwise against the positive-control baseline. ANOVA is omnibus, so its
     # one p-value appears once on the control row rather than being misleadingly
     # repeated as though it were a post-hoc pairwise result.
+    import spotting_plots
+
+    if statistical_test == "t_test":
+        heading = "p vs +ctrl"
+    elif posthoc == "none":
+        heading = "ANOVA p"
+    else:
+        heading = f"{spotting_plots.POSTHOC_METHODS[posthoc]} p"
     for row in out:
-        row.update(p_value=None, significant=False,
-                   p_heading=("p vs +ctrl" if statistical_test == "t_test"
-                              else "ANOVA p"))
-    if not out:
+        row.update(p_value=None, significant=False, p_heading=heading)
+    if not out or not with_p:
         return out
 
     control_rows = t[use & (t["strain_col"].astype(int) == frame.control_col)]
@@ -408,19 +534,7 @@ def summarize(frame: Frame, *, statistical_test: str = "t_test",
     group = t[use].copy()
     group["value"] = group["relative_growth"].astype(float)
 
-    import spotting_plots
-
-    if statistical_test == "t_test":
-        tests = spotting_plots._ratio_tests(group, control, p_adjust)
-        p_column = "p" if p_adjust == "none" else "p_adj"
-        values = {str(r.group2): float(getattr(r, p_column))
-                  for r in tests.itertuples()}
-        for row in out:
-            p_value = values.get(row["strain"])
-            row["p_value"] = p_value
-            row["significant"] = (p_value is not None and p_value == p_value
-                                  and p_value <= alpha)
-    elif statistical_test == "anova":
+    if statistical_test == "anova" and posthoc == "none":
         tests = spotting_plots._anova_test(group, control)
         p_value = float(tests.iloc[0]["p"]) if not tests.empty else float("nan")
         for row in out:
@@ -428,6 +542,16 @@ def summarize(frame: Frame, *, statistical_test: str = "t_test",
                 row["p_value"] = p_value
                 row["significant"] = p_value == p_value and p_value <= alpha
                 break
-    else:
-        raise ValueError("statistical_test must be 't_test' or 'anova'")
+        return out
+    # The read-out the run's scoring uses too, so the bold rows here are the
+    # strains its "significant" count names.
+    values = spotting_plots.vs_control(
+        group, control, statistical_test=statistical_test, p_adjust=p_adjust,
+        posthoc=posthoc, extra_references=extra_references,
+        all_pairs=all_pairs)
+    for row in out:
+        p_value = values.get(row["strain"], (None,))[0]
+        row["p_value"] = p_value
+        row["significant"] = (p_value is not None and p_value == p_value
+                              and p_value <= alpha)
     return out

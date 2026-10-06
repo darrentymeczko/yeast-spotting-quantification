@@ -206,6 +206,39 @@ def test_zoom_is_bounded(view):
     assert view._zoom == MIN_ZOOM
 
 
+def test_the_view_is_remembered_for_next_time(tk_root, tmp_path, monkeypatch):
+    """Fit or Aligned, rotated or not: kept across sittings, and the export
+    lays its slides out the same way."""
+    from results_review import links
+
+    monkeypatch.setattr(links, "LINKS_FILE", tmp_path / "links.json")
+    assert links.sheet_view() == ("fit", False)
+    first = SheetView(tk_root, on_view=links.remember_sheet_view)
+    try:
+        first.set_view("aligned")
+        first.toggle_rotate()
+    finally:
+        first.destroy()
+    assert links.sheet_view() == ("aligned", True)
+
+    view, rotate = links.sheet_view()
+    second = SheetView(tk_root, view=view, rotate=rotate)
+    try:
+        assert (second.view, second.rotated) == ("aligned", True)
+    finally:
+        second.destroy()
+
+
+def test_a_damaged_view_setting_falls_back_to_fit(tmp_path, monkeypatch):
+    from results_review import links
+
+    monkeypatch.setattr(links, "LINKS_FILE", tmp_path / "links.json")
+    (tmp_path / "links.json").write_text(
+        '{"photos": {}, "sheet_view": {"view": "sideways", "rotate": "yes"}}',
+        encoding="utf-8")
+    assert links.sheet_view() == ("fit", False)
+
+
 def test_app_restores_a_candidates_redrawn_sheet_after_navigation(tmp_path):
     from types import SimpleNamespace
 

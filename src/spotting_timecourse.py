@@ -78,6 +78,7 @@ sys.path.insert(0, str(HERE))
 from spotting_paths import PROJECT_ROOT   # noqa: E402
 import spotting_quant as sq        # noqa: E402
 import spotting_batch as sb        # noqa: E402
+import spotting_estimate as est    # noqa: E402
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 # The measurement cache lives with the PROGRAM, never in the photo folders.
@@ -93,9 +94,6 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 TIMECOURSE_CACHE = PROJECT_ROOT / ".spotting_cache"
 CONFIG_NAME = "timecourse_config.json"
 ROW_SETS = [(0, 3), (1, 4), (2, 5)]
-# Measured wall-clock for one uncached photo (full-res centring + one
-# Python background subtraction). Re-check with --timing.
-SECONDS_PER_MEASUREMENT = 70
 ROW_NAMES = ["least", "middle", "most"]
 # The order the media are run in, for slide and report ordering.
 MEDIUM_ORDER = ["GLU", "GLY", "K-OAc"]
@@ -755,11 +753,39 @@ def _measure_chunk(chunk):
     return results
 
 
+def _measure_chunks(jobs, workers: int) -> list:
+    """One chunk per worker, dealt round-robin -- how `measure_all` splits."""
+    n_chunks = max(1, min(workers, len(jobs)))
+    return [c for c in (jobs[i::n_chunks] for i in range(n_chunks)) if c]
+
+
+def _is_cached(job) -> bool:
+    path, rows, cache_dir, n_rows, n_cols, _ = _job_parts(job)
+    opts = _job_opts(rows, n_rows, n_cols)
+    return (Path(cache_dir) / f"{sb._cache_key(Path(path), opts)}.npz").exists()
+
+
+def busiest_load(jobs, workers: int) -> tuple[int, int]:
+    """(uncached photos in all, uncached photos on the busiest worker).
+
+    The wall clock waits for the busiest worker, not the average one: cached
+    photos cost nothing, so a split that is even by count can still leave one
+    worker with most of the real work. One worker runs every chunk in turn.
+    """
+    per_chunk = [sum(1 for j in c if not _is_cached(j))
+                 for c in _measure_chunks(list(jobs), workers)]
+    total = sum(per_chunk)
+    return total, (total if workers <= 1 else max(per_chunk, default=0))
+
+
 def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
     """Measure every photo in parallel, with one cache entry per photo.
 
     Each process holds full-resolution images; BLAS is limited to one thread.
     Returns errors and elapsed (seconds, was_cached) pairs for the timing report.
+
+    How long it took is recorded for the next run's estimate; see
+    spotting_estimate.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -767,9 +793,11 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
     total = len(jobs)
     t_start = time.perf_counter()
     done_n = 0
+    # Photos actually measured by the busiest worker: what the wall clock
+    # waited for, and so what the recorded rate is per.
+    load = 0
     # One chunk per worker, with bounded groups of photos inside it.
-    n_chunks = max(1, min(workers, total))
-    chunks = [c for c in (jobs[i::n_chunks] for i in range(n_chunks)) if c]
+    chunks = _measure_chunks(jobs, workers)
 
     if workers <= 1:
         for c in chunks:
@@ -777,6 +805,8 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
                 done_n += 1
                 if err:
                     errors.append((path, err))
+                elif not cached:
+                    load += 1
                 elapsed.append((dt, cached))
                 print(f"\r    {done_n}/{total}", end="", flush=True)
         print()
@@ -785,17 +815,25 @@ def measure_all(jobs, cache_dir: Path, workers: int, timing: bool = False):
                                  initializer=_init_worker) as pool:
             futs = [pool.submit(_measure_chunk, c) for c in chunks]
             for fut in as_completed(futs):
+                fresh_here = 0
                 for path, rows, err, dt, cached in fut.result():
                     done_n += 1
                     if err:
                         errors.append((path, err))
+                    elif not cached:
+                        fresh_here += 1
                     elapsed.append((dt, cached))
+                load = max(load, fresh_here)
                 print(f"\r    {done_n}/{total}  ({len(chunks)} batch worker(s))",
                       end="", flush=True)
         print()
 
+    wall = time.perf_counter() - t_start
+    # A failed photo returns early and would make the pass look fast.
+    if not errors:
+        est.record_measure(load, wall, workers)
+
     if timing:
-        wall = time.perf_counter() - t_start
         fresh = sorted(dt for dt, c in elapsed if not c)
         hits = sum(1 for _, c in elapsed if c)
         print(f"    timing: {wall / 60:.1f} min wall-clock on {workers} "
@@ -850,24 +888,33 @@ def as_level(rows_or_level, layout: "sb.DilutionLayout | None" = None):
 
 
 def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
-                    exclude=None, p_thresh: float = 0.05,
-                    layout: "sb.DilutionLayout | None" = None):
+                    exclude=None, layout: "sb.DilutionLayout | None" = None,
+                    statistics: "dict | None" = None, test: bool = True):
     """Metrics for one (photo pair, dilution level).
 
     Normalizes exactly as the main pipeline does -- per-plate control average,
     rim-flagged spots dropped, detection floor -- so the CV reported here is the
     CV the real figure would have, not an approximation of it.
 
+    Significance is the experiment's own test, `statistics` (`run_plots`'
+    keyword arguments; None is its defaults), run on the very frame the
+    candidate's sheet graph is drawn from -- see `_tested_frame`. The count is
+    therefore the number of brackets on that graph, never a second opinion
+    from a test nobody chose.
+
+    `test=False` leaves the test to the caller: `n_significant` is None and
+    `_tested` carries the frame, for `significant_strains` to run -- which is
+    how `run_one` spreads a slow post-hoc test over its workers.
+
     `rows` is a `DilutionLevel` (or a legacy row tuple). Which spots are read,
     and which is the control, come from the level's cells, so a design with any
     number of levels -- on any rows of any plate -- scores the same way.
     """
-    from scipy import stats
-
     level = as_level(rows, layout)
     ex = set(exclude or [])
     rel, ctrl_vals = {}, []
     ctrl_expected = 0
+    plates = []
     for shot in cand_shots(cand):
         try:
             cells = level.cells(shot.plate)
@@ -875,6 +922,7 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
                                   level.quant_rows(shot.plate), cache_dir, layout)
         except Exception:
             return None
+        plates.append(pd_)
         # Every control replicate on THIS plate forms its denominator, however
         # many the design spots -- two per plate in the lab layout, four on a
         # single plate, or any other number.
@@ -897,33 +945,138 @@ def score_candidate(cand, rows, cache_dir: Path, strains, control_col,
     if not ctrl_vals:
         return None
     cm = float(np.mean(ctrl_vals))
-    floor = sq.MIN_CONTROL_GRAY / max(cm, 1e-9)
-    cvs, n_sig, n_str = [], 0, 0
-    strain_sigs: dict[str, int] = {}  # strain -> +1 increased / -1 reduced
+    cvs, n_str = [], 0
     for strain_name, v in rel.items():
         v = np.asarray(v, float)
         if len(v) < 3 or v.mean() <= 0:
             continue
         n_str += 1
         cvs.append(float(v.std() / v.mean()))
-        w = np.maximum(v, floor)
-        if np.all(w > 0) and float(
-                stats.ttest_1samp(np.log(w), 0).pvalue) < p_thresh:
-            n_sig += 1
-            strain_sigs[strain_name] = 1 if float(v.mean()) > 1.0 else -1
     if not cvs:
         return None
-    return {"median_CV": float(np.median(cvs)),
-            "control_mean": cm,
-            "control_CV": float(np.std(ctrl_vals) / cm) if cm > 0 else np.nan,
-            "n_strains": n_str, "n_significant": n_sig,
-            "control_n": len(ctrl_vals),
-            # How many control spots the design put on these plates at this
-            # level, for the completeness term. Underscored like _strain_sigs:
-            # it is popped before the row reaches the CSV, whose columns stay
-            # as they were.
-            "_control_expected": ctrl_expected,
-            "_strain_sigs": strain_sigs}
+    tested = _tested_frame(plates, strains, control_col, level, ex)
+    out = {"median_CV": float(np.median(cvs)),
+           "control_mean": cm,
+           "control_CV": float(np.std(ctrl_vals) / cm) if cm > 0 else np.nan,
+           "n_strains": n_str, "n_significant": None,
+           "control_n": len(ctrl_vals),
+           # How many control spots the design put on these plates at this
+           # level, for the completeness term. Underscored like _strain_sigs:
+           # it is popped before the row reaches the CSV, whose columns stay
+           # as they were.
+           "_control_expected": ctrl_expected,
+           "_strain_sigs": {}}
+    if not test:
+        out["_tested"] = tested
+        return out
+    sigs = significant_strains(tested, statistics)
+    out["n_significant"] = len(sigs)
+    out["_strain_sigs"] = sigs     # strain -> +1 increased / -1 reduced
+    return out
+
+
+def _tested_frame(plates, strains, control_col, level, exclude):
+    """The rows a candidate's significance is tested on, or None.
+
+    The frame its sheet graph is drawn from (`spotting_timecourse_figures.
+    build_tidy_for_candidate` makes the same `build_tidy_level` call),
+    filtered as the renderer filters it. The scoring pass above keeps its own
+    simpler normalisation for the CV; testing that instead is what let the
+    count on a sheet disagree with the brackets on its graph.
+    """
+    import contextlib
+    import io
+
+    import spotting_plots as sp
+
+    # Its notes -- control outliers, rows that cannot be normalised -- are
+    # printed for every candidate when the sheets are drawn; once is enough.
+    with contextlib.redirect_stdout(io.StringIO()):
+        tidy = sb.build_tidy_level(plates, strains, control_col, level, exclude,
+                                   experiment="scoring", treatment="scoring",
+                                   set_label="TC")
+    if tidy is None or tidy.empty or "relative_growth" not in tidy.columns:
+        return None
+    group = sp._filtered(tidy, "relative_growth", keep_artifacts=False,
+                         keep_outliers=False)
+    return group if not group.empty else None
+
+
+def significant_strains(group, statistics: "dict | None" = None) -> dict:
+    """{strain: +1 increased / -1 reduced} for every strain the experiment's
+    test calls different from the control.
+
+    The renderer's own test (`spotting_plots.vs_control`), at its own cutoff
+    (p <= alpha), so a strain counts here exactly when its graph has a bracket
+    to the control. `statistics` is `run_plots`' keyword arguments; None, or
+    a key left out, is its default. An omnibus-only ANOVA names no strain.
+    """
+    import spotting_plots as sp
+
+    if group is None:
+        return {}
+    s = statistics or {}
+    control = sp._control_for(group)
+    if control not in set(group["strain"]):
+        return {}
+    tested = sp.vs_control(group, control,
+                           statistical_test=s.get("statistical_test", "t_test"),
+                           p_adjust=s.get("p_adjust", "none"),
+                           posthoc=s.get("posthoc", "none"),
+                           extra_references=s.get("extra_references", ()),
+                           all_pairs=bool(s.get("all_pairs", False)))
+    alpha = float(s.get("alpha", 0.05))
+    return {strain: 1 if ratio > 1.0 else -1
+            for strain, (p, ratio) in tested.items() if p == p and p <= alpha}
+
+
+def _significance_job(job):
+    """Worker: `significant_strains` for one candidate. Module level so a
+    process pool can pickle it."""
+    group, statistics = job
+    return significant_strains(group, statistics)
+
+
+#: Serial seconds of testing worth starting a process pool for. Dunnett's
+#: p-values are a numerical integral -- about 2 s for a 24-strain panel, so
+#: minutes over a run -- while every other test takes 0.1 s or less.
+PARALLEL_TEST_S = 10.0
+
+
+def significance_all(groups: list, statistics: "dict | None",
+                     workers: int) -> list:
+    """`significant_strains` for every candidate, in order.
+
+    Two real tests run here first and the second is timed -- the first pays
+    for importing and warming up the test, ~1.5 s even for a 0.1 s Tukey. The
+    rest go to a process pool only when doing them one by one would take
+    longer than `PARALLEL_TEST_S`: starting the workers costs a few seconds,
+    which a t-test or Tukey run would never win back.
+    """
+    out, took, i = [], [], 0
+    while i < len(groups) and len(took) < 2:
+        group = groups[i]
+        i += 1
+        if group is None:                  # nothing to test, nothing to time
+            out.append({})
+            continue
+        t0 = time.perf_counter()
+        out.append(significant_strains(group, statistics))
+        took.append(time.perf_counter() - t0)
+    rest = groups[i:]
+    serial_s = (took[-1] if took else 0.0) * len(rest)
+    if workers <= 1 or len(rest) < 2 or serial_s < PARALLEL_TEST_S:
+        return out + [significant_strains(g, statistics) for g in rest]
+    from concurrent.futures import ProcessPoolExecutor
+
+    n = min(workers, len(rest))
+    print(f"    testing {len(rest)} more candidate(s) on {n} worker(s) "
+          f"(~{serial_s / 60:.1f} min one at a time) ...")
+    with ProcessPoolExecutor(max_workers=n, initializer=_init_worker) as pool:
+        out += list(pool.map(_significance_job,
+                             [(g, statistics) for g in rest],
+                             chunksize=max(1, len(rest) // (4 * n))))
+    return out
 
 
 def set_id_from_name(name: str):
@@ -1376,11 +1529,12 @@ def _run_plot_job(job):
     import contextlib
     import io
 
-    csv_path, outdir, label = job
+    csv_path, outdir, label = job[:3]
+    statistics = job[3] if len(job) > 3 else None
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            sb.run_plots(Path(csv_path), Path(outdir))
+            sb.run_plots(Path(csv_path), Path(outdir), **(statistics or {}))
         return (label, buf.getvalue(), None)
     except Exception as e:
         return (label, buf.getvalue(), f"{type(e).__name__}: {e}")
@@ -1526,7 +1680,8 @@ def draw_montages(jobs, workers: int):
     return errors
 
 
-def output_best_candidates(bests, cfg, cache, outdir, label, layout=None):
+def output_best_candidates(bests, cfg, cache, outdir, label, layout=None,
+                           statistics=None):
     """Full pipeline output for the best candidate of EACH medium.
 
     One per medium, not one per set. Each medium is its own experiment -- the
@@ -1565,7 +1720,7 @@ def output_best_candidates(bests, cfg, cache, outdir, label, layout=None):
     print(f"  wrote {csv_path.name}  ({len(frames)} medium/media)")
 
     # --- PyPrism figures: queued, not drawn here ---
-    plot_job = (str(csv_path), str(outdir), label)
+    plot_job = (str(csv_path), str(outdir), label, statistics)
 
     # --- queue one montage per medium, and the slide it belongs to ---
     # The montages are NOT drawn here. Each costs two Python background
@@ -1814,9 +1969,77 @@ def build_best_deck(slides, args) -> "Path | None":
     return out
 
 
+def figure_workload(cands, layout, figures) -> tuple[int, int, int, int]:
+    """(graphs, photos, pairings, sheets) the comparison sheets will need.
+
+    Counted before scoring, so every candidate is assumed to be drawn; one
+    whose control is too faint to score gets no sheet, and the estimate is a
+    little high for it. With `figures` N, which candidates make each medium's
+    top N is not known yet, so they are assumed to be N different pairings.
+    """
+    want = str(figures).strip().lower()
+    if want == "none" or not cands:
+        return 0, 0, 0, 0
+    n_per = None if want == "all" else max(1, int(want))
+    n_levels = len(layout.populated_levels()) or len(layout.levels) or 1
+    by_medium = {}
+    for c in cands:
+        by_medium.setdefault(c["medium"], []).append(c)
+    photos = pairings = sheets = 0
+    for group in by_medium.values():
+        shots_m = {str(s.path) for c in group for s in cand_shots(c)}
+        if n_per is None:
+            pairings += len(group)
+            sheets += len(group) * n_levels
+            photos += len(shots_m)
+        else:
+            n_pairs = min(n_per, len(group))
+            pairings += n_pairs
+            sheets += min(n_per, len(group) * n_levels)
+            per_pair = max(len(cand_shots(c)) for c in group)
+            photos += min(len(shots_m), n_pairs * per_pair)
+    return sheets, photos, pairings, sheets
+
+
+def print_estimate(load: int, figures: tuple, workers: int) -> float:
+    """Say how long the run will take, phase by phase; returns the seconds.
+
+    `load` is the uncached photos on the busiest worker (`busiest_load`) and
+    `figures` is `figure_workload`'s count.
+    """
+    per_photo, measure_timed = est.measure_s(workers)
+    measure = load * per_photo
+    sheets = figures[3]
+    drawing, figures_timed = est.figure_seconds(*figures, workers)
+    total = measure + drawing + est.OVERHEAD_S
+    print(f"  Estimated run time on {workers} worker(s): "
+          f"about {est.format_minutes(total)}")
+    if load:
+        print(f"      measuring  {est.format_phase(measure):<12} "
+              f"{load} photo(s) on the busiest worker, ~{per_photo:.0f} s each")
+    else:
+        print(f"      measuring  {'none':<12} every photo is already cached")
+    if sheets:
+        print(f"      figures    {est.format_phase(drawing):<12} "
+              f"{sheets} comparison sheet(s)")
+    print(f"      the rest   {est.format_phase(est.OVERHEAD_S):<12} "
+          f"start-up, scoring, best-candidate output")
+    if (load and not measure_timed) or (sheets and not figures_timed):
+        print("      (default rates: each finished run on this computer "
+              "refines them)")
+    return total
+
+
 def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
-            mont_jobs=None, plot_jobs=None, shots=None, layout=None) -> int:
+            mont_jobs=None, plot_jobs=None, shots=None, layout=None,
+            statistics=None) -> int:
     """Score one capture tree. `cfg` is its already-resolved strain panel.
+
+    `statistics` chooses the tests the figures report, as keyword arguments to
+    `spotting_batch.run_plots`; None keeps its defaults. The same test decides
+    which strains count as significant when candidates are scored, so the
+    counts, the strain consensus and the ranking built on them are those of
+    the test the figures show.
 
     `slides` collects this tree's best-candidate (montage, graph) pairs for the
     run-wide PowerPoint and `mont_jobs` the montages still to be drawn; pass
@@ -1881,17 +2104,11 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     print(f"  {len(cands)} photo pairing(s) x {n_levels} dilutions = "
           f"{len(cands) * n_levels} candidates")
     # One measurement per photo, not per (photo, dilution): every dilution
-    # choice comes out of the same pass. SECONDS_PER_MEASUREMENT is a measured
-    # figure -- re-check it with --timing after any change to worker count or to
-    # the measurement code, because the naive estimate has been badly wrong here
-    # before (see _init_worker).
-    n_todo = sum(
-        1 for j in jobs
-        if not (cache / f"{sb._cache_key(Path(j[0]), replace(sq.MeasureOptions(), quant_rows=j[1], **grid_opts))}.npz").exists())
+    # choice comes out of the same pass.
+    n_todo, load = busiest_load(jobs, workers)
     print(f"  {len(jobs)} measurement(s) after de-duplication, "
-          f"{n_todo} not yet cached; at ~{SECONDS_PER_MEASUREMENT} s each that "
-          f"is about {n_todo * SECONDS_PER_MEASUREMENT / 60 / max(workers, 1):.0f} "
-          f"min on {workers} worker(s)")
+          f"{n_todo} not yet cached")
+    print_estimate(load, figure_workload(cands, layout, args.figures), workers)
     stubs = cloud_placeholders(shots)
     if stubs:
         # Count how many will actually need downloading (cached ones are free).
@@ -1923,10 +2140,18 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     if len(errs) > 10:
         print(f"  ! ... and {len(errs) - 10} more")
 
-    print("\n  Scoring ...")
+    import spotting_plots as sp
+
+    # Significance is counted with the test the experiment chose -- the one
+    # the figures draw -- so "8/23 significant" means eight brackets on the
+    # graph. It used to be an uncorrected t-test whatever was chosen, which
+    # under an ANOVA + Tukey counted strains no graph would ever mark.
+    sig_test = sp.describe_test(**(statistics or {}))
+    print(f"\n  Scoring ... (significance: {sig_test})")
     recs = []
-    # (cand, level, strain_sigs, control_n, control_expected), parallel to recs
-    cand_meta = []
+    # (cand, level, control_n, control_expected) and the frame each candidate
+    # is tested on, parallel to recs
+    cand_meta, tested = [], []
     for c in cands:
         # The control column and the excluded strains are per MEDIUM: on K-OAc
         # the WT control does not grow, so several sets normalise against a
@@ -1937,10 +2162,12 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
         for level in layout.levels:
             rows, nm = level, level.name
             m = score_candidate(c, level, cache, cfg["strains"], cc_m, ex_m,
-                                layout=layout)
+                                layout=layout, statistics=statistics,
+                                test=False)
             if not m:
                 continue
-            sigs = m.pop("_strain_sigs", {})
+            tested.append(m.pop("_tested"))
+            m.pop("_strain_sigs", None)
             ctrl_n = m.pop("control_n", 0)
             ctrl_expected = m.pop("_control_expected", 4)
             # One photo column per plate: plate1, plate2, ... -- for the lab's two
@@ -1952,11 +2179,28 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
                          "timepoint": c["tp_label"], "hours": c["hours"],
                          **photo_cols,
                          "dilution": nm, "control_n": ctrl_n, **m})
-            cand_meta.append((c, rows, sigs, ctrl_n, ctrl_expected))
+            cand_meta.append((c, rows, ctrl_n, ctrl_expected))
     if not recs:
         print("  Nothing could be scored -- every candidate had a control at "
               "or below the noise floor.", file=sys.stderr)
         return 1
+
+    # Tested together rather than inside the loop above, so a slow post-hoc
+    # test (Dunnett) can be spread over the workers.
+    all_sigs = significance_all(tested, statistics, workers)
+    for rec, sigs in zip(recs, all_sigs):
+        rec["n_significant"] = len(sigs)
+    # (cand, level, strain_sigs, control_n, control_expected), parallel to recs
+    cand_meta = [(c, rows, sigs, ctrl_n, ctrl_expected)
+                 for (c, rows, ctrl_n, ctrl_expected), sigs
+                 in zip(cand_meta, all_sigs)]
+    chosen = statistics or {}
+    if (chosen.get("statistical_test") == "anova"
+            and chosen.get("posthoc", "none") == "none"):
+        print("  ! An ANOVA with no post-hoc test does not say WHICH strains "
+              "differ, so no\n    strain is counted significant and candidates "
+              "are ranked on spread and\n    controls alone. Choose a post-hoc "
+              "test to rank on the strains as well.")
 
     df = pd.DataFrame(recs)
     # Preserve original order index so the sorted df can look up cand_meta.
@@ -1983,6 +2227,8 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
         df = df.sort_values(["medium", key, "median_CV"],
                             ascending=[True, by_var, True]).reset_index(drop=True)
     df["ranked_by"] = args.rank_by
+    # Which test `n_significant` counts with, so a CSV says what its count is.
+    df["significance_test"] = sig_test
 
     # --- Cross-candidate strain significance consensus, PER MEDIUM ---
     # A strain's behaviour is a property of the strain ON THAT MEDIUM, so the
@@ -2161,7 +2407,8 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
                 rank_note=f"ranked by {args.rank_by}",
                 resolve=lambda medium: medium_cfg(cfg, medium),
                 workers=args.workers or max(
-                    1, min(8, (multiprocessing.cpu_count() or 2) // 2)))
+                    1, min(8, (multiprocessing.cpu_count() or 2) // 2)),
+                statistics=statistics)
             if made:
                 print(f"  wrote {len(made)} sheet(s) to {outdir / 'figures'}")
             else:
@@ -2176,7 +2423,7 @@ def run_one(tree: "Tree", args, cfg, multi: bool = False, slides=None,
     print(f"\n  Building full output for {len(bests)} best candidate(s) ...")
     try:
         got, jobs, rj = output_best_candidates(
-            bests, cfg, cache, outdir / "best", tree.label, layout)
+            bests, cfg, cache, outdir / "best", tree.label, layout, statistics)
         if slides is not None:
             slides.extend(got)
         if mont_jobs is not None:

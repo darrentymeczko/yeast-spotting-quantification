@@ -110,6 +110,30 @@ def remember_set(results_dir: Path) -> None:
     _save(data)
 
 
+# --- how the sheet is shown -------------------------------------------------
+# A way of looking, not a fact about any one set: it carries across sets and
+# sittings, and the PowerPoint export lays its slides out the same way.
+
+SHEET_VIEWS = ("fit", "aligned")
+
+
+def sheet_view() -> tuple[str, bool]:
+    """(view, rotated) the sheet was last shown in; ("fit", False) at first."""
+    raw = _load().get("sheet_view")
+    raw = raw if isinstance(raw, dict) else {}
+    view = raw.get("view")
+    return (view if view in SHEET_VIEWS else SHEET_VIEWS[0],
+            raw.get("rotate") is True)
+
+
+def remember_sheet_view(view: str, rotate: bool) -> None:
+    if view not in SHEET_VIEWS or sheet_view() == (view, bool(rotate)):
+        return
+    data = _load()
+    data["sheet_view"] = {"view": view, "rotate": bool(rotate)}
+    _save(data)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -273,7 +297,10 @@ def resolve(label: str, stored: str = "", results_dir: "Path | None" = None
     """
     if stored:
         p = Path(stored)
-        if is_capture_tree(p):
+        from .discovery import load_run_info
+        info = load_run_info(results_dir) if results_dir is not None else None
+        recorded = info is not None and "resolved_photos" in info.pipeline_config
+        if p.is_dir() and (recorded or is_capture_tree(p)):
             return p
     recorded = from_run_info(results_dir)
     if recorded is not None:
